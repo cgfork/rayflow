@@ -1,0 +1,23 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dag = {workspace=true}
+uuid = {workspace=true}
+jiff = {workspace=true}
+serde = {workspace=true}
+serde_json = { workspace = true }
+thiserror = { workspace = true, optional = true }
+toasty = { workspace = true, optional = true }
+
+[features]
+default = ["mysql"]
+mysql = ["dep:thiserror", "dep:toasty"]
+
+[dev-dependencies]
+jiff = { workspace = true }
+toasty = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "process"] }

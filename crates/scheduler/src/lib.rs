@@ -1,0 +1,590 @@
+//! Task scheduler: consumes tasks and drives node status by task events.
+//!
+//! The scheduler ties the [`runtime`] primitives together. It consumes the tasks
+//! that the backend enqueues as a run progresses and moves their nodes through
+//! the state machine:
+//!
+//! ```text
+//! ready -schedule-> running -event(pend)-> pending -event(terminal)-> succeeded/failed/terminated
+//! ready -schedule-> running -event(terminal)-> succeeded/failed/terminated
+//! ready -event(pend)-> pending -event(terminal)-> succeeded/failed/terminated
+//! ```
+//!
+//! Scheduling a task emits [`Command::Run`] for its node. A [`TaskRunner`] then
+//! runs the scheduled task, recording the [`TaskEvent`] it produces; the
+//! scheduler polls those events (optionally scoped to one shard) and emits the
+//! command that drives each node to its next status as a [`CommandEntry`].
+//! Commands are appended to the store's command log (via
+//! [`CommandEmit`](runtime::CommandEmit)) rather than applied inline: consuming
+//! and applying them (via [`CommandPoll`](runtime::CommandPoll) +
+//! [`CommandApply`](runtime::CommandApply)) is what drives node status. Because
+//! the terminal transitions are ordinary events, a node that is `Pending` can
+//! also be driven to a terminal status by feeding a [`TaskEvent`] back through
+//! [`Scheduler::drive`].
+//!
+//! The scheduler is backend-agnostic: it depends only on the [`Store`] and
+//! [`TaskRunner`] traits. A [`mysql`](runtime::mysql) [`Store`] implementation is
+//! provided behind the default `mysql` feature.
+
+use runtime::{Command, CommandEntry, Task};
+use uuid::Uuid;
+
+pub use runtime::{TaskEvent, TaskEventEntry};
+
+/// Executes scheduled tasks and reports the events that drive their status.
+#[allow(async_fn_in_trait)]
+pub trait TaskRunner: Send + Sync {
+    /// Error returned when running a task or polling its event.
+    type Err: std::error::Error + Send + Sync + 'static;
+
+    /// Runs `task`, executing the work.
+    ///
+    /// The event the run produces is recorded and later returned by
+    /// [`poll`](Self::poll), so running a task does not itself report the event.
+    async fn run(&self, task: &Task) -> Result<(), Self::Err>;
+
+    /// Polls up to `max` task events that have not yet been consumed.
+    ///
+    /// When `shard` is `Some`, only events routed to that shard are returned;
+    /// when `None`, events are returned across every shard.
+    async fn poll(&self, max: usize, shard: Option<u32>) -> Result<Vec<TaskEventEntry>, Self::Err>;
+
+    /// Acknowledges `event`, so it is not polled again.
+    ///
+    /// Called once the event has been driven, so an event is only consumed after
+    /// its command has been emitted.
+    async fn ack(&self, event: &TaskEventEntry) -> Result<(), Self::Err>;
+}
+
+/// The store the scheduler consumes tasks from and drives commands into.
+#[allow(async_fn_in_trait)]
+pub trait Store {
+    /// Error returned by the store.
+    type Err: std::error::Error + Send + Sync + 'static;
+
+    /// A transaction opened by the store.
+    ///
+    /// The scheduler emits commands and acknowledges tasks through this handle,
+    /// so a command and the task it schedules commit atomically.
+    type Tx<'a>: StoreTx<Err = Self::Err>
+    where
+        Self: 'a;
+
+    /// Consumes up to `max` tasks that have not yet been acknowledged.
+    ///
+    /// When `shard` is `Some`, only tasks routed to that shard are returned; when
+    /// `None`, tasks are returned across every shard.
+    async fn poll_tasks(&self, max: usize, shard: Option<u32>) -> Result<Vec<Task>, Self::Err>;
+
+    /// Opens a transaction the scheduler drives commands and task acks through.
+    ///
+    /// Implementing the transaction here keeps the store in charge of atomicity:
+    /// an emit and an ack performed on the same transaction are committed
+    /// together.
+    async fn transaction(&mut self) -> Result<Self::Tx<'_>, Self::Err>;
+}
+
+/// A store transaction: a unit of work that emits commands and acknowledges tasks.
+///
+/// The scheduler performs the command emit and the task ack of a single step on
+/// one transaction, so the two advance together when it commits.
+#[allow(async_fn_in_trait)]
+pub trait StoreTx {
+    /// Error returned by the transaction.
+    type Err: std::error::Error + Send + Sync + 'static;
+
+    /// Appends `entry` to the command log.
+    async fn emit(&mut self, entry: &CommandEntry) -> Result<(), Self::Err>;
+
+    /// Acknowledges `task`.
+    async fn ack(&mut self, task: &Task) -> Result<(), Self::Err>;
+
+    /// Commits the transaction.
+    async fn commit(self) -> Result<(), Self::Err>;
+}
+
+/// Error returned by the [`Scheduler`].
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The store returned an error.
+    #[error("task store: {0}")]
+    Store(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The task runner returned an error.
+    #[error("task runner: {0}")]
+    Runner(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+fn store_err<E>(error: E) -> Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Error::Store(Box::new(error))
+}
+
+fn runner_err<E>(error: E) -> Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Error::Runner(Box::new(error))
+}
+
+/// Consumes tasks and drives their nodes through the run state machine.
+pub struct Scheduler<S, R> {
+    store: S,
+    runner: R,
+    batch: usize,
+    shard: Option<u32>,
+}
+
+impl<S, R> Scheduler<S, R>
+where
+    S: Store,
+    R: TaskRunner,
+{
+    /// Creates a scheduler that consumes at most `batch` tasks per [`tick`](Self::tick).
+    pub fn new(store: S, runner: R, batch: usize) -> Self {
+        assert!(batch > 0, "batch must be at least 1");
+        Self {
+            store,
+            runner,
+            batch,
+            shard: None,
+        }
+    }
+
+    /// Restricts polling to tasks routed to `shard`.
+    ///
+    /// By default a scheduler polls tasks across every shard.
+    pub fn with_shard(mut self, shard: u32) -> Self {
+        self.shard = Some(shard);
+        self
+    }
+
+    /// Returns the shard this scheduler polls, or `None` if it polls every shard.
+    pub fn shard(&self) -> Option<u32> {
+        self.shard
+    }
+
+    /// Returns a shared reference to the underlying store.
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Returns a mutable reference to the underlying store.
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
+    /// Consumes the scheduler, returning its store.
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
+    /// Returns the maximum number of tasks consumed per [`tick`](Self::tick).
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
+    /// Schedules a consumed task, driving `Ready -> Running`.
+    ///
+    /// The `Run` command is emitted and the task is acknowledged on one store
+    /// transaction, so a task is scheduled at most once.
+    pub async fn schedule(&mut self, task: &Task) -> Result<(), Error> {
+        let entry = Self::entry(task, Command::Run { node: task.node_id });
+        let mut tx = self.store.transaction().await.map_err(store_err)?;
+        tx.emit(&entry).await.map_err(store_err)?;
+        tx.ack(task).await.map_err(store_err)?;
+        tx.commit().await.map_err(store_err)
+    }
+
+    /// Drives a node's status by applying a task event.
+    ///
+    /// This is how a node that is `Pending` (or still `Running`) reaches a
+    /// terminal status from an event delivered out of band.
+    pub async fn drive(&mut self, task: &Task, event: TaskEvent) -> Result<(), Error> {
+        self.emit_event(task.data_id, task.graph_id, task.node_id, event)
+            .await
+    }
+
+    /// Emits the command that drives `node` by `event` for the run identified by
+    /// `data_id` and `graph_id`.
+    async fn emit_event(
+        &mut self,
+        data_id: Uuid,
+        graph_id: Uuid,
+        node: Uuid,
+        event: TaskEvent,
+    ) -> Result<(), Error> {
+        let entry = CommandEntry::new(data_id, graph_id, event.command(node));
+        let mut tx = self.store.transaction().await.map_err(store_err)?;
+        tx.emit(&entry).await.map_err(store_err)?;
+        tx.commit().await.map_err(store_err)
+    }
+
+    /// Consumes up to [`batch`](Self::batch) tasks, schedules and runs each, then
+    /// polls the events the runs produced and drives each node by its event.
+    ///
+    /// Returns the number of tasks processed.
+    pub async fn tick(&mut self) -> Result<usize, Error> {
+        let tasks = self
+            .store
+            .poll_tasks(self.batch, self.shard)
+            .await
+            .map_err(store_err)?;
+        for task in &tasks {
+            self.schedule(task).await?;
+            self.runner.run(task).await.map_err(runner_err)?;
+        }
+        self.drive_events().await?;
+        Ok(tasks.len())
+    }
+
+    /// Polls up to [`batch`](Self::batch) task events, optionally scoped to this
+    /// scheduler's shard, and drives each node by its event.
+    ///
+    /// Returns the number of events driven.
+    pub async fn drive_events(&mut self) -> Result<usize, Error> {
+        let events = self
+            .runner
+            .poll(self.batch, self.shard)
+            .await
+            .map_err(runner_err)?;
+        for entry in &events {
+            self.emit_event(entry.data_id, entry.graph_id, entry.node_id, entry.event)
+                .await?;
+            self.runner.ack(entry).await.map_err(runner_err)?;
+        }
+        Ok(events.len())
+    }
+
+    /// Runs [`tick`](Self::tick) until a tick consumes no tasks.
+    ///
+    /// Returns the total number of tasks processed.
+    pub async fn drain(&mut self) -> Result<usize, Error> {
+        let mut total = 0;
+        loop {
+            let processed = self.tick().await?;
+            total += processed;
+            if processed == 0 {
+                return Ok(total);
+            }
+        }
+    }
+
+    fn entry(task: &Task, command: Command) -> CommandEntry {
+        CommandEntry::new(task.data_id, task.graph_id, command)
+    }
+}
+
+#[cfg(feature = "mysql")]
+mod mysql {
+    //! [`Store`] implementation backed by the MySQL task backend.
+
+    use dag::Graph;
+    use runtime::{
+        CommandEmit, CommandEntry, GraphStore, Task, TaskPoll,
+        mysql::{Backend, Error},
+    };
+    use uuid::Uuid;
+
+    use super::{Store, StoreTx};
+
+    impl<S> Store for Backend<S>
+    where
+        S: GraphStore<Uuid>,
+        <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
+        <S as GraphStore<Uuid>>::G: Graph<NodeId = Uuid>,
+    {
+        type Err = Error;
+        type Tx<'a>
+            = BackendTx<'a>
+        where
+            Self: 'a;
+
+        async fn poll_tasks(&self, max: usize, shard: Option<u32>) -> Result<Vec<Task>, Self::Err> {
+            let mut db = self.db().clone();
+            let tasks: Vec<Task> = Task::poll(&mut db, max, shard).await?.collect();
+            Ok(tasks)
+        }
+
+        async fn transaction(&mut self) -> Result<Self::Tx<'_>, Self::Err> {
+            Ok(BackendTx {
+                tx: self.db_mut().transaction().await?,
+            })
+        }
+    }
+
+    /// A [`StoreTx`] backed by a MySQL transaction.
+    ///
+    /// The command append and the task ack of a scheduling step share one
+    /// transaction, so committing advances both at once.
+    pub struct BackendTx<'a> {
+        tx: toasty::Transaction<'a>,
+    }
+
+    impl StoreTx for BackendTx<'_> {
+        type Err = Error;
+
+        async fn emit(&mut self, entry: &CommandEntry) -> Result<(), Self::Err> {
+            entry.emit(&mut self.tx).await
+        }
+
+        async fn ack(&mut self, task: &Task) -> Result<(), Self::Err> {
+            task.ack(&mut self.tx).await
+        }
+
+        async fn commit(self) -> Result<(), Self::Err> {
+            self.tx.commit().await?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MemStore {
+        pending: RefCell<VecDeque<Task>>,
+        acked: RefCell<Vec<Uuid>>,
+        emitted: RefCell<Vec<CommandEntry>>,
+    }
+
+    impl Store for MemStore {
+        type Err = Infallible;
+        type Tx<'a>
+            = MemTx<'a>
+        where
+            Self: 'a;
+
+        async fn poll_tasks(&self, max: usize, shard: Option<u32>) -> Result<Vec<Task>, Self::Err> {
+            let mut pending = self.pending.borrow_mut();
+            let mut taken = Vec::new();
+            pending.retain(|task| {
+                if taken.len() < max && shard.is_none_or(|shard| task.shard == shard) {
+                    taken.push(task.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            Ok(taken)
+        }
+
+        async fn transaction(&mut self) -> Result<Self::Tx<'_>, Self::Err> {
+            Ok(MemTx { store: &*self })
+        }
+    }
+
+    /// A [`StoreTx`] that records emitted commands and acked tasks in memory.
+    struct MemTx<'a> {
+        store: &'a MemStore,
+    }
+
+    impl StoreTx for MemTx<'_> {
+        type Err = Infallible;
+
+        async fn emit(&mut self, entry: &CommandEntry) -> Result<(), Self::Err> {
+            self.store.emitted.borrow_mut().push(entry.clone());
+            Ok(())
+        }
+
+        async fn ack(&mut self, task: &Task) -> Result<(), Self::Err> {
+            self.store.acked.borrow_mut().push(task.id);
+            Ok(())
+        }
+
+        async fn commit(self) -> Result<(), Self::Err> {
+            Ok(())
+        }
+    }
+
+    /// A [`TaskRunner`] that records a fixed event for every task it runs.
+    struct FixedRunner {
+        event: TaskEvent,
+        events: Mutex<Vec<TaskEventEntry>>,
+    }
+
+    impl FixedRunner {
+        fn new(event: TaskEvent) -> Self {
+            Self {
+                event,
+                events: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TaskRunner for FixedRunner {
+        type Err = Infallible;
+
+        async fn run(&self, task: &Task) -> Result<(), Self::Err> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(TaskEventEntry::new(task, self.event));
+            Ok(())
+        }
+
+        async fn poll(
+            &self,
+            max: usize,
+            shard: Option<u32>,
+        ) -> Result<Vec<TaskEventEntry>, Self::Err> {
+            let mut events = self.events.lock().unwrap();
+            let mut taken = Vec::new();
+            events.retain(|entry| {
+                if taken.len() < max && shard.is_none_or(|shard| entry.shard == shard) {
+                    taken.push(entry.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            Ok(taken)
+        }
+
+        async fn ack(&self, _event: &TaskEventEntry) -> Result<(), Self::Err> {
+            Ok(())
+        }
+    }
+
+    fn task(node: u128) -> Task {
+        task_shard(node, 0)
+    }
+
+    fn task_shard(node: u128, shard: u32) -> Task {
+        Task {
+            task_offset: 0,
+            id: Uuid::new_v4(),
+            data_id: Uuid::from_u128(0xda7a),
+            shard,
+            graph_id: Uuid::from_u128(0x9a1),
+            node_id: Uuid::from_u128(node),
+            node_run_id: 1,
+            created_at: jiff::Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn events_map_to_commands() {
+        let node = Uuid::from_u128(7);
+        assert_eq!(TaskEvent::Pend.command(node), Command::Pend { node });
+        assert_eq!(TaskEvent::Succeed.command(node), Command::Succeed { node });
+        assert_eq!(TaskEvent::Fail.command(node), Command::Fail { node });
+        assert_eq!(
+            TaskEvent::Terminate.command(node),
+            Command::Terminate { node }
+        );
+        assert_eq!(TaskEvent::Cancel.command(node), Command::Cancel { node });
+    }
+
+    #[tokio::test]
+    async fn schedules_ready_task_and_drives_by_event() {
+        let mut scheduler = Scheduler::new(
+            MemStore::default(),
+            FixedRunner::new(TaskEvent::Succeed),
+            16,
+        );
+        let task = task(1);
+        scheduler
+            .store_mut()
+            .pending
+            .borrow_mut()
+            .push_back(task.clone());
+
+        let processed = scheduler.tick().await.unwrap();
+        assert_eq!(processed, 1);
+
+        let store = scheduler.into_store();
+        let emitted = store.emitted.borrow();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].command, Command::Run { node: task.node_id });
+        assert_eq!(emitted[1].command, Command::Succeed { node: task.node_id });
+        assert_eq!(&*store.acked.borrow(), &[task.id]);
+    }
+
+    #[tokio::test]
+    async fn pend_then_terminal_event_drives_pending_node() {
+        let mut scheduler =
+            Scheduler::new(MemStore::default(), FixedRunner::new(TaskEvent::Pend), 16);
+        let task = task(2);
+        scheduler
+            .store_mut()
+            .pending
+            .borrow_mut()
+            .push_back(task.clone());
+
+        scheduler.tick().await.unwrap();
+        scheduler.drive(&task, TaskEvent::Fail).await.unwrap();
+
+        let store = scheduler.into_store();
+        let emitted = store.emitted.borrow();
+        let commands: Vec<_> = emitted.iter().map(|entry| entry.command.clone()).collect();
+        assert_eq!(
+            commands,
+            vec![
+                Command::Run { node: task.node_id },
+                Command::Pend { node: task.node_id },
+                Command::Fail { node: task.node_id },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_respects_batch_and_drain_empties_queue() {
+        let mut scheduler =
+            Scheduler::new(MemStore::default(), FixedRunner::new(TaskEvent::Succeed), 2);
+        for node in 0..5 {
+            scheduler
+                .store_mut()
+                .pending
+                .borrow_mut()
+                .push_back(task(node));
+        }
+
+        assert_eq!(scheduler.tick().await.unwrap(), 2);
+        assert_eq!(scheduler.drain().await.unwrap(), 3);
+
+        let store = scheduler.into_store();
+        assert_eq!(store.acked.borrow().len(), 5);
+        assert_eq!(store.emitted.borrow().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn shard_scoped_scheduler_polls_only_that_shard() {
+        let mut scheduler = Scheduler::new(
+            MemStore::default(),
+            FixedRunner::new(TaskEvent::Succeed),
+            16,
+        )
+        .with_shard(1);
+        for (node, shard) in [(0u128, 0u32), (1, 1), (2, 2), (3, 1)] {
+            scheduler
+                .store_mut()
+                .pending
+                .borrow_mut()
+                .push_back(task_shard(node, shard));
+        }
+
+        assert_eq!(scheduler.shard(), Some(1));
+        assert_eq!(scheduler.drain().await.unwrap(), 2);
+
+        let store = scheduler.into_store();
+        let nodes: Vec<Uuid> = store
+            .emitted
+            .borrow()
+            .iter()
+            .filter_map(|entry| match entry.command {
+                Command::Run { node } => Some(node),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nodes, vec![Uuid::from_u128(1), Uuid::from_u128(3)]);
+    }
+}
