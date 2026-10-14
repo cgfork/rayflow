@@ -1,0 +1,21 @@
+[package]
+name = "scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+runtime = { path = "../runtime", default-features = false }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+dag = { workspace = true, optional = true }
+toasty = { workspace = true, optional = true }
+
+[dev-dependencies]
+jiff = { workspace = true }
+toasty = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[features]
+default = ["mysql"]
+mysql = ["runtime/mysql", "dep:dag", "dep:toasty"]
