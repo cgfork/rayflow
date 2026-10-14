@@ -1,26 +1,21 @@
 [package]
-name = "runner"
+name = "executor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
 runtime = { path = "../runtime", default-features = false, optional = true }
-scheduler = { path = "../scheduler", default-features = false, optional = true }
 uuid = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["process", "rt", "net", "time"], optional = true }
-toasty = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
-toasty = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "process", "net", "time"] }
 
 [features]
@@ -36,10 +31,8 @@ docker = [
 mysql = [
     "dep:runtime",
     "runtime/mysql",
-    "dep:scheduler",
     "dep:uuid",
     "dep:thiserror",
     "dep:tokio",
-    "dep:toasty",
     "docker",
 ]

@@ -36,9 +36,9 @@ CREATE TABLE IF NOT EXISTS run (
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     PRIMARY KEY (id),
     UNIQUE KEY uk_run_uuid (uuid),
-    UNIQUE KEY uk_run_data_graph (data_id, graph_id),
+    UNIQUE KEY uk_run_data_graph_version (data_id, graph_id, version),
     KEY idx_run_shard (shard)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'dag execution run, one row per (data_id, graph_id)';
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'dag execution run, one row per (data_id, graph_id, version)';
 
 CREATE TABLE IF NOT EXISTS run_config (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS node_config (
 
 CREATE TABLE IF NOT EXISTS node_run (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
-    run_id     BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'owning run id',
+    run_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
     data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
     graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
     node_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'node unique identifier',
@@ -85,6 +85,35 @@ CREATE TABLE IF NOT EXISTS node_run (
     KEY idx_node_run_data_graph (data_id, graph_id),
     KEY idx_node_run_shard (shard)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node status within a dag execution run, one row per revision';
+
+CREATE TABLE IF NOT EXISTS transition_lock (
+    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
+    graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
+    updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last lock acquisition timestamp',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_transition_lock_run (data_id, graph_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'transaction-scoped locks serializing run transitions';
+
+CREATE TABLE IF NOT EXISTS scheduled_task (
+    id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    uuid           CHAR(36)        NOT NULL DEFAULT '' COMMENT 'scheduled task unique identifier',
+    task_id        CHAR(36)        NOT NULL DEFAULT '' COMMENT 'task unique identifier',
+    run_id         CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
+    node_run_id    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'owning node run id',
+    node_config_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'referenced node config id',
+    run_config_id  BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'referenced run config id',
+    status         VARCHAR(16)     NOT NULL DEFAULT 'Ready' COMMENT 'scheduled task status',
+    created_at     DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
+    updated_at     DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_scheduled_task_uuid (uuid),
+    KEY idx_scheduled_task_task_id (task_id),
+    KEY idx_scheduled_task_run_id (run_id),
+    KEY idx_scheduled_task_node_run_id (node_run_id),
+    KEY idx_scheduled_task_node_config_id (node_config_id),
+    KEY idx_scheduled_task_run_config_id (run_config_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'scheduled task referencing its task, run, node run and configurations';
 
 CREATE TABLE IF NOT EXISTS command_entry (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key, used as the command offset',

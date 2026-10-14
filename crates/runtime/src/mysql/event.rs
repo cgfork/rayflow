@@ -5,7 +5,7 @@ use toasty::Executor;
 
 use super::Error;
 use super::model::{TaskEventModel, TaskEventPollOffsetModel, unacked_filter};
-use crate::{TaskEventEntry, TaskEventPoll, TaskEventWrite};
+use crate::{TaskEventEntry, TaskEventWrite};
 
 impl<B> TaskEventWrite<B> for TaskEventEntry
 where
@@ -30,60 +30,54 @@ where
     }
 }
 
-impl<B> TaskEventPoll<B> for TaskEventEntry
-where
-    B: Executor,
-{
-    type Err = Error;
-
-    async fn poll(
+impl TaskEventEntry {
+    /// Returns up to `max` task events that have not yet been acknowledged.
+    pub async fn poll<B>(
         backend: &mut B,
-        maxium: usize,
-        shard: Option<u32>,
-    ) -> Result<impl Iterator<Item = Self>, Self::Err> {
-        let fields = TaskEventModel::fields();
-        let rows = match shard {
-            Some(shard) => {
-                let offset = TaskEventPollOffsetModel::filter_by_shard(shard)
-                    .first()
-                    .exec(&mut *backend)
-                    .await?
-                    .map(|row| row.offset)
-                    .unwrap_or(0);
-                TaskEventModel::filter_by_shard(shard)
-                    .filter(fields.id().gt(offset))
-                    .order_by(fields.id().asc())
-                    .limit(maxium)
-                    .exec(&mut *backend)
-                    .await?
-            }
-            None => {
-                let offsets: Vec<(u32, u64)> = TaskEventPollOffsetModel::all()
-                    .exec(&mut *backend)
-                    .await?
-                    .into_iter()
-                    .map(|row| (row.shard, row.offset))
-                    .collect();
-                let mut query = TaskEventModel::all();
-                if let Some(filter) = unacked_filter(&offsets, fields.shard(), fields.id()) {
-                    query = query.filter(filter);
-                }
-                query
-                    .order_by(fields.id().asc())
-                    .limit(maxium)
-                    .exec(&mut *backend)
-                    .await?
-            }
-        };
-
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            events.push(row.into_task_event_entry()?);
+        max: usize,
+        shards: &[u32],
+    ) -> Result<impl Iterator<Item = Self>, Error>
+    where
+        B: Executor,
+    {
+        let mut offset_query = TaskEventPollOffsetModel::all();
+        if !shards.is_empty() {
+            offset_query =
+                offset_query.filter(TaskEventPollOffsetModel::fields().shard().in_list(shards));
         }
-        Ok(events.into_iter())
+        let offsets: Vec<(u32, u64)> = offset_query
+            .exec(&mut *backend)
+            .await?
+            .into_iter()
+            .map(|row| (row.shard, row.offset))
+            .collect();
+
+        let fields = TaskEventModel::fields();
+        let mut query = TaskEventModel::all();
+        if !shards.is_empty() {
+            query = query.filter(fields.shard().in_list(shards));
+        }
+        if let Some(filter) = unacked_filter(&offsets, fields.shard(), fields.id()) {
+            query = query.filter(filter);
+        }
+        let rows = query
+            .order_by(fields.id().asc())
+            .limit(max)
+            .exec(&mut *backend)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(TaskEventModel::into_task_event_entry)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter())
     }
 
-    async fn ack(&self, backend: &mut B) -> Result<(), Self::Err> {
+    /// Acknowledges this event by advancing its shard's recorded offset.
+    pub async fn ack<B>(&self, backend: &mut B) -> Result<(), Error>
+    where
+        B: Executor,
+    {
         // Advance the shard's offset, but never move it backwards.
         let now = Timestamp::now();
         match TaskEventPollOffsetModel::filter_by_shard(self.shard)

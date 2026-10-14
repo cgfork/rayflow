@@ -7,7 +7,7 @@ use dag::{Graph, Id};
 use jiff::Timestamp;
 use uuid::Uuid;
 
-/// Stable FNV-1a hash of a data id, used to place keys on the consistent hash ring.
+/// Stable FNV-1a hash of a data id, used to place it in the shard table.
 pub fn hash_data_id(data_id: Uuid) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -19,10 +19,10 @@ pub fn hash_data_id(data_id: Uuid) -> u64 {
     hash
 }
 
-/// Maps a data id to its shard index on the consistent hash ring.
+/// Maps a data id to its shard index in the shard table.
 ///
 /// The result is always in `0..shards`, so it can be stored in the `shard`
-/// columns and used to route keys on the ring.
+/// columns and used for ownership lookups.
 pub fn shard_of(data_id: Uuid, shards: u32) -> u32 {
     (hash_data_id(data_id) % u64::from(shards)) as u32
 }
@@ -30,7 +30,7 @@ pub fn shard_of(data_id: Uuid, shards: u32) -> u32 {
 /// The node status.
 /// 1. Ready -> Running -> Succeeded/Failed/Terminated
 /// 2. Ready -> Running -> Pending -> Succeeded/Failed/Terminated
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     Ready,
     Running,
@@ -86,7 +86,7 @@ pub trait CommandEmit<B> {
     type Err: std::error::Error;
 
     /// Appends this command entry to `backend`'s log.
-    async fn emit(&self, backend: &mut B) -> Result<(), Self::Err>;
+    async fn emit(&self, backend: &mut B) -> Result<u64, Self::Err>;
 }
 
 /// Polls command entries that are waiting to be applied.
@@ -97,12 +97,12 @@ pub trait CommandPoll<B>: Send + Sized {
 
     /// Returns up to `maxium` command entries that have not been acknowledged.
     ///
-    /// When `shard` is `Some`, only entries routed to that shard are returned;
-    /// when `None`, entries are returned across every shard.
+    /// When `shards` is non-empty, only entries routed to one of those shards
+    /// are returned; when it is empty, entries are returned across every shard.
     async fn poll(
         backend: &mut B,
         maxium: usize,
-        shard: Option<u32>,
+        shards: &[u32],
     ) -> Result<impl Iterator<Item = Self>, Self::Err>;
 
     /// Acknowledges this entry, advancing the recorded offset of its shard to
@@ -199,12 +199,12 @@ pub trait TaskPoll<B>: Send + Sized {
 
     /// Returns up to `maxium` tasks that have not been acknowledged.
     ///
-    /// When `shard` is `Some`, only tasks routed to that shard are returned; when
-    /// `None`, tasks are returned across every shard.
+    /// When `shards` is non-empty, only tasks routed to one of those shards are
+    /// returned; when it is empty, tasks are returned across every shard.
     async fn poll(
         backend: &mut B,
         maxium: usize,
-        shard: Option<u32>,
+        shards: &[u32],
     ) -> Result<impl Iterator<Item = Self>, Self::Err>;
 
     /// Acknowledges this task, advancing the recorded offset of its shard to `self.task_offset`.
@@ -230,6 +230,78 @@ pub struct Task {
     pub node_run_id: u64,
     /// Time at which the task was created.
     pub created_at: Timestamp,
+}
+
+/// A task that has been dispatched to a runner.
+///
+/// A scheduled task materializes the references a runner needs — the task, its
+/// run, node run, and the node and run configurations in effect — together with
+/// the status the dispatch reached. It is written when a task is dispatched and
+/// is what a runner executes from.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScheduledTask {
+    /// Auto-increment primary key.
+    pub id: u64,
+    /// Unique scheduled task identifier.
+    pub uuid: Uuid,
+    /// Identifier of the task being dispatched.
+    pub task_id: Uuid,
+    /// Identifier of the run the task belongs to.
+    pub run_id: Uuid,
+    /// Identifier of the node run the task drives.
+    pub node_run_id: u64,
+    /// Identifier of the node configuration in effect.
+    pub node_config_id: u64,
+    /// Identifier of the run configuration in effect.
+    pub run_config_id: u64,
+    /// Status the dispatch reached.
+    pub status: Status,
+    /// Time at which the scheduled task was created.
+    pub created_at: Timestamp,
+    /// Time at which the scheduled task was last updated.
+    pub updated_at: Timestamp,
+}
+
+impl ScheduledTask {
+    /// Creates a scheduled task dispatching `task` under `run_id`.
+    ///
+    /// The task is marked [`Running`](Status::Running) and references the node
+    /// and run configurations in effect (`0` when there is none).
+    pub fn dispatch(task: &Task, run_id: Uuid, node_config_id: u64, run_config_id: u64) -> Self {
+        let now = Timestamp::now();
+        Self {
+            id: 0,
+            uuid: Uuid::new_v4(),
+            task_id: task.id,
+            run_id,
+            node_run_id: task.node_run_id,
+            node_config_id,
+            run_config_id,
+            status: Status::Running,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// Persists a scheduled task.
+#[allow(async_fn_in_trait)]
+pub trait ScheduledTaskWrite<B> {
+    /// Error returned when writing a scheduled task.
+    type Err: std::error::Error;
+
+    /// Writes this scheduled task to `backend`.
+    async fn write(&self, backend: &mut B) -> Result<(), Self::Err>;
+}
+
+/// Reads a scheduled task by the task it dispatches.
+#[allow(async_fn_in_trait)]
+pub trait ScheduledTaskRead<I, B>: Send + Sized {
+    /// Error returned when reading a scheduled task.
+    type Err: std::error::Error;
+
+    /// Reads the scheduled task dispatching the task identified by `task_id`.
+    async fn read(backend: &mut B, task_id: I) -> Result<Self, Self::Err>;
 }
 
 /// A run's annotation configuration at a given revision.
@@ -305,6 +377,16 @@ impl TaskEvent {
             TaskEvent::Cancel => Command::Cancel { node },
         }
     }
+
+    /// The node status this event drives a node to.
+    pub fn status(self) -> Status {
+        match self {
+            TaskEvent::Pend => Status::Pending,
+            TaskEvent::Succeed => Status::Succeeded,
+            TaskEvent::Fail => Status::Failed,
+            TaskEvent::Terminate | TaskEvent::Cancel => Status::Terminated,
+        }
+    }
 }
 
 impl std::fmt::Display for TaskEvent {
@@ -344,25 +426,20 @@ pub trait TaskEventWrite<B> {
     async fn write(&self, backend: &mut B) -> Result<(), Self::Err>;
 }
 
-/// Polls task events that are waiting to be consumed.
+/// Polls and acknowledges the task events produced by runs.
 #[allow(async_fn_in_trait)]
-pub trait TaskEventPoll<B>: Send + Sized {
+pub trait TaskEventPoll: Send + Sync {
     /// Error returned when polling or acknowledging a task event.
-    type Err: std::error::Error;
+    type Err: std::error::Error + Send + Sync + 'static;
 
-    /// Returns up to `maxium` task events that have not been acknowledged.
+    /// Returns up to `max` task events that have not yet been consumed.
     ///
-    /// When `shard` is `Some`, only events routed to that shard are returned; when
-    /// `None`, events are returned across every shard.
-    async fn poll(
-        backend: &mut B,
-        maxium: usize,
-        shard: Option<u32>,
-    ) -> Result<impl Iterator<Item = Self>, Self::Err>;
+    /// When `shards` is non-empty, only events routed to one of those shards are
+    /// returned; when it is empty, events are returned across every shard.
+    async fn poll(&self, max: usize, shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err>;
 
-    /// Acknowledges this event, advancing the recorded offset of its shard to
-    /// `self.event_offset`.
-    async fn ack(&self, backend: &mut B) -> Result<(), Self::Err>;
+    /// Acknowledges `event`, so it is not polled again.
+    async fn ack(&self, event: &TaskEventEntry) -> Result<(), Self::Err>;
 }
 
 /// A task event recorded in the event log.
@@ -413,10 +490,20 @@ impl TaskEventEntry {
     }
 }
 
-#[allow(async_fn_in_trait)]
+/// Loads graphs by id.
+///
+/// `load` returns a `Send` future so a graph store can be awaited from an async
+/// context that must itself be `Send` (a request handler, say).
 pub trait GraphStore<I: Id> {
+    /// The graph type this store loads.
     type G: Graph<GraphId = I>;
+    /// Error returned when loading a graph.
     type Err: std::error::Error;
 
-    async fn load(&self, graph_id: I, version: Option<u64>) -> Result<Self::G, Self::Err>;
+    /// Loads the graph with the given id, at `version` when one is given.
+    fn load(
+        &self,
+        graph_id: I,
+        version: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<Self::G, Self::Err>> + Send;
 }

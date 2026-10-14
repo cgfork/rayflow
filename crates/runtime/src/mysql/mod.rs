@@ -1,8 +1,10 @@
 //! MySQL-backed task backend.
 //!
-//! Every operation is expressed with the Toasty [`Model`](toasty::Model)s in
+//! Most operations are expressed with the Toasty [`Model`](toasty::Model)s in
 //! [`model`]; register them on the [`Db`](toasty::Db) with [`models`] (or let
-//! [`Backend::connect`] do it) before issuing queries.
+//! [`Backend::connect`] do it) before issuing queries. The task, command, and
+//! task-event pollers first fetch the relevant per-shard offsets, then query the
+//! log with those offsets applied.
 
 use toasty::Db;
 use uuid::Uuid;
@@ -10,7 +12,9 @@ use uuid::Uuid;
 mod command;
 mod entry;
 mod event;
+mod lock;
 pub mod model;
+mod scheduled;
 mod task;
 
 pub use model::models;
@@ -55,6 +59,12 @@ pub enum Error {
     /// A stored task event name could not be parsed.
     #[error("invalid task event: {0}")]
     InvalidEvent(String),
+    /// A scheduled task with the given task id does not exist.
+    #[error("scheduled task not found: {0}")]
+    ScheduledTaskNotFound(Uuid),
+    /// A stored scheduled task status could not be parsed.
+    #[error("invalid status: {0}")]
+    InvalidStatus(String),
 }
 
 /// A MySQL-backed task backend.
@@ -66,8 +76,8 @@ pub struct Backend<S> {
 }
 
 impl<S> Backend<S> {
-    /// Creates a backend from an existing database handle, the number of shards on the
-    /// consistent hash ring, and the graph store used to resolve graph structure.
+    /// Creates a backend from an existing database handle, the number of shards in
+    /// the shard table, and the graph store used to resolve graph structure.
     pub fn new(db: Db, shards: u32, graph_store: S) -> Self {
         assert!(shards > 0, "shards must be at least 1");
         Self {
