@@ -11,9 +11,10 @@
 //! ```
 //!
 //! Scheduling a task emits [`Command::Run`] for its node. A [`TaskRunner`] then
-//! runs the scheduled task, recording the [`TaskEvent`] it produces; the
-//! scheduler polls those events (optionally scoped to one shard) and emits the
-//! command that drives each node to its next status as a [`CommandEntry`].
+//! runs the scheduled task, recording the [`TaskEvent`] it produces; a
+//! [`TaskEventPoll`] supplies those events (optionally scoped to a set of shards)
+//! and acknowledges them once the scheduler emits the command that drives each
+//! node to its next status as a [`CommandEntry`].
 //! Commands are appended to the store's command log (via
 //! [`CommandEmit`](runtime::CommandEmit)) rather than applied inline: consuming
 //! and applying them (via [`CommandPoll`](runtime::CommandPoll) +
@@ -22,38 +23,39 @@
 //! also be driven to a terminal status by feeding a [`TaskEvent`] back through
 //! [`Scheduler::drive`].
 //!
-//! The scheduler is backend-agnostic: it depends only on the [`Store`] and
-//! [`TaskRunner`] traits. A [`mysql`](runtime::mysql) [`Store`] implementation is
-//! provided behind the default `mysql` feature.
+//! The scheduler is backend-agnostic: it depends only on the [`Store`],
+//! [`TaskRunner`], and [`TaskEventPoll`] traits. A
+//! [`mysql`](runtime::mysql) [`Store`] implementation is provided behind the
+//! default `mysql` feature, along with the [`AutoRunner`] and [`Dispatcher`]
+//! components.
 
-use runtime::{Command, CommandEntry, Task};
+use runtime::{Command, CommandEntry, Task, TaskEventPoll};
 use uuid::Uuid;
+
+#[cfg(feature = "mysql")]
+pub mod auto;
+#[cfg(feature = "mysql")]
+pub mod dispatcher;
 
 pub use runtime::{TaskEvent, TaskEventEntry};
 
-/// Executes scheduled tasks and reports the events that drive their status.
+#[cfg(feature = "mysql")]
+pub use auto::AutoRunner;
+#[cfg(feature = "mysql")]
+pub use dispatcher::Dispatcher;
+
+/// Executes scheduled tasks.
 #[allow(async_fn_in_trait)]
 pub trait TaskRunner: Send + Sync {
-    /// Error returned when running a task or polling its event.
+    /// Error returned when running a task.
     type Err: std::error::Error + Send + Sync + 'static;
 
     /// Runs `task`, executing the work.
     ///
     /// The event the run produces is recorded and later returned by
-    /// [`poll`](Self::poll), so running a task does not itself report the event.
+    /// [`TaskEventPoll::poll`], so running a task does not itself report the
+    /// event.
     async fn run(&self, task: &Task) -> Result<(), Self::Err>;
-
-    /// Polls up to `max` task events that have not yet been consumed.
-    ///
-    /// When `shard` is `Some`, only events routed to that shard are returned;
-    /// when `None`, events are returned across every shard.
-    async fn poll(&self, max: usize, shard: Option<u32>) -> Result<Vec<TaskEventEntry>, Self::Err>;
-
-    /// Acknowledges `event`, so it is not polled again.
-    ///
-    /// Called once the event has been driven, so an event is only consumed after
-    /// its command has been emitted.
-    async fn ack(&self, event: &TaskEventEntry) -> Result<(), Self::Err>;
 }
 
 /// The store the scheduler consumes tasks from and drives commands into.
@@ -72,9 +74,9 @@ pub trait Store {
 
     /// Consumes up to `max` tasks that have not yet been acknowledged.
     ///
-    /// When `shard` is `Some`, only tasks routed to that shard are returned; when
-    /// `None`, tasks are returned across every shard.
-    async fn poll_tasks(&self, max: usize, shard: Option<u32>) -> Result<Vec<Task>, Self::Err>;
+    /// When `shards` is non-empty, only tasks routed to one of those shards are
+    /// returned; when it is empty, tasks are returned across every shard.
+    async fn poll_tasks(&self, max: usize, shards: &[u32]) -> Result<Vec<Task>, Self::Err>;
 
     /// Opens a transaction the scheduler drives commands and task acks through.
     ///
@@ -110,7 +112,7 @@ pub enum Error {
     #[error("task store: {0}")]
     Store(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The task runner returned an error.
-    #[error("task runner: {0}")]
+    #[error("task runner or event consumer: {0}")]
     Runner(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -133,13 +135,13 @@ pub struct Scheduler<S, R> {
     store: S,
     runner: R,
     batch: usize,
-    shard: Option<u32>,
+    shards: Vec<u32>,
 }
 
 impl<S, R> Scheduler<S, R>
 where
     S: Store,
-    R: TaskRunner,
+    R: TaskRunner + TaskEventPoll,
 {
     /// Creates a scheduler that consumes at most `batch` tasks per [`tick`](Self::tick).
     pub fn new(store: S, runner: R, batch: usize) -> Self {
@@ -148,7 +150,7 @@ where
             store,
             runner,
             batch,
-            shard: None,
+            shards: Vec::new(),
         }
     }
 
@@ -156,13 +158,44 @@ where
     ///
     /// By default a scheduler polls tasks across every shard.
     pub fn with_shard(mut self, shard: u32) -> Self {
-        self.shard = Some(shard);
+        self.shards = vec![shard];
         self
     }
 
-    /// Returns the shard this scheduler polls, or `None` if it polls every shard.
+    /// Restricts polling to the shards in `shards`.
+    ///
+    /// Pass the shards owned by this process in the shard table; an empty set
+    /// polls every shard.
+    pub fn with_shards<I>(mut self, shards: I) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        self.shards = normalize_shards(shards);
+        self
+    }
+
+    /// Replaces the set of shards this scheduler polls.
+    ///
+    /// Call this after a membership notification changes table ownership.
+    pub fn set_shards<I>(&mut self, shards: I)
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        self.shards = normalize_shards(shards);
+    }
+
+    /// Returns the shards this scheduler polls, or an empty slice for every shard.
+    pub fn shards(&self) -> &[u32] {
+        &self.shards
+    }
+
+    /// Returns the single shard this scheduler polls, or `None` when it polls
+    /// every shard or more than one shard.
     pub fn shard(&self) -> Option<u32> {
-        self.shard
+        match self.shards.as_slice() {
+            [shard] => Some(*shard),
+            _ => None,
+        }
     }
 
     /// Returns a shared reference to the underlying store.
@@ -228,7 +261,7 @@ where
     pub async fn tick(&mut self) -> Result<usize, Error> {
         let tasks = self
             .store
-            .poll_tasks(self.batch, self.shard)
+            .poll_tasks(self.batch, &self.shards)
             .await
             .map_err(store_err)?;
         for task in &tasks {
@@ -246,7 +279,7 @@ where
     pub async fn drive_events(&mut self) -> Result<usize, Error> {
         let events = self
             .runner
-            .poll(self.batch, self.shard)
+            .poll(self.batch, &self.shards)
             .await
             .map_err(runner_err)?;
         for entry in &events {
@@ -276,6 +309,16 @@ where
     }
 }
 
+fn normalize_shards<I>(shards: I) -> Vec<u32>
+where
+    I: IntoIterator<Item = u32>,
+{
+    let mut shards: Vec<u32> = shards.into_iter().collect();
+    shards.sort_unstable();
+    shards.dedup();
+    shards
+}
+
 #[cfg(feature = "mysql")]
 mod mysql {
     //! [`Store`] implementation backed by the MySQL task backend.
@@ -301,9 +344,9 @@ mod mysql {
         where
             Self: 'a;
 
-        async fn poll_tasks(&self, max: usize, shard: Option<u32>) -> Result<Vec<Task>, Self::Err> {
+        async fn poll_tasks(&self, max: usize, shards: &[u32]) -> Result<Vec<Task>, Self::Err> {
             let mut db = self.db().clone();
-            let tasks: Vec<Task> = Task::poll(&mut db, max, shard).await?.collect();
+            let tasks: Vec<Task> = Task::poll(&mut db, max, shards).await?.collect();
             Ok(tasks)
         }
 
@@ -326,7 +369,8 @@ mod mysql {
         type Err = Error;
 
         async fn emit(&mut self, entry: &CommandEntry) -> Result<(), Self::Err> {
-            entry.emit(&mut self.tx).await
+            entry.emit(&mut self.tx).await?;
+            Ok(())
         }
 
         async fn ack(&mut self, task: &Task) -> Result<(), Self::Err> {
@@ -363,11 +407,11 @@ mod tests {
         where
             Self: 'a;
 
-        async fn poll_tasks(&self, max: usize, shard: Option<u32>) -> Result<Vec<Task>, Self::Err> {
+        async fn poll_tasks(&self, max: usize, shards: &[u32]) -> Result<Vec<Task>, Self::Err> {
             let mut pending = self.pending.borrow_mut();
             let mut taken = Vec::new();
             pending.retain(|task| {
-                if taken.len() < max && shard.is_none_or(|shard| task.shard == shard) {
+                if taken.len() < max && (shards.is_empty() || shards.contains(&task.shard)) {
                     taken.push(task.clone());
                     false
                 } else {
@@ -430,16 +474,16 @@ mod tests {
                 .push(TaskEventEntry::new(task, self.event));
             Ok(())
         }
+    }
 
-        async fn poll(
-            &self,
-            max: usize,
-            shard: Option<u32>,
-        ) -> Result<Vec<TaskEventEntry>, Self::Err> {
+    impl TaskEventPoll for FixedRunner {
+        type Err = Infallible;
+
+        async fn poll(&self, max: usize, shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err> {
             let mut events = self.events.lock().unwrap();
             let mut taken = Vec::new();
             events.retain(|entry| {
-                if taken.len() < max && shard.is_none_or(|shard| entry.shard == shard) {
+                if taken.len() < max && (shards.is_empty() || shards.contains(&entry.shard)) {
                     taken.push(entry.clone());
                     false
                 } else {
@@ -586,5 +630,38 @@ mod tests {
             })
             .collect();
         assert_eq!(nodes, vec![Uuid::from_u128(1), Uuid::from_u128(3)]);
+    }
+
+    #[tokio::test]
+    async fn scheduler_polls_an_owned_shard_set() {
+        let mut scheduler = Scheduler::new(
+            MemStore::default(),
+            FixedRunner::new(TaskEvent::Succeed),
+            16,
+        )
+        .with_shards([2, 1, 1]);
+        for (node, shard) in [(0u128, 0u32), (1, 1), (2, 2), (3, 3)] {
+            scheduler
+                .store_mut()
+                .pending
+                .borrow_mut()
+                .push_back(task_shard(node, shard));
+        }
+
+        assert_eq!(scheduler.shards(), &[1, 2]);
+        assert_eq!(scheduler.shard(), None);
+        assert_eq!(scheduler.drain().await.unwrap(), 2);
+
+        let store = scheduler.into_store();
+        let nodes: Vec<Uuid> = store
+            .emitted
+            .borrow()
+            .iter()
+            .filter_map(|entry| match entry.command {
+                Command::Run { node } => Some(node),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nodes, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
     }
 }

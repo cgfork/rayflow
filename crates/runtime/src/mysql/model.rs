@@ -21,9 +21,9 @@ use toasty::Json;
 use toasty::stmt::{Expr, Path};
 use uuid::Uuid;
 
-use crate::{Command, CommandEntry, TaskEvent, TaskEventEntry};
+use crate::{Command, CommandEntry, ScheduledTask, Status, TaskEvent, TaskEventEntry};
 
-/// Builds the filter selecting event-log rows that are past their shard's
+/// Builds the filter selecting log rows that are past their shard's
 /// acknowledged offset.
 ///
 /// `offsets` holds the acknowledged `(shard, offset)` pairs. A row is selectable
@@ -106,10 +106,10 @@ pub struct TaskPollOffsetModel {
     pub updated_at: Timestamp,
 }
 
-/// The `run` table: one execution of a graph for a `(data_id, graph_id)`.
+/// The `run` table: one execution of a graph version for a `(data_id, graph_id)`.
 #[derive(Debug, Clone, toasty::Model)]
 #[table = "run"]
-#[unique(data_id, graph_id)]
+#[unique(data_id, graph_id, version)]
 pub struct RunModel {
     #[key]
     #[auto]
@@ -181,7 +181,8 @@ pub struct NodeRunModel {
     #[key]
     #[auto]
     pub id: u64,
-    pub run_id: u64,
+    /// Unique identifier of the run this node run belongs to.
+    pub run_id: Uuid,
     pub data_id: Uuid,
     pub graph_id: Uuid,
     pub node_id: Uuid,
@@ -192,8 +193,78 @@ pub struct NodeRunModel {
     pub status: String,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    #[belongs_to(key = run_id, references = id)]
+    #[belongs_to(key = run_id, references = uuid)]
     pub run: toasty::Deferred<RunModel>,
+}
+
+/// The `transition_lock` table: transaction-scoped locks serializing command
+/// application for a run.
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "transition_lock"]
+#[unique(data_id, graph_id)]
+pub struct TransitionLockModel {
+    #[key]
+    #[auto]
+    pub id: u64,
+    pub data_id: Uuid,
+    pub graph_id: Uuid,
+    pub updated_at: Timestamp,
+}
+
+/// The `scheduled_task` table: a task materialized with the run, node run, and
+/// configurations needed to execute it.
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "scheduled_task"]
+pub struct ScheduledTaskModel {
+    #[key]
+    #[auto]
+    pub id: u64,
+    #[unique]
+    pub uuid: Uuid,
+    #[index]
+    pub task_id: Uuid,
+    #[index]
+    pub run_id: Uuid,
+    #[index]
+    pub node_run_id: u64,
+    #[index]
+    pub node_config_id: u64,
+    #[index]
+    pub run_config_id: u64,
+    #[column(type = varchar(16))]
+    pub status: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[belongs_to(key = task_id, references = uuid)]
+    pub task: toasty::Deferred<TaskModel>,
+    #[belongs_to(key = run_id, references = uuid)]
+    pub run: toasty::Deferred<RunModel>,
+    #[belongs_to(key = node_run_id, references = id)]
+    pub node_run: toasty::Deferred<NodeRunModel>,
+    #[belongs_to(key = node_config_id, references = id)]
+    pub node_config: toasty::Deferred<NodeConfigModel>,
+    #[belongs_to(key = run_config_id, references = id)]
+    pub run_config: toasty::Deferred<RunConfigModel>,
+}
+
+impl ScheduledTaskModel {
+    /// Converts this model into the domain [`ScheduledTask`](crate::ScheduledTask).
+    pub fn into_scheduled_task(self) -> Result<ScheduledTask, super::Error> {
+        let status = Status::from_str(&self.status)
+            .map_err(|_| super::Error::InvalidStatus(self.status.clone()))?;
+        Ok(ScheduledTask {
+            id: self.id,
+            uuid: self.uuid,
+            task_id: self.task_id,
+            run_id: self.run_id,
+            node_run_id: self.node_run_id,
+            node_config_id: self.node_config_id,
+            run_config_id: self.run_config_id,
+            status,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
 }
 
 /// The `command_entry` table: the append-only command event log.
@@ -322,6 +393,8 @@ pub fn models() -> toasty::ModelSet {
         RunConfigModel,
         NodeConfigModel,
         NodeRunModel,
+        TransitionLockModel,
+        ScheduledTaskModel,
         CommandEntryModel,
         CommandPollOffsetModel,
         TaskEventModel,

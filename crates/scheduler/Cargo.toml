@@ -9,13 +9,15 @@ runtime = { path = "../runtime", default-features = false }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 dag = { workspace = true, optional = true }
+jiff = { workspace = true, optional = true }
 toasty = { workspace = true, optional = true }
 
 [dev-dependencies]
 jiff = { workspace = true }
+serde_json = { workspace = true }
 toasty = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 [features]
 default = ["mysql"]
-mysql = ["runtime/mysql", "dep:dag", "dep:toasty"]
+mysql = ["runtime/mysql", "dep:dag", "dep:jiff", "dep:toasty"]

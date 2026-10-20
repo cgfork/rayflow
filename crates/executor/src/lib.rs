@@ -1,21 +1,11 @@
-//! Task runner.
+//! Task executor.
 //!
-//! A runner executes a task's job and reports the event the run produced,
-//! implementing the scheduler's `TaskRunner` contract. The job itself is
-//! described by [`Job`]:
+//! The executor crate provides job primitives for executing a task's work.
+//! [`Runnable`] describes a job that runs in a [`JobContext`] and returns a
+//! [`TaskState`], whose event drives the task's node. [`script::Script`] is the
+//! built-in job that runs source through an interpreter.
 //!
-//! - [`Job::Docker`] — a container image run through the Docker Engine API.
-//! - [`Job::Script`] — a script run through an interpreter.
-//!
-//! A job is deserialized from a node's configuration payload
-//! (`node_config.config`), so it uses a tagged wire format: the `type` field
-//! selects the variant and the remaining fields are that variant's fields. See
-//! [`Job::from_config`].
-//!
-//! The job types are feature-agnostic and always available. [`local::LocalRunner`]
-//! executes jobs on the local machine and persists their events to the
-//! `task_event` table; it is gated behind the default `mysql` feature, and the
-//! [`docker`] client behind the default `docker` feature.
+//! The job types are feature-agnostic and always available.
 
 pub mod script;
 

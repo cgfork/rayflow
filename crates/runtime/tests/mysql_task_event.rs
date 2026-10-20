@@ -6,7 +6,7 @@
 //! `DATABASE_URL` the test is skipped.
 #![cfg(feature = "mysql")]
 
-use runtime::{TaskEvent, TaskEventEntry, TaskEventPoll, TaskEventWrite};
+use runtime::{TaskEvent, TaskEventEntry, TaskEventWrite};
 use toasty::Db;
 use uuid::Uuid;
 
@@ -59,7 +59,7 @@ async fn writes_polls_and_acks_task_events() {
         .await
         .expect("write fail");
 
-    let polled: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, None)
+    let polled: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, &[])
         .await
         .expect("poll events")
         .collect();
@@ -75,7 +75,7 @@ async fn writes_polls_and_acks_task_events() {
     }
 
     // Acknowledged events are not polled again.
-    let again: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, None)
+    let again: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, &[])
         .await
         .expect("poll events again")
         .collect();
@@ -83,7 +83,7 @@ async fn writes_polls_and_acks_task_events() {
 }
 
 #[tokio::test]
-async fn poll_scopes_by_shard() {
+async fn poll_scopes_by_shards() {
     let Some(mut db) = setup().await else {
         eprintln!("skipping: set DATABASE_URL to run the MySQL task event test");
         return;
@@ -98,10 +98,18 @@ async fn poll_scopes_by_shard() {
         .await
         .expect("write shard 1");
 
-    let shard0: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, Some(0))
+    let shard0: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, &[0])
         .await
         .expect("poll shard 0")
         .collect();
     assert_eq!(shard0.len(), 1);
     assert_eq!(shard0[0].node_id, Uuid::from_u128(1));
+
+    let selected: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, &[0, 1])
+        .await
+        .expect("poll shards 0 and 1")
+        .collect();
+    assert_eq!(selected.len(), 2);
+    assert_eq!(selected[0].node_id, Uuid::from_u128(1));
+    assert_eq!(selected[1].node_id, Uuid::from_u128(2));
 }

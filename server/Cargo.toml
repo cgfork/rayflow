@@ -1,0 +1,21 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+config = { workspace = true }
+runtime = { workspace = true }
+dag = { workspace = true }
+jiff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toasty = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

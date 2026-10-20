@@ -24,6 +24,7 @@ use runtime::mysql::Backend;
 use runtime::mysql::model::{NodeRunModel, RunModel};
 use runtime::{
     Command, CommandApply, CommandEmit, CommandEntry, CommandPoll, GraphStore, Status, Task,
+    TaskEventPoll,
 };
 use scheduler::{Scheduler, TaskEvent, TaskEventEntry, TaskRunner};
 use toasty::Db;
@@ -82,12 +83,16 @@ impl TaskRunner for MockRunner {
             .push(TaskEventEntry::new(task, event));
         Ok(())
     }
+}
 
-    async fn poll(&self, max: usize, shard: Option<u32>) -> Result<Vec<TaskEventEntry>, Self::Err> {
+impl TaskEventPoll for MockRunner {
+    type Err = Infallible;
+
+    async fn poll(&self, max: usize, shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err> {
         let mut events = self.events.lock().unwrap();
         let mut taken = Vec::new();
         events.retain(|entry| {
-            if taken.len() < max && shard.is_none_or(|shard| entry.shard == shard) {
+            if taken.len() < max && (shards.is_empty() || shards.contains(&entry.shard)) {
                 taken.push(entry.clone());
                 false
             } else {
@@ -158,7 +163,7 @@ async fn start_run(db: &mut Db, backend: &Backend<TestGraphStore>, data_id: Uuid
 /// Polls the command log and applies every unacknowledged command, in offset
 /// order. Returns how many commands were applied.
 async fn consume_commands(db: &mut Db, backend: &Backend<TestGraphStore>) -> usize {
-    let entries: Vec<CommandEntry> = CommandEntry::poll(db, 256, None)
+    let entries: Vec<CommandEntry> = CommandEntry::poll(db, 256, &[])
         .await
         .expect("poll commands")
         .collect();
@@ -190,7 +195,7 @@ async fn run_to_quiescence(
 
 /// Returns the latest node run per `(run_id, node_id)`.
 fn latest_node_runs(rows: &[NodeRunModel]) -> Vec<&NodeRunModel> {
-    let mut latest: HashMap<(u64, Uuid), &NodeRunModel> = HashMap::new();
+    let mut latest: HashMap<(Uuid, Uuid), &NodeRunModel> = HashMap::new();
     for row in rows {
         match latest.get(&(row.run_id, row.node_id)) {
             Some(current) if current.revision >= row.revision => {}
@@ -290,7 +295,7 @@ async fn mysql_scheduler_runs_a_chain_to_completion() {
     assert_eq!(failed, 0);
 
     // Every emitted command was consumed.
-    let pending: Vec<CommandEntry> = CommandEntry::poll(&mut db, 256, None)
+    let pending: Vec<CommandEntry> = CommandEntry::poll(&mut db, 256, &[])
         .await
         .expect("poll commands")
         .collect();

@@ -53,48 +53,39 @@ where
     async fn poll(
         backend: &mut B,
         maxium: usize,
-        shard: Option<u32>,
+        shards: &[u32],
     ) -> Result<impl Iterator<Item = Self>, Self::Err> {
-        let fields = TaskModel::fields();
-        let rows = match shard {
-            Some(shard) => {
-                let offset = TaskPollOffsetModel::filter_by_shard(shard)
-                    .first()
-                    .exec(&mut *backend)
-                    .await?
-                    .map(|row| row.offset)
-                    .unwrap_or(0);
-                TaskModel::filter_by_shard(shard)
-                    .filter(fields.id().gt(offset))
-                    .order_by(fields.id().asc())
-                    .limit(maxium)
-                    .exec(&mut *backend)
-                    .await?
-            }
-            None => {
-                let offsets: Vec<(u32, u64)> = TaskPollOffsetModel::all()
-                    .exec(&mut *backend)
-                    .await?
-                    .into_iter()
-                    .map(|row| (row.shard, row.offset))
-                    .collect();
-                let mut query = TaskModel::all();
-                if let Some(filter) = unacked_filter(&offsets, fields.shard(), fields.id()) {
-                    query = query.filter(filter);
-                }
-                query
-                    .order_by(fields.id().asc())
-                    .limit(maxium)
-                    .exec(&mut *backend)
-                    .await?
-            }
-        };
-
-        let mut tasks = Vec::with_capacity(rows.len());
-        for row in rows {
-            tasks.push(row.into_task()?);
+        let mut offset_query = TaskPollOffsetModel::all();
+        if !shards.is_empty() {
+            offset_query =
+                offset_query.filter(TaskPollOffsetModel::fields().shard().in_list(shards));
         }
-        Ok(tasks.into_iter())
+        let offsets: Vec<(u32, u64)> = offset_query
+            .exec(&mut *backend)
+            .await?
+            .into_iter()
+            .map(|row| (row.shard, row.offset))
+            .collect();
+
+        let fields = TaskModel::fields();
+        let mut query = TaskModel::all();
+        if !shards.is_empty() {
+            query = query.filter(fields.shard().in_list(shards));
+        }
+        if let Some(filter) = unacked_filter(&offsets, fields.shard(), fields.id()) {
+            query = query.filter(filter);
+        }
+        let rows = query
+            .order_by(fields.id().asc())
+            .limit(maxium)
+            .exec(&mut *backend)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(TaskModel::into_task)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter())
     }
 
     async fn ack(&self, backend: &mut B) -> Result<(), Self::Err> {
