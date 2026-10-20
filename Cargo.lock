@@ -705,14 +705,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dag"
-version = "0.1.0"
-dependencies = [
- "serde",
- "uuid",
-]
-
-[[package]]
 name = "deadpool"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -888,6 +880,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "event"
+version = "0.1.0"
+dependencies = [
+ "jiff",
+ "serde",
+ "thiserror",
+ "toasty",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "event-listener"
 version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -902,10 +906,10 @@ name = "executor"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "event",
  "http-body-util",
  "hyper",
  "hyper-util",
- "runtime",
  "serde",
  "thiserror",
  "tokio",
@@ -1141,6 +1145,14 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "graph"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "uuid",
+]
 
 [[package]]
 name = "hashbrown"
@@ -2104,6 +2116,7 @@ version = "0.1.0"
 dependencies = [
  "config",
  "coordinator",
+ "event",
  "runtime",
  "scheduler",
  "serde",
@@ -2542,7 +2555,8 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "coordinator",
- "dag",
+ "event",
+ "graph",
  "jiff",
  "serde",
  "serde_json",
@@ -2740,9 +2754,12 @@ dependencies = [
 name = "scheduler"
 version = "0.1.0"
 dependencies = [
- "dag",
+ "coordinator",
+ "event",
+ "graph",
  "jiff",
  "runtime",
+ "serde",
  "serde_json",
  "thiserror",
  "toasty",
@@ -2882,7 +2899,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "config",
- "dag",
+ "event",
+ "graph",
  "jiff",
  "runtime",
  "serde",

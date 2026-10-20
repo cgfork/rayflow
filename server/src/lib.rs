@@ -12,10 +12,10 @@ pub use app::App;
 pub use config::Config;
 pub use graph::{Graphs, StaticGraphStore};
 
+use ::graph::GraphStore;
+use ::graph::types::DAG;
 use axum::Router;
 use axum::routing::get;
-use dag::types::DAG;
-use runtime::GraphStore;
 use uuid::Uuid;
 
 /// Builds the application router: service routes plus the REST API.

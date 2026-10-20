@@ -1,17 +1,20 @@
-//! Integration test for the distributed transition lock.
+//! Integration test for guarded command transitions.
 //!
 //! It needs a MySQL instance. Set `DATABASE_URL` (for example
 //! `mysql://root:password@127.0.0.1:3306/rayflow`) to run it; the test resets
 //! the database and pushes the schema from the Toasty models itself. Without
 //! `DATABASE_URL` the test is skipped.
-#![cfg(feature = "mysql")]
 
 use std::convert::Infallible;
 
-use dag::types::{DAG, Node};
-use runtime::mysql::model::NodeRunModel;
-use runtime::mysql::{Backend, Error};
-use runtime::{Command, CommandApply, CommandEntry, GraphStore, Status};
+use event::command::Command;
+use event::command::CommandEntry;
+use graph::GraphStore;
+use graph::types::{DAG, Node};
+use runtime::CommandApply;
+use runtime::backend::Status;
+use runtime::command::NodeRun;
+use runtime::{Error, backend::Backend};
 use toasty::Db;
 use uuid::Uuid;
 
@@ -33,7 +36,7 @@ async fn setup() -> Option<(Db, DAG, Uuid, Uuid)> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
     let mut builder = Db::builder();
-    builder.models(runtime::mysql::models());
+    builder.models(runtime::models());
     let db = builder
         .connect(&url)
         .await
@@ -63,7 +66,7 @@ async fn setup() -> Option<(Db, DAG, Uuid, Uuid)> {
 #[tokio::test]
 async fn concurrent_applications_visit_a_transition_once() {
     let Some((mut db, dag, data_id, graph_id)) = setup().await else {
-        eprintln!("skipping: set DATABASE_URL to run the MySQL transition lock test");
+        eprintln!("skipping: set DATABASE_URL to run the MySQL command transition test");
         return;
     };
 
@@ -75,9 +78,7 @@ async fn concurrent_applications_visit_a_transition_once() {
         .await
         .expect("start run");
 
-    // Two consumers race to apply the same transition. The transaction-scoped
-    // lock makes the loser wait, after which it observes Running and rejects the
-    // duplicate transition instead of visiting the node's state twice.
+    // Guarded updates allow only one consumer to apply the transition.
     let transition = CommandEntry::new(data_id, graph_id, Command::Run { node });
     let (first, second) = tokio::join!(
         transition.apply(backend.clone()),
@@ -96,13 +97,17 @@ async fn concurrent_applications_visit_a_transition_once() {
                 assert_eq!(rejected_node, node);
                 rejected += 1;
             }
+            Err(Error::ConcurrentUpdate(rejected_node)) => {
+                assert_eq!(rejected_node, node);
+                rejected += 1;
+            }
             Err(error) => panic!("unexpected transition error: {error}"),
         }
     }
     assert_eq!(applied, 1);
     assert_eq!(rejected, 1);
 
-    let node_run = NodeRunModel::all()
+    let node_run = NodeRun::all()
         .first()
         .exec(&mut db)
         .await

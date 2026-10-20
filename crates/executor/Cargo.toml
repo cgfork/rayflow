@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+event = { workspace = true }
 serde = { workspace = true }
-runtime = { path = "../runtime", default-features = false, optional = true }
 uuid = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["process", "rt", "net", "time"], optional = true }
@@ -29,8 +29,6 @@ docker = [
     "dep:tokio",
 ]
 mysql = [
-    "dep:runtime",
-    "runtime/mysql",
     "dep:uuid",
     "dep:thiserror",
     "dep:tokio",

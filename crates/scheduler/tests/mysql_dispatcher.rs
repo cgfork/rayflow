@@ -4,17 +4,18 @@
 //! `mysql://root:password@127.0.0.1:3306/rayflow`) to run it; the test resets
 //! the database and pushes the schema from the Toasty models itself. Without
 //! `DATABASE_URL` the test is skipped.
-#![cfg(feature = "mysql")]
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Mutex;
 
-use runtime::mysql::model::{
-    NodeConfigModel, NodeRunModel, RunConfigModel, RunModel, ScheduledTaskModel, TaskModel,
-};
-use runtime::{Task, TaskEventPoll};
+use event::task::Task;
+use event::task::Task as TaskModel;
+use runtime::command::{NodeRun, Run};
+use scheduler::TaskEventPoll;
 use scheduler::dispatcher::Dispatcher;
+use scheduler::scheduled::{NodeConfig, RunConfig};
+use scheduler::{ScheduledTask, ScheduledTaskRead};
 use scheduler::{TaskEvent, TaskEventEntry, TaskRunner};
 use toasty::Db;
 use uuid::Uuid;
@@ -25,7 +26,7 @@ async fn setup() -> Option<Db> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
     let mut builder = Db::builder();
-    builder.models(runtime::mysql::models());
+    builder.models(scheduler::scheduled::models());
     let db = builder
         .connect(&url)
         .await
@@ -76,7 +77,7 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
     let graph_id = Uuid::from_u128(0x9a1);
     let node_id = Uuid::from_u128(1);
 
-    let run = RunModel::create()
+    let run = Run::create()
         .uuid(Uuid::new_v4())
         .data_id(data_id)
         .graph_id(graph_id)
@@ -88,13 +89,13 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
         .await
         .expect("create run");
 
-    let node_run = NodeRunModel::create()
+    let node_run = NodeRun::create()
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)
         .node_id(node_id)
         .revision(1)
-        .status(runtime::Status::Running.to_string())
+        .status(runtime::backend::Status::Running.to_string())
         .created_at(now)
         .updated_at(now)
         .exec(&mut db)
@@ -104,7 +105,7 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
     // Two node config versions; the latest (version 2) is in effect.
     let mut node_config_ids = Vec::new();
     for version in [1u64, 2] {
-        let row = NodeConfigModel::create()
+        let row = NodeConfig::create()
             .node_id(node_id)
             .version(version)
             .annotation_match(String::new())
@@ -124,7 +125,7 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
     let annotation: HashMap<String, String> = HashMap::new();
     let mut run_config_ids = Vec::new();
     for revision in [0u64, 3] {
-        let row = RunConfigModel::create()
+        let row = RunConfig::create()
             .run_id(run.uuid)
             .revision(revision)
             .annotation(annotation.clone())
@@ -148,7 +149,7 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
         created_at: now,
     };
     TaskModel::create()
-        .uuid(task.id)
+        .id(task.id)
         .data_id(data_id)
         .graph_id(graph_id)
         .node_id(node_id)
@@ -164,7 +165,7 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
     // The wrapped runner still ran the task.
     assert_eq!(*dispatcher.runner().ran.lock().unwrap(), vec![task.id]);
 
-    let scheduled = ScheduledTaskModel::filter_by_task_id(task.id)
+    let scheduled = ScheduledTask::filter_by_task_id(task.id)
         .first()
         .exec(&mut db)
         .await
@@ -176,16 +177,36 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
     assert_eq!(scheduled.node_run_id, node_run.id);
     assert_eq!(scheduled.node_config_id, node_config_ids[1]);
     assert_eq!(scheduled.run_config_id, run_config_ids[0]);
-    assert_eq!(scheduled.status, runtime::Status::Running.to_string());
+    assert_eq!(
+        scheduled.status,
+        runtime::backend::Status::Running.to_string()
+    );
+
+    let dispatch = ScheduledTask::read(&mut db, task.id)
+        .await
+        .expect("read dispatch through scheduler");
+    assert_eq!(dispatch.task_id, task.id);
+    assert_eq!(dispatch.node_run_id, task.node_run_id);
+    assert_eq!(
+        dispatch.status,
+        runtime::backend::Status::Running.to_string()
+    );
+    assert!(matches!(
+        ScheduledTask::read(&mut db, Uuid::new_v4()).await,
+        Err(scheduler::scheduled::Error::ScheduledTaskNotFound(_))
+    ));
 
     // Acknowledging the task's terminal event settles the recorded status.
     let event = TaskEventEntry::new(&task, TaskEvent::Succeed);
     dispatcher.ack(&event).await.expect("ack event");
-    let settled = ScheduledTaskModel::filter_by_task_id(task.id)
+    let settled = ScheduledTask::filter_by_task_id(task.id)
         .first()
         .exec(&mut db)
         .await
         .expect("read scheduled task")
         .expect("scheduled task still exists");
-    assert_eq!(settled.status, runtime::Status::Succeeded.to_string());
+    assert_eq!(
+        settled.status,
+        runtime::backend::Status::Succeeded.to_string()
+    );
 }

@@ -52,7 +52,7 @@ impl<S> App<S> {
     /// app over `db` (see [`new`](Self::new)).
     pub async fn connect(url: &str, config: Config, graph_store: S) -> Result<Self, toasty::Error> {
         let mut builder = Db::builder();
-        builder.models(runtime::mysql::models());
+        builder.models(runtime::models());
         let db = builder.connect(url).await?;
         Ok(Self::new(db, config, graph_store))
     }
@@ -105,7 +105,13 @@ pub enum AppError {
     Graph(Box<dyn std::error::Error + Send + Sync>),
     /// The backend returned an error.
     #[error(transparent)]
-    Backend(#[from] runtime::mysql::Error),
+    Backend(#[from] runtime::Error),
+}
+
+impl From<event::Error> for AppError {
+    fn from(error: event::Error) -> Self {
+        Self::Backend(error.into())
+    }
 }
 
 impl From<toasty::Error> for AppError {
@@ -143,8 +149,8 @@ struct ErrorBody {
 pub(crate) mod test {
     use std::convert::Infallible;
 
-    use dag::types::DAG;
-    use runtime::GraphStore;
+    use graph::GraphStore;
+    use graph::types::DAG;
     use toasty::Db;
     use uuid::Uuid;
 
@@ -179,7 +185,7 @@ pub(crate) mod test {
         let url = std::env::var("DATABASE_URL").ok()?;
 
         let mut builder = Db::builder();
-        builder.models(runtime::mysql::models());
+        builder.models(runtime::models());
         let db = builder
             .connect(&url)
             .await

@@ -2,9 +2,11 @@
 //!
 //! Set `DATABASE_URL` to run these tests. Without it they skip.
 
+#![cfg(feature = "mysql")]
+
 use std::time::Duration;
 
-use coordinator::{LeaderElection, LeaderElectionModel};
+use coordinator::mysql::{LeaderElectionModel, MySqlLeaderElection};
 use jiff::Timestamp;
 use toasty::Db;
 use uuid::Uuid;
@@ -33,8 +35,10 @@ async fn one_leader_holds_the_lease_until_it_expires_or_resigns() {
     };
 
     let role = format!("coordinator-test-{}", Uuid::new_v4());
-    let first = LeaderElection::new(db.clone(), role.clone(), "first", Duration::from_secs(30));
-    let second = LeaderElection::new(db.clone(), role.clone(), "second", Duration::from_secs(30));
+    let first =
+        MySqlLeaderElection::new(db.clone(), role.clone(), "first", Duration::from_secs(30));
+    let second =
+        MySqlLeaderElection::new(db.clone(), role.clone(), "second", Duration::from_secs(30));
 
     assert!(first.try_acquire_or_renew().await.expect("acquire first"));
     assert!(!second.try_acquire_or_renew().await.expect("second waits"));
@@ -55,4 +59,29 @@ async fn one_leader_holds_the_lease_until_it_expires_or_resigns() {
 
     assert!(first.try_acquire_or_renew().await.expect("take over"));
     assert!(!second.is_leader().await.expect("second lost lease"));
+
+    // An expired lease cannot be stolen while its protected transaction is
+    // still running. The contender must wait for that transaction to finish.
+    let mut connection = db.clone();
+    let mut tx = connection.transaction().await.expect("transaction");
+    assert!(first.acquire_in(&mut tx).await.expect("lock lease"));
+    LeaderElectionModel::filter_by_name(first.name().to_owned())
+        .update()
+        .expires_at(Timestamp::now() - Duration::from_secs(1))
+        .exec(&mut tx)
+        .await
+        .expect("expire locked lease");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), second.try_acquire_or_renew())
+            .await
+            .is_err(),
+        "takeover must wait for protected work"
+    );
+    tx.commit().await.expect("commit protected work");
+    assert!(
+        second
+            .try_acquire_or_renew()
+            .await
+            .expect("take over after commit")
+    );
 }

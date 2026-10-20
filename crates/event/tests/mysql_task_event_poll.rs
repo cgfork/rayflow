@@ -1,13 +1,16 @@
 //! Integration tests for the MySQL-backed task event log.
 //!
 //! Set `DATABASE_URL` to run these tests. Without it they skip.
-#![cfg(feature = "mysql")]
 
+use event::Poll;
 use std::time::Duration;
 
+use event::Emit as TaskEventWrite;
+use event::poll::PollOffset as PollOffsetModel;
+use event::task_event::TaskEvent;
+use event::task_event::TaskEventEntry as TaskEventModel;
+use event::task_event::TaskEventEntry;
 use jiff::Timestamp;
-use runtime::mysql::model::{PollOffsetModel, TaskEventModel};
-use runtime::{TaskEvent, TaskEventEntry, TaskEventWrite};
 use toasty::Db;
 use uuid::Uuid;
 
@@ -15,7 +18,7 @@ async fn setup() -> Option<Db> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
     let mut builder = Db::builder();
-    builder.models(runtime::mysql::models());
+    builder.models(event::models());
     let db = builder
         .connect(&url)
         .await
@@ -49,11 +52,11 @@ async fn writes_polls_and_acks_contiguous_task_events() {
     };
 
     entry(1, TaskEvent::Succeed)
-        .write(&mut db)
+        .emit(&mut db)
         .await
         .expect("write succeed");
     entry(2, TaskEvent::Fail)
-        .write(&mut db)
+        .emit(&mut db)
         .await
         .expect("write fail");
 
@@ -88,22 +91,22 @@ async fn waits_for_a_fresh_task_event_gap() {
     };
 
     entry(1, TaskEvent::Pend)
-        .write(&mut db)
+        .emit(&mut db)
         .await
         .expect("write first");
     let gap = entry(2, TaskEvent::Fail);
-    gap.write(&mut db).await.expect("write gap row");
+    gap.emit(&mut db).await.expect("write gap row");
     entry(3, TaskEvent::Succeed)
-        .write(&mut db)
+        .emit(&mut db)
         .await
         .expect("write after gap");
-    let gap_id = TaskEventModel::filter_by_uuid(gap.id)
+    let gap_id = TaskEventModel::filter_by_id(gap.id)
         .first()
         .exec(&mut db)
         .await
         .expect("read gap row")
         .expect("gap row")
-        .id;
+        .event_offset;
     toasty::sql::statement("DELETE FROM task_event WHERE id = ?")
         .bind(gap_id)
         .exec(&mut db)

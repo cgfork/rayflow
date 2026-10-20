@@ -2,9 +2,9 @@
 
 use std::error::Error as StdError;
 
-use coordinator::LeaderElection;
+use coordinator::mysql::MySqlLeaderElection;
 use pilot::{Config, Pilot};
-use runtime::mysql::Backend;
+use runtime::backend::Backend;
 use server::StaticGraphStore;
 use uuid::Uuid;
 
@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     let backend = Backend::connect(&config.database_url, StaticGraphStore::new()).await?;
     let node_id = Uuid::new_v4().to_string();
-    let election = LeaderElection::new(
+    let election = MySqlLeaderElection::new(
         backend.db().clone(),
         config.leader_name.clone(),
         node_id.clone(),

@@ -3,16 +3,18 @@
 //! A [`Dispatcher`] sits between the scheduler and the runner that actually
 //! executes a task. It implements the scheduler's [`TaskRunner`] contract and,
 //! on every [`run`](TaskRunner::run), first materializes a
-//! [`ScheduledTask`](runtime::ScheduledTask) row referencing the task, its run,
+//! [`ScheduledTask`] row referencing the task, its run,
 //! its node run, and the node and run configurations in effect, then forwards
 //! the task to the wrapped runner. As a [`TaskEventPoll`], `poll` is
 //! forwarded unchanged and `ack` settles the record's status before forwarding,
 //! so a dispatcher is a drop-in component that adds dispatch tracking.
 
-use runtime::mysql::model::{
-    NodeConfigModel, NodeRunModel, RunConfigModel, RunModel, ScheduledTaskModel,
-};
-use runtime::{ScheduledTask, ScheduledTaskWrite, Task, TaskEventPoll};
+use crate::ScheduledTask;
+use crate::ScheduledTaskWrite;
+use crate::TaskEventPoll;
+use crate::scheduled::{Error as ScheduledTaskError, NodeConfig, RunConfig};
+use event::task::Task;
+use runtime::command::{NodeRun, Run};
 use toasty::Db;
 use uuid::Uuid;
 
@@ -26,7 +28,7 @@ pub enum Error {
     Toasty(#[from] toasty::Error),
     /// The backend returned an error.
     #[error(transparent)]
-    Backend(#[from] runtime::mysql::Error),
+    Backend(#[from] ScheduledTaskError),
     /// The node run driving the task does not exist.
     #[error("node run not found: {0}")]
     NodeRunNotFound(u64),
@@ -68,29 +70,29 @@ impl<R> Dispatcher<R> {
     async fn dispatch(&self, task: &Task) -> Result<(), Error> {
         let mut db = self.db.clone();
 
-        let node_run = NodeRunModel::filter_by_id(task.node_run_id)
+        let node_run = NodeRun::filter_by_id(task.node_run_id)
             .first()
             .exec(&mut db)
             .await?
             .ok_or(Error::NodeRunNotFound(task.node_run_id))?;
 
-        let run = RunModel::filter_by_uuid(node_run.run_id)
+        let run = Run::filter_by_uuid(node_run.run_id)
             .first()
             .exec(&mut db)
             .await?
             .ok_or(Error::RunNotFound(node_run.run_id))?;
 
-        let node_config_id = NodeConfigModel::filter_by_node_id(task.node_id)
-            .order_by(NodeConfigModel::fields().version().desc())
+        let node_config_id = NodeConfig::filter_by_node_id(task.node_id)
+            .order_by(NodeConfig::fields().version().desc())
             .first()
             .exec(&mut db)
             .await?
             .map(|row| row.id)
             .unwrap_or(0);
 
-        let run_config_id = RunConfigModel::filter_by_run_id(run.uuid)
-            .filter(RunConfigModel::fields().revision().le(run.revision))
-            .order_by(RunConfigModel::fields().revision().desc())
+        let run_config_id = RunConfig::filter_by_run_id(run.uuid)
+            .filter(RunConfig::fields().revision().le(run.revision))
+            .order_by(RunConfig::fields().revision().desc())
             .first()
             .exec(&mut db)
             .await?
@@ -140,16 +142,23 @@ impl<R> Dispatcher<R> {
     /// record (e.g. one dispatched elsewhere) is left untouched.
     async fn settle(&self, event: &TaskEventEntry) -> Result<(), Error> {
         let mut db = self.db.clone();
-        let Some(row) = ScheduledTaskModel::filter_by_task_id(event.task_id)
+        let Some(row) = ScheduledTask::filter_by_task_id(event.task_id)
             .first()
             .exec(&mut db)
             .await?
         else {
             return Ok(());
         };
-        ScheduledTaskModel::filter_by_id(row.id)
+        ScheduledTask::filter_by_id(row.id)
             .update()
-            .status(event.event.status().to_string())
+            .status(match event.event {
+                event::task_event::TaskEvent::Pend => "Pending",
+                event::task_event::TaskEvent::Succeed => "Succeeded",
+                event::task_event::TaskEvent::Fail => "Failed",
+                event::task_event::TaskEvent::Terminate | event::task_event::TaskEvent::Cancel => {
+                    "Terminated"
+                }
+            })
             .updated_at(jiff::Timestamp::now())
             .exec(&mut db)
             .await?;

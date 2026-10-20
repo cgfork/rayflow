@@ -1,0 +1,16 @@
+[package]
+name = "event"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uuid = { workspace = true }
+jiff = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toasty = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

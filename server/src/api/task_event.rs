@@ -5,8 +5,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
-use dag::types::DAG;
-use runtime::{GraphStore, TaskEvent};
+use event::task_event::TaskEvent;
+use graph::GraphStore;
+use graph::types::DAG;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

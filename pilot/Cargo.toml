@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+event = { workspace = true }
 config = { workspace = true }
-coordinator = { workspace = true }
+coordinator = { workspace = true, features = ["mysql"] }
 runtime = { workspace = true }
 scheduler = { workspace = true }
 serde = { workspace = true }
