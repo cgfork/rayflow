@@ -1,17 +1,16 @@
-//! Integration test for the MySQL-backed task event log.
+//! Integration tests for the MySQL-backed task event log.
 //!
-//! It needs a MySQL instance. Set `DATABASE_URL` (for example
-//! `mysql://root:password@127.0.0.1:3306/rayflow`) to run it; the test resets
-//! the database and pushes the schema from the Toasty models itself. Without
-//! `DATABASE_URL` the test is skipped.
+//! Set `DATABASE_URL` to run these tests. Without it they skip.
 #![cfg(feature = "mysql")]
 
+use std::time::Duration;
+
+use jiff::Timestamp;
+use runtime::mysql::model::{PollOffsetModel, TaskEventModel};
 use runtime::{TaskEvent, TaskEventEntry, TaskEventWrite};
 use toasty::Db;
 use uuid::Uuid;
 
-/// Connects and rebuilds the schema from the Toasty models, or returns `None`
-/// when no `DATABASE_URL` is configured.
 async fn setup() -> Option<Db> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
@@ -28,7 +27,7 @@ async fn setup() -> Option<Db> {
     Some(db)
 }
 
-fn entry(node: u128, shard: u32, event: TaskEvent) -> TaskEventEntry {
+fn entry(node: u128, event: TaskEvent) -> TaskEventEntry {
     TaskEventEntry {
         event_offset: 0,
         id: Uuid::new_v4(),
@@ -37,29 +36,28 @@ fn entry(node: u128, shard: u32, event: TaskEvent) -> TaskEventEntry {
         graph_id: Uuid::from_u128(0x9a1),
         node_id: Uuid::from_u128(node),
         node_run_id: 1,
-        shard,
         event,
-        created_at: jiff::Timestamp::now(),
+        created_at: Timestamp::now(),
     }
 }
 
 #[tokio::test]
-async fn writes_polls_and_acks_task_events() {
+async fn writes_polls_and_acks_contiguous_task_events() {
     let Some(mut db) = setup().await else {
         eprintln!("skipping: set DATABASE_URL to run the MySQL task event test");
         return;
     };
 
-    entry(1, 0, TaskEvent::Succeed)
+    entry(1, TaskEvent::Succeed)
         .write(&mut db)
         .await
         .expect("write succeed");
-    entry(2, 0, TaskEvent::Fail)
+    entry(2, TaskEvent::Fail)
         .write(&mut db)
         .await
         .expect("write fail");
 
-    let polled: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, &[])
+    let polled: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16)
         .await
         .expect("poll events")
         .collect();
@@ -67,49 +65,80 @@ async fn writes_polls_and_acks_task_events() {
     assert_eq!(polled[0].node_id, Uuid::from_u128(1));
     assert_eq!(polled[0].event, TaskEvent::Succeed);
     assert_eq!(polled[1].event, TaskEvent::Fail);
-    // The log assigns a monotonically increasing offset on write.
     assert!(polled[0].event_offset < polled[1].event_offset);
 
     for event in &polled {
         event.ack(&mut db).await.expect("ack event");
     }
 
-    // Acknowledged events are not polled again.
-    let again: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, &[])
-        .await
-        .expect("poll events again")
-        .collect();
-    assert!(again.is_empty());
+    assert!(
+        TaskEventEntry::poll(&mut db, 16)
+            .await
+            .expect("poll events again")
+            .next()
+            .is_none()
+    );
 }
 
 #[tokio::test]
-async fn poll_scopes_by_shards() {
+async fn waits_for_a_fresh_task_event_gap() {
     let Some(mut db) = setup().await else {
         eprintln!("skipping: set DATABASE_URL to run the MySQL task event test");
         return;
     };
 
-    entry(1, 0, TaskEvent::Succeed)
+    entry(1, TaskEvent::Pend)
         .write(&mut db)
         .await
-        .expect("write shard 0");
-    entry(2, 1, TaskEvent::Fail)
+        .expect("write first");
+    let gap = entry(2, TaskEvent::Fail);
+    gap.write(&mut db).await.expect("write gap row");
+    entry(3, TaskEvent::Succeed)
         .write(&mut db)
         .await
-        .expect("write shard 1");
-
-    let shard0: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, &[0])
+        .expect("write after gap");
+    let gap_id = TaskEventModel::filter_by_uuid(gap.id)
+        .first()
+        .exec(&mut db)
         .await
-        .expect("poll shard 0")
-        .collect();
-    assert_eq!(shard0.len(), 1);
-    assert_eq!(shard0[0].node_id, Uuid::from_u128(1));
-
-    let selected: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16, &[0, 1])
+        .expect("read gap row")
+        .expect("gap row")
+        .id;
+    toasty::sql::statement("DELETE FROM task_event WHERE id = ?")
+        .bind(gap_id)
+        .exec(&mut db)
         .await
-        .expect("poll shards 0 and 1")
+        .expect("delete gap row");
+
+    let first: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16)
+        .await
+        .expect("poll fresh gap")
         .collect();
-    assert_eq!(selected.len(), 2);
-    assert_eq!(selected[0].node_id, Uuid::from_u128(1));
-    assert_eq!(selected[1].node_id, Uuid::from_u128(2));
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].node_id, Uuid::from_u128(1));
+    first[0].ack(&mut db).await.expect("ack first");
+
+    assert!(
+        TaskEventEntry::poll(&mut db, 16)
+            .await
+            .expect("fresh gap blocks later events")
+            .next()
+            .is_none()
+    );
+
+    let now = Timestamp::now();
+    PollOffsetModel::filter_by_name("task_event".to_string())
+        .update()
+        .gap_since(Some(now - Duration::from_secs(11)))
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .expect("age task event gap");
+
+    let after: Vec<TaskEventEntry> = TaskEventEntry::poll(&mut db, 16)
+        .await
+        .expect("skip aged gap")
+        .collect();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].node_id, Uuid::from_u128(3));
 }

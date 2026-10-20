@@ -12,9 +12,9 @@
 //!
 //! Scheduling a task emits [`Command::Run`] for its node. A [`TaskRunner`] then
 //! runs the scheduled task, recording the [`TaskEvent`] it produces; a
-//! [`TaskEventPoll`] supplies those events (optionally scoped to a set of shards)
-//! and acknowledges them once the scheduler emits the command that drives each
-//! node to its next status as a [`CommandEntry`].
+//! [`TaskEventPoll`] supplies those events and acknowledges them once the
+//! scheduler emits the command that drives each node to its next status as a
+//! [`CommandEntry`].
 //! Commands are appended to the store's command log (via
 //! [`CommandEmit`](runtime::CommandEmit)) rather than applied inline: consuming
 //! and applying them (via [`CommandPoll`](runtime::CommandPoll) +
@@ -72,11 +72,9 @@ pub trait Store {
     where
         Self: 'a;
 
-    /// Consumes up to `max` tasks that have not yet been acknowledged.
-    ///
-    /// When `shards` is non-empty, only tasks routed to one of those shards are
-    /// returned; when it is empty, tasks are returned across every shard.
-    async fn poll_tasks(&self, max: usize, shards: &[u32]) -> Result<Vec<Task>, Self::Err>;
+    /// Consumes up to `max` tasks from the first unacknowledged contiguous
+    /// offset.
+    async fn poll_tasks(&self, max: usize) -> Result<Vec<Task>, Self::Err>;
 
     /// Opens a transaction the scheduler drives commands and task acks through.
     ///
@@ -135,7 +133,6 @@ pub struct Scheduler<S, R> {
     store: S,
     runner: R,
     batch: usize,
-    shards: Vec<u32>,
 }
 
 impl<S, R> Scheduler<S, R>
@@ -150,51 +147,6 @@ where
             store,
             runner,
             batch,
-            shards: Vec::new(),
-        }
-    }
-
-    /// Restricts polling to tasks routed to `shard`.
-    ///
-    /// By default a scheduler polls tasks across every shard.
-    pub fn with_shard(mut self, shard: u32) -> Self {
-        self.shards = vec![shard];
-        self
-    }
-
-    /// Restricts polling to the shards in `shards`.
-    ///
-    /// Pass the shards owned by this process in the shard table; an empty set
-    /// polls every shard.
-    pub fn with_shards<I>(mut self, shards: I) -> Self
-    where
-        I: IntoIterator<Item = u32>,
-    {
-        self.shards = normalize_shards(shards);
-        self
-    }
-
-    /// Replaces the set of shards this scheduler polls.
-    ///
-    /// Call this after a membership notification changes table ownership.
-    pub fn set_shards<I>(&mut self, shards: I)
-    where
-        I: IntoIterator<Item = u32>,
-    {
-        self.shards = normalize_shards(shards);
-    }
-
-    /// Returns the shards this scheduler polls, or an empty slice for every shard.
-    pub fn shards(&self) -> &[u32] {
-        &self.shards
-    }
-
-    /// Returns the single shard this scheduler polls, or `None` when it polls
-    /// every shard or more than one shard.
-    pub fn shard(&self) -> Option<u32> {
-        match self.shards.as_slice() {
-            [shard] => Some(*shard),
-            _ => None,
         }
     }
 
@@ -259,11 +211,7 @@ where
     ///
     /// Returns the number of tasks processed.
     pub async fn tick(&mut self) -> Result<usize, Error> {
-        let tasks = self
-            .store
-            .poll_tasks(self.batch, &self.shards)
-            .await
-            .map_err(store_err)?;
+        let tasks = self.store.poll_tasks(self.batch).await.map_err(store_err)?;
         for task in &tasks {
             self.schedule(task).await?;
             self.runner.run(task).await.map_err(runner_err)?;
@@ -272,16 +220,12 @@ where
         Ok(tasks.len())
     }
 
-    /// Polls up to [`batch`](Self::batch) task events, optionally scoped to this
-    /// scheduler's shard, and drives each node by its event.
+    /// Polls up to [`batch`](Self::batch) task events and drives each node by its
+    /// event.
     ///
     /// Returns the number of events driven.
     pub async fn drive_events(&mut self) -> Result<usize, Error> {
-        let events = self
-            .runner
-            .poll(self.batch, &self.shards)
-            .await
-            .map_err(runner_err)?;
+        let events = self.runner.poll(self.batch).await.map_err(runner_err)?;
         for entry in &events {
             self.emit_event(entry.data_id, entry.graph_id, entry.node_id, entry.event)
                 .await?;
@@ -309,16 +253,6 @@ where
     }
 }
 
-fn normalize_shards<I>(shards: I) -> Vec<u32>
-where
-    I: IntoIterator<Item = u32>,
-{
-    let mut shards: Vec<u32> = shards.into_iter().collect();
-    shards.sort_unstable();
-    shards.dedup();
-    shards
-}
-
 #[cfg(feature = "mysql")]
 mod mysql {
     //! [`Store`] implementation backed by the MySQL task backend.
@@ -344,9 +278,9 @@ mod mysql {
         where
             Self: 'a;
 
-        async fn poll_tasks(&self, max: usize, shards: &[u32]) -> Result<Vec<Task>, Self::Err> {
+        async fn poll_tasks(&self, max: usize) -> Result<Vec<Task>, Self::Err> {
             let mut db = self.db().clone();
-            let tasks: Vec<Task> = Task::poll(&mut db, max, shards).await?.collect();
+            let tasks: Vec<Task> = Task::poll(&mut db, max).await?.collect();
             Ok(tasks)
         }
 
@@ -407,11 +341,11 @@ mod tests {
         where
             Self: 'a;
 
-        async fn poll_tasks(&self, max: usize, shards: &[u32]) -> Result<Vec<Task>, Self::Err> {
+        async fn poll_tasks(&self, max: usize) -> Result<Vec<Task>, Self::Err> {
             let mut pending = self.pending.borrow_mut();
             let mut taken = Vec::new();
             pending.retain(|task| {
-                if taken.len() < max && (shards.is_empty() || shards.contains(&task.shard)) {
+                if taken.len() < max {
                     taken.push(task.clone());
                     false
                 } else {
@@ -479,11 +413,11 @@ mod tests {
     impl TaskEventPoll for FixedRunner {
         type Err = Infallible;
 
-        async fn poll(&self, max: usize, shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err> {
+        async fn poll(&self, max: usize) -> Result<Vec<TaskEventEntry>, Self::Err> {
             let mut events = self.events.lock().unwrap();
             let mut taken = Vec::new();
             events.retain(|entry| {
-                if taken.len() < max && (shards.is_empty() || shards.contains(&entry.shard)) {
+                if taken.len() < max {
                     taken.push(entry.clone());
                     false
                 } else {
@@ -499,15 +433,10 @@ mod tests {
     }
 
     fn task(node: u128) -> Task {
-        task_shard(node, 0)
-    }
-
-    fn task_shard(node: u128, shard: u32) -> Task {
         Task {
             task_offset: 0,
             id: Uuid::new_v4(),
             data_id: Uuid::from_u128(0xda7a),
-            shard,
             graph_id: Uuid::from_u128(0x9a1),
             node_id: Uuid::from_u128(node),
             node_run_id: 1,
@@ -598,70 +527,5 @@ mod tests {
         let store = scheduler.into_store();
         assert_eq!(store.acked.borrow().len(), 5);
         assert_eq!(store.emitted.borrow().len(), 10);
-    }
-
-    #[tokio::test]
-    async fn shard_scoped_scheduler_polls_only_that_shard() {
-        let mut scheduler = Scheduler::new(
-            MemStore::default(),
-            FixedRunner::new(TaskEvent::Succeed),
-            16,
-        )
-        .with_shard(1);
-        for (node, shard) in [(0u128, 0u32), (1, 1), (2, 2), (3, 1)] {
-            scheduler
-                .store_mut()
-                .pending
-                .borrow_mut()
-                .push_back(task_shard(node, shard));
-        }
-
-        assert_eq!(scheduler.shard(), Some(1));
-        assert_eq!(scheduler.drain().await.unwrap(), 2);
-
-        let store = scheduler.into_store();
-        let nodes: Vec<Uuid> = store
-            .emitted
-            .borrow()
-            .iter()
-            .filter_map(|entry| match entry.command {
-                Command::Run { node } => Some(node),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(nodes, vec![Uuid::from_u128(1), Uuid::from_u128(3)]);
-    }
-
-    #[tokio::test]
-    async fn scheduler_polls_an_owned_shard_set() {
-        let mut scheduler = Scheduler::new(
-            MemStore::default(),
-            FixedRunner::new(TaskEvent::Succeed),
-            16,
-        )
-        .with_shards([2, 1, 1]);
-        for (node, shard) in [(0u128, 0u32), (1, 1), (2, 2), (3, 3)] {
-            scheduler
-                .store_mut()
-                .pending
-                .borrow_mut()
-                .push_back(task_shard(node, shard));
-        }
-
-        assert_eq!(scheduler.shards(), &[1, 2]);
-        assert_eq!(scheduler.shard(), None);
-        assert_eq!(scheduler.drain().await.unwrap(), 2);
-
-        let store = scheduler.into_store();
-        let nodes: Vec<Uuid> = store
-            .emitted
-            .borrow()
-            .iter()
-            .filter_map(|entry| match entry.command {
-                Command::Run { node } => Some(node),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(nodes, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
     }
 }

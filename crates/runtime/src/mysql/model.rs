@@ -18,41 +18,11 @@ use std::str::FromStr;
 
 use jiff::Timestamp;
 use toasty::Json;
-use toasty::stmt::{Expr, Path};
 use uuid::Uuid;
 
-use crate::{Command, CommandEntry, ScheduledTask, Status, TaskEvent, TaskEventEntry};
+use coordinator::LeaderElectionModel;
 
-/// Builds the filter selecting log rows that are past their shard's
-/// acknowledged offset.
-///
-/// `offsets` holds the acknowledged `(shard, offset)` pairs. A row is selectable
-/// when its `id` is greater than the offset recorded for its own shard; a shard
-/// with no recorded offset selects every row. Returns `None` when every row is
-/// selectable (so the query needs no filter).
-pub(crate) fn unacked_filter<Origin>(
-    offsets: &[(u32, u64)],
-    shard: Path<Origin, u32>,
-    id: Path<Origin, u64>,
-) -> Option<Expr<bool>> {
-    let mut filter: Option<Expr<bool>> = None;
-    for (offset_shard, offset) in offsets {
-        let cond = shard.clone().eq(*offset_shard).and(id.clone().gt(*offset));
-        filter = Some(match filter {
-            Some(existing) => existing.or(cond),
-            None => cond,
-        });
-    }
-    if !offsets.is_empty() {
-        let known: Vec<u32> = offsets.iter().map(|(shard, _)| *shard).collect();
-        let unseen = Expr::in_list(shard, known).not();
-        filter = Some(match filter {
-            Some(existing) => existing.or(unseen),
-            None => unseen,
-        });
-    }
-    filter
-}
+use crate::{Command, CommandEntry, ScheduledTask, Status, TaskEvent, TaskEventEntry};
 
 /// The `task` table: a task waiting to be processed.
 #[derive(Debug, Clone, toasty::Model)]
@@ -70,8 +40,6 @@ pub struct TaskModel {
     pub node_id: Uuid,
     #[index]
     pub node_run_id: u64,
-    #[index]
-    pub shard: u32,
     pub created_at: Timestamp,
     #[belongs_to(key = node_run_id, references = id)]
     pub node_run: toasty::Deferred<NodeRunModel>,
@@ -87,23 +55,9 @@ impl TaskModel {
             graph_id: self.graph_id,
             node_id: self.node_id,
             node_run_id: self.node_run_id,
-            shard: self.shard,
             created_at: self.created_at,
         })
     }
-}
-
-/// The `task_poll_offset` table: the last acknowledged task offset per shard.
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "task_poll_offset"]
-pub struct TaskPollOffsetModel {
-    #[key]
-    #[auto]
-    pub id: u64,
-    #[unique]
-    pub shard: u32,
-    pub offset: u64,
-    pub updated_at: Timestamp,
 }
 
 /// The `run` table: one execution of a graph version for a `(data_id, graph_id)`.
@@ -118,8 +72,6 @@ pub struct RunModel {
     pub uuid: Uuid,
     pub data_id: Uuid,
     pub graph_id: Uuid,
-    #[index]
-    pub shard: u32,
     pub version: u64,
     pub revision: u64,
     pub created_at: Timestamp,
@@ -186,8 +138,6 @@ pub struct NodeRunModel {
     pub data_id: Uuid,
     pub graph_id: Uuid,
     pub node_id: Uuid,
-    #[index]
-    pub shard: u32,
     pub revision: u64,
     #[column(type = varchar(16))]
     pub status: String,
@@ -279,8 +229,6 @@ pub struct CommandEntryModel {
     pub uuid: Uuid,
     pub data_id: Uuid,
     pub graph_id: Uuid,
-    #[index]
-    pub shard: u32,
     #[column(type = json)]
     pub command: Json<Command>,
     pub created_at: Timestamp,
@@ -294,24 +242,10 @@ impl CommandEntryModel {
             id: self.uuid,
             data_id: self.data_id,
             graph_id: self.graph_id,
-            shard: self.shard,
             command: self.command.0,
             created_at: self.created_at,
         })
     }
-}
-
-/// The `command_poll_offset` table: the last acknowledged command offset per shard.
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "command_poll_offset"]
-pub struct CommandPollOffsetModel {
-    #[key]
-    #[auto]
-    pub id: u64,
-    #[unique]
-    pub shard: u32,
-    pub offset: u64,
-    pub updated_at: Timestamp,
 }
 
 /// The `task_event` table: the append-only task event log.
@@ -330,8 +264,6 @@ pub struct TaskEventModel {
     pub graph_id: Uuid,
     pub node_id: Uuid,
     pub node_run_id: u64,
-    #[index]
-    pub shard: u32,
     #[column(type = varchar(16))]
     pub event: String,
     pub created_at: Timestamp,
@@ -354,23 +286,26 @@ impl TaskEventModel {
             graph_id: self.graph_id,
             node_id: self.node_id,
             node_run_id: self.node_run_id,
-            shard: self.shard,
             event,
             created_at: self.created_at,
         })
     }
 }
 
-/// The `task_event_poll_offset` table: the last acknowledged event offset per shard.
+/// The `poll_offset` table: the global acknowledged offset of one append-only
+/// log and the time at which its current gap was first observed.
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "task_event_poll_offset"]
-pub struct TaskEventPollOffsetModel {
+#[table = "poll_offset"]
+pub struct PollOffsetModel {
+    /// Log name: `command_entry`, `task`, or `task_event`.
     #[key]
-    #[auto]
-    pub id: u64,
-    #[unique]
-    pub shard: u32,
+    #[column(type = varchar(64))]
+    pub name: String,
+    /// Last offset whose row has been acknowledged.
     pub offset: u64,
+    /// When the first unacknowledged gap was observed, if one is pending.
+    pub gap_since: Option<Timestamp>,
+    /// Last time the offset or gap state changed.
     pub updated_at: Timestamp,
 }
 
@@ -388,7 +323,6 @@ pub struct TaskEventPollOffsetModel {
 pub fn models() -> toasty::ModelSet {
     toasty::models!(
         TaskModel,
-        TaskPollOffsetModel,
         RunModel,
         RunConfigModel,
         NodeConfigModel,
@@ -396,8 +330,8 @@ pub fn models() -> toasty::ModelSet {
         TransitionLockModel,
         ScheduledTaskModel,
         CommandEntryModel,
-        CommandPollOffsetModel,
         TaskEventModel,
-        TaskEventPollOffsetModel,
+        PollOffsetModel,
+        LeaderElectionModel,
     )
 }

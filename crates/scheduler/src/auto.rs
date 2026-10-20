@@ -36,9 +36,9 @@ impl TaskRunner for AutoRunner {
 impl TaskEventPoll for AutoRunner {
     type Err = Error;
 
-    async fn poll(&self, max: usize, shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err> {
+    async fn poll(&self, max: usize) -> Result<Vec<TaskEventEntry>, Self::Err> {
         let mut db = self.db.clone();
-        Ok(TaskEventEntry::poll(&mut db, max, shards).await?.collect())
+        Ok(TaskEventEntry::poll(&mut db, max).await?.collect())
     }
 
     async fn ack(&self, event: &TaskEventEntry) -> Result<(), Self::Err> {

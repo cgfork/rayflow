@@ -5,14 +5,11 @@ A run walks the nodes of a graph through a small status state machine, persistin
 every transition so the work can be driven forward, deferred, and resumed across
 processes.
 
-The workspace splits into six core modules plus the `server` binary, which
-exposes them over HTTP:
+The workspace splits into five core modules plus the `server` and `pilot`
+binaries:
 
 - **`dag`** — pure graph primitives. No I/O.
-- **`shardtable`** — a precomputed shard-to-member table driven by a pluggable
-  `Membership` trait.
-- **`swim`** — a small SWIM-style membership implementation behind a transport
-  abstraction.
+- **`coordinator`** — MySQL-backed leader election for the active consumer.
 - **`runtime`** — command driving and task read/write/consume, with a MySQL-backed
   store behind the default `mysql` feature.
 - **`scheduler`** — the task scheduler: consumes tasks and drives node status by
@@ -20,6 +17,8 @@ exposes them over HTTP:
 - **`executor`** — job primitives for executing task work, including the built-in
   script job.
 - **`server`** — an HTTP API (axum) that serves the runtime.
+- **`pilot`** — a continuously running, leader-elected command, task, and
+  task-event consumer.
 
 ```text
                  +---------+      +----------------+
@@ -39,8 +38,8 @@ exposes them over HTTP:
                          +-----------------+
 
                                   +-----------------+
-                                  |   shardtable    |
-                                  |   shard table   |
+                                  |   coordinator   |
+                                  | leader election |
                                   +-----------------+
 ```
 
@@ -60,38 +59,21 @@ Pure, I/O-free graph primitives.
 - `types` — the concrete `DAG` type plus `Node`, `Input`, `Output`, and `Kind`
   (`File`/`Directory`). A node carries a name, type, inputs, and outputs.
 
-### `shardtable` — membership-driven consistent hash table
+### `coordinator` — leader election
 
-A virtual-node consistent hash table plus a coordinator. The table owns its ring
-and is independent of where membership comes from; the coordinator connects the
-two.
+`LeaderElection` grants one pilot at a time the right to consume the global
+logs. Each role has one row in `leader_election`; acquisition and renewal use a
+single atomic MySQL upsert, so standbys observe the lease holder rather than
+racing it.
 
-- `Membership` — supplies the current members (`members`) and exposes a tokio
-  `watch` subscription (`subscribe`) that emits a new member-list snapshot on
-  every change. SWIM or another membership implementation can provide it.
-- `HashTable` — stores only the shard-to-member mapping. Internally it builds a
-  SipHash virtual-node ring, deduplicates members, and resolves each explicitly
-  configured shard to its first ring candidate once. `shard_owner` is a direct
-  indexed lookup; `owned_shards` and `migrations` report assignments and
-  ownership changes.
-- `Coordinator` — cloneable and concurrent. It watches membership notifications,
-  rebuilds the hash ring and table with `DEFAULT_REPLICAS` virtual nodes per
-  member, and returns the `ShardMigration`s between the old and new tables.
-  Readers receive immutable `Arc<HashTable>` snapshots, so lookups can continue
-  while a new table is being built and published.
-
-### `swim` — membership
-
-A compact SWIM state machine that implements `shardtable::Membership`.
-
-- `Swim` — tracks alive, suspect, and dead members; probes peers with ping/ack;
-  refutes suspicion with increasing incarnations; and publishes alive-member
-  snapshots through the shared `watch` subscription.
-- `Message` / `Outbound` — protocol messages and the addresses they should be
-  sent to. `Swim::tick` advances failure detection and `Swim::handle` processes
-  incoming messages.
-- `Transport` — a minimal async send abstraction. Callers can use UDP, an
-  in-memory bus, or another transport without coupling it to the state machine.
+- `LeaderElection::new(db, name, node_id, lease)` creates a handle for a named
+  coordinator role.
+- `try_acquire_or_renew` takes an expired lease or renews the current holder's
+  lease and returns whether this node is the leader.
+- `is_leader` checks that this node still owns an unexpired lease, and `resign`
+  releases it during shutdown.
+- `LeaderElectionModel` is registered with the runtime models so the same
+  `toasty::Db` can host both execution state and coordination state.
 
 ### `runtime` — execution runtime
 
@@ -100,24 +82,24 @@ The execution state machine and the storage-facing traits.
 - `Status` — `Ready`, `Running`, `Pending`, `Succeeded`, `Failed`, `Terminated`.
 - `Command` / `CommandEntry` — the commands that drive a node and their
   append-only event log. An entry carries `(data_id, graph_id, command)` plus its
-  log position (`command_offset`, `id`, `shard`, `created_at`). `CommandApply`
+  log position (`command_offset`, `id`, `created_at`). `CommandApply`
   applies an entry to a backend; `CommandEmit` appends one and `CommandPoll`
-  consumes them (`poll`, optionally scoped to a set of shards, + `ack`). The
-  latter two are generic over any
-  `toasty::Executor`, so they run against a `Db` or a `Transaction`.
+  consumes the first unacknowledged contiguous run (`poll` + `ack`). They are
+  generic over any `toasty::Executor`, so they run against a `Db` or a
+  `Transaction`.
 - `transition_lock` — a transaction-scoped distributed lock keyed by
   `(data_id, graph_id)`. `CommandApply` upserts the lock row before applying a
   command, so concurrent consumers serialize command application for a run; the
   InnoDB row lock is released on commit or rollback.
 - `Task` — a task waiting to be processed, with `TaskWrite` (produce),
-  `TaskRead` (read by id), and `TaskPoll` (consume: `poll`, optionally scoped to
-  a set of shards, + `ack`).
+  `TaskRead` (read by id), and `TaskPoll` (consume the first unacknowledged
+  contiguous run with `poll` + `ack`).
 - `TaskEvent` / `TaskEventEntry` — the event a task run reports and its
   append-only log. `TaskEventWrite` appends an event, and the MySQL
   `TaskEventEntry` log operations `poll` and `ack` consume them. The
   `TaskEventPoll` trait is the scheduler-facing contract for a component that
-  supplies and acknowledges those events (optionally scoped to a set of shards),
-  so event reporting survives a process restart.
+  supplies and acknowledges those events, so event reporting survives a process
+  restart.
 - `ScheduledTask` — a task that has been dispatched to a runner, materializing
   the task, its run, node run, and the node and run configurations in effect
   plus a status. `ScheduledTaskWrite` records one and `ScheduledTaskRead` reads
@@ -127,20 +109,20 @@ The execution state machine and the storage-facing traits.
 - `NodeConfig` — a node's configuration payload at a given version, plus the
   `annotation_match` expression that selects it.
 - `GraphStore` — loads a graph by id and optional version.
-- `shard_of` / `hash_data_id` — FNV-1a placement of a data id into a shard
-  index.
 - `src/mysql/` — the MySQL backend. `model.rs` defines the Toasty `Model`s for
   the schema (one per table) and `models()` registers them on the `Db`;
   `Backend::connect` builds a `Db` with those models. `command.rs` drives node
   state, `task.rs`/`entry.rs`/`event.rs`/`scheduled.rs` persist and poll tasks,
   commands, events, and scheduled tasks through the generated query builders.
-  Polling first reads the relevant per-shard offsets, then applies them to the
-  log query so only unacknowledged rows are selected; guarded updates and offset
-  bumps remain typed.
+  `poll.rs` stores one global offset per log in `poll_offset`. A poll selects
+  rows after that offset, stops at the first missing auto-increment id, and
+  persists when that gap was first observed. A gap is skipped only after it has
+  remained missing for 10 seconds; the persisted offset then advances to just
+  before the first returned row, so a crash cannot lose that row.
   `runtime.sql` mirrors the models as a standalone schema for deployments
   (`task`, `run` (+ `uuid`), `run_config`, `node_config`, `node_run`,
-  `transition_lock`, `scheduled_task`, `task_poll_offset`, `command_entry`,
-  `command_poll_offset`, `task_event`, `task_event_poll_offset`).
+  `transition_lock`, `scheduled_task`, `command_entry`, `task_event`,
+  `poll_offset`, `leader_election`).
 
 `Command` variants and the transition each applies:
 
@@ -161,36 +143,31 @@ The execution state machine and the storage-facing traits.
 Consumes tasks and drives node status by task events. It is backend-agnostic and
 depends only on three traits:
 
-- `Store` — `poll_tasks` (consume, optionally scoped to a set of shards) and
+- `Store` — `poll_tasks` (consume the first unacknowledged contiguous tasks) and
   `transaction`, which opens a `StoreTx` the scheduler drives commands and task
   acks through. Atomicity lives in the store: the MySQL
   `runtime::mysql::Backend` opens a real SQL transaction, so a command append and
   its task ack commit together.
 - `TaskRunner` — runs a scheduled task (`run`, which only executes the work).
-- `TaskEventPoll` — supplies the events task runs produced (`poll`,
-  optionally scoped to a set of shards) and acknowledges them (`ack`) once
+- `TaskEventPoll` — supplies the events task runs produced (`poll`) and
+  acknowledges them (`ack`) once
   driven. Running and consuming are separate: `run` records the event, `poll`
   returns it, and `ack` consumes it.
 
 - `TaskEvent` — `Pend`, `Succeed`, `Fail`, `Terminate`, `Cancel`; each maps to the
   matching `Command` via `TaskEvent::command(node)`. Defined in `runtime` and
   re-exported here.
-- `TaskEventEntry` — the recorded event (its `task_id`/`node_id`/`shard` plus the
+- `TaskEventEntry` — the recorded event (its `task_id`/`node_id` plus the
   `TaskEvent`), so a polled event can be routed back to its node; built from a
   task with `TaskEventEntry::new`. Also defined in `runtime` and re-exported.
 - `Scheduler` — `schedule` (consume a task and emit `Run`, i.e. `Ready -> Running`,
   then `ack`), `drive` (emit a `TaskEvent`), `drive_events` (poll task events and
   drive each), `tick` (one batch: poll tasks, schedule and run each, then poll
   events and drive them), and `drain` (loop until a tick consumes nothing).
-  `with_shard` scopes both task and event polling to a single shard, while
-  `with_shards`/`set_shards` accept the complete shard set owned by this process.
-  By default every shard is polled. On a membership notification, rebuild the
-  table, call `table.owned_shards(&local_member)`, and pass that
-  set to `set_shards`.
 - `AutoRunner` (in `src/auto.rs`, behind `mysql`) — implements `TaskRunner` and
   `TaskEventPoll`; `run` records a successful event for the task, `poll` reads
-  the unconsumed events back (optionally scoped to a set of shards), and `ack`
-  advances the shard offset once the scheduler has driven them.
+  the unconsumed events back, and `ack` advances the global event offset once the
+  scheduler has driven them.
 - `Dispatcher` (in `src/dispatcher.rs`, behind `mysql`) — wraps another
   `TaskRunner` and adds dispatch tracking. On `run`, it first records a
   `ScheduledTask` referencing the task, its run, node run, and the node and run
@@ -211,14 +188,13 @@ reaches quiescence (see `crates/scheduler/tests/mysql_scheduler.rs`).
 ### Command event log (event sourcing)
 
 Commands are recorded append-only in `command_entry`, keyed by a monotonically
-increasing offset (`id`) and routed to a shard derived from `data_id`.
-`CommandEntry::routed` builds an entry placed on the shard of its `data_id`, and
-`CommandEmit::emit` appends it through any `toasty::Executor`, letting the database
-assign the offset. Consumers advance through the log with `CommandPoll::poll`
-(read unacknowledged entries in offset order, optionally restricted to a set of
-shards) and `CommandPoll::ack` (persist the shard's consumed offset in
-`command_poll_offset`). Because the log is the source of truth, a run's status can
-be driven — or replayed — from the recorded command sequence.
+increasing offset (`id`). `CommandEntry::new` builds an entry for a
+`(data_id, graph_id)` run, and `CommandEmit::emit` appends it through any
+`toasty::Executor`, letting the database assign the offset. Consumers advance
+through the log with `CommandPoll::poll` (read the first unacknowledged
+contiguous entries in offset order) and `CommandPoll::ack` (persist the global
+consumed offset in `poll_offset`). Because the log is the source of truth, a
+run's status can be driven — or replayed — from the recorded command sequence.
 
 ### `executor` — task jobs
 
@@ -233,8 +209,8 @@ be driven — or replayed — from the recorded command sequence.
 
 ### `server` — HTTP API
 
-The workspace's only binary. `server::router` builds the axum `Router` and
-`main` serves it. The router's state is `server::app::App`, so the REST handlers
+`server::router` builds the axum `Router` and `main` serves it. The router's
+state is `server::app::App`, so the REST handlers
 delegate straight to the app: they emit through `RunApp` and read state back
 from it (no parallel HTTP state type). `App::connect(url, config, graph_store)`
 builds it, letting the binary supply any `GraphStore`; `server::graph` provides
@@ -244,12 +220,10 @@ ten word-named graphs embedded from the repository's `graphs/` directory
 `server::config::Config::load` layers configuration with the `config` crate —
 built-in defaults, then a file (`RAYFLOW_CONFIG`; by default `rayflow.yaml` at
 the repository root, or any format found under the `rayflow` name), then the
-environment: `RAYFLOW_ADDR` (listen address, default `0.0.0.0:8080`),
-`RAYFLOW_SHARDS` (shard count, default `1`), and `DATABASE_URL` (MySQL URL;
-required). The
-checked-in `rayflow.yaml` sets `addr`, `shards: 1`, and `database_url`; the
-binary runs entirely from this config. Service routes are `/` (service name) and
-`/health` (liveness).
+environment: `RAYFLOW_ADDR` (listen address, default `0.0.0.0:8080`) and
+`DATABASE_URL` (MySQL URL; required). The checked-in `rayflow.yaml` sets `addr`
+and `database_url`; the binary runs entirely from this config. Service routes are
+`/` (service name) and `/health` (liveness).
 
 The REST API is the command *producer* of the event-sourced runtime: it appends
 the commands that drive a run to the command log and reads back the state they
@@ -263,9 +237,9 @@ produced once a consumer has applied them.
 | `POST` | `/task_events` | `{ task_id, event }` | Emit a `TaskEvent` for an existing task. |
 | `GET` | `/runs/graph_state` | `?data_id=&graph_id=` | Current `GraphState` (run `uuid`, `version`, `revision`, `edges`, and each node's state). |
 
-Commands and task events are accepted (`202 Accepted` with the entry `id` and
-`shard`) once appended; `graph_state` returns `404` when no run exists for the
-pair, and task-event emission returns `404` when the task does not exist.
+Commands and task events are accepted (`202 Accepted` with the entry `id`) once
+appended; `graph_state` returns `404` when no run exists for the pair, and
+task-event emission returns `404` when the task does not exist.
 
 The same surface is available as a library, in `server::app`:
 
@@ -273,11 +247,11 @@ The same surface is available as a library, in `server::app`:
   loaded `Config`, and any `GraphStore` (so the server is graph-source agnostic);
   `App::connect` is the same but connects the `Db` from a URL first. `App` is
   `Clone`, so it is the axum router state directly. `App::offsets` exposes the
-  shared per-shard offsets, and `App::run_with` yields a `RunApp` for one
+  shared command offset, and `App::run_with` yields a `RunApp` for one
   `(data_id, graph_id)` run.
 - `RunApp` produces commands — `start`, `rerun`, `dryrun` append the command and
   return the emitted `CommandEntry`; the `*_wait` variants additionally block
-  until the command's shard offset is consumed
+  until the command's offset is consumed
   (`start_wait`/`rerun_wait`/`dryrun_wait`).
 - `App::emit_task_event(task_id, event)` resolves the task and appends its event,
   returning the recorded `TaskEventEntry` with its assigned offset.
@@ -288,6 +262,29 @@ The same surface is available as a library, in `server::app`:
   run's current revision.
 - `AppError` maps to an HTTP response (`404` for missing runs/nodes, `500` for
   backend or graph errors).
+
+### `pilot` — leader-elected consumer
+
+Every pilot competes for a MySQL-backed lease on a named coordinator role. Only
+the current leader consumes the global logs; standbys return an empty step and
+take over after the lease expires or is released. On every pass the leader:
+
+1. Acquires or renews the leader lease.
+2. Polls and applies command entries, then acknowledges them.
+3. Runs `Scheduler::tick`, which consumes tasks and task events.
+4. Applies the commands emitted by that scheduling pass.
+
+Command, task, and task-event consumption all use a persisted global offset and
+skip an auto-increment gap only after it has remained missing for 10 seconds.
+
+Configuration is layered like the server's: defaults, then `rayflow.yaml`, then
+the environment. Pilot settings include `batch`, `poll_interval_ms`,
+`leader_name`, and `leader_lease_ms`; `RAYFLOW_PILOT_*` variables override them.
+Run it with:
+
+```sh
+DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow cargo run -p pilot
+```
 
 ## Node State Transition
 
@@ -367,11 +364,11 @@ DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow cargo test -p schedule
 ```text
 crates/
   dag/         pure graph model (Graph/Id traits, DAG types)
-  shardtable/  Membership + HashTable + Coordinator
-  swim/        SWIM membership + Transport abstraction
+  coordinator/ MySQL-backed LeaderElection
   runtime/     Command/Status/Task/RunConfig/NodeConfig traits + src/mysql/ backend
   scheduler/   TaskEvent/TaskRunner/TaskEventPoll/Store + Scheduler + AutoRunner/Dispatcher
   executor/    JobContext/Runnable/TaskState + script.rs Script
 server/        axum HTTP API binary (router + RAYFLOW_ADDR bind)
+pilot/         leader-elected command/task/task-event consumer binary
 runtime.sql    MySQL schema (task, run, run_config, node_config, node_run, transition_lock, scheduled_task, task_event, command_entry, poll offsets)
 ```

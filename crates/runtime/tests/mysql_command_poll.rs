@@ -1,17 +1,17 @@
-//! Integration test for multi-shard command polling.
+//! Integration tests for contiguous command polling.
 //!
-//! It needs a MySQL instance. Set `DATABASE_URL` (for example
-//! `mysql://root:password@127.0.0.1:3306/rayflow`) to run it; the test resets
-//! the database and pushes the schema from the Toasty models itself. Without
-//! `DATABASE_URL` the test is skipped.
+//! Set `DATABASE_URL` to run these tests. Without it they skip, matching the
+//! other MySQL integration tests in the workspace.
 #![cfg(feature = "mysql")]
 
+use std::time::Duration;
+
+use jiff::Timestamp;
+use runtime::mysql::model::PollOffsetModel;
 use runtime::{Command, CommandEmit, CommandEntry, CommandPoll};
 use toasty::Db;
 use uuid::Uuid;
 
-/// Connects and rebuilds the schema from the Toasty models, or returns `None`
-/// when no `DATABASE_URL` is configured.
 async fn setup() -> Option<Db> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
@@ -28,67 +28,120 @@ async fn setup() -> Option<Db> {
     Some(db)
 }
 
-fn entry(shard: u32, node: u128) -> CommandEntry {
-    CommandEntry {
-        command_offset: 0,
-        id: Uuid::new_v4(),
-        data_id: Uuid::from_u128(0xda7a),
-        graph_id: Uuid::from_u128(0x9a1),
-        shard,
-        command: Command::Run {
+fn entry(node: u128) -> CommandEntry {
+    CommandEntry::new(
+        Uuid::from_u128(0xda7a),
+        Uuid::from_u128(0x9a1),
+        Command::Run {
             node: Uuid::from_u128(node),
         },
-        created_at: jiff::Timestamp::now(),
-    }
+    )
+}
+
+async fn age_gap(db: &mut Db) {
+    let now = Timestamp::now();
+    PollOffsetModel::filter_by_name("command_entry".to_string())
+        .update()
+        .gap_since(Some(now - Duration::from_secs(11)))
+        .updated_at(now)
+        .exec(db)
+        .await
+        .expect("age command gap");
 }
 
 #[tokio::test]
-async fn polls_selected_shards_and_acks_independently() {
+async fn polls_and_acknowledges_contiguous_commands() {
     let Some(mut db) = setup().await else {
         eprintln!("skipping: set DATABASE_URL to run the MySQL command poll test");
         return;
     };
 
-    for (node, shard) in [(1, 0), (2, 1), (3, 2)] {
-        entry(shard, node)
-            .emit(&mut db)
-            .await
-            .expect("emit command");
+    for node in [1, 2, 3] {
+        entry(node).emit(&mut db).await.expect("emit command");
     }
 
-    let selected: Vec<CommandEntry> = CommandEntry::poll(&mut db, 16, &[0, 2])
+    let polled: Vec<CommandEntry> = CommandEntry::poll(&mut db, 16)
         .await
-        .expect("poll shards 0 and 2")
+        .expect("poll commands")
         .collect();
+    assert_eq!(polled.len(), 3);
     assert_eq!(
-        selected
-            .iter()
-            .map(|entry| entry.command.clone())
-            .collect::<Vec<_>>(),
-        vec![
-            Command::Run {
-                node: Uuid::from_u128(1)
-            },
-            Command::Run {
-                node: Uuid::from_u128(3)
-            },
-        ]
+        polled[0].command,
+        Command::Run {
+            node: Uuid::from_u128(1)
+        }
+    );
+    assert_eq!(
+        polled[2].command,
+        Command::Run {
+            node: Uuid::from_u128(3)
+        }
     );
 
-    for entry in &selected {
+    for entry in &polled {
         entry.ack(&mut db).await.expect("ack command");
     }
 
-    let selected_again: Vec<CommandEntry> = CommandEntry::poll(&mut db, 16, &[0, 2])
-        .await
-        .expect("poll acknowledged shards")
-        .collect();
-    assert!(selected_again.is_empty());
+    assert!(
+        CommandEntry::poll(&mut db, 16)
+            .await
+            .expect("poll acknowledged commands")
+            .next()
+            .is_none()
+    );
+}
 
-    let remaining: Vec<CommandEntry> = CommandEntry::poll(&mut db, 16, &[])
+#[tokio::test]
+async fn waits_for_a_fresh_gap_then_skips_it_after_ten_seconds() {
+    let Some(mut db) = setup().await else {
+        eprintln!("skipping: set DATABASE_URL to run the MySQL command poll test");
+        return;
+    };
+
+    let first = entry(1).emit(&mut db).await.expect("emit first");
+    let missing = entry(2).emit(&mut db).await.expect("emit gap row");
+    entry(3).emit(&mut db).await.expect("emit after gap");
+    toasty::sql::statement("DELETE FROM command_entry WHERE id = ?")
+        .bind(missing)
+        .exec(&mut db)
         .await
-        .expect("poll all shards")
+        .expect("delete gap row");
+
+    let polled: Vec<CommandEntry> = CommandEntry::poll(&mut db, 16)
+        .await
+        .expect("poll fresh gap")
         .collect();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].shard, 1);
+    assert_eq!(polled.len(), 1);
+    assert_eq!(polled[0].command_offset, first);
+    polled[0].ack(&mut db).await.expect("ack first");
+
+    assert!(
+        CommandEntry::poll(&mut db, 16)
+            .await
+            .expect("fresh gap blocks later rows")
+            .next()
+            .is_none()
+    );
+
+    age_gap(&mut db).await;
+    let after: Vec<CommandEntry> = CommandEntry::poll(&mut db, 16)
+        .await
+        .expect("skip aged gap")
+        .collect();
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].command,
+        Command::Run {
+            node: Uuid::from_u128(3)
+        }
+    );
+    after[0].ack(&mut db).await.expect("ack after gap");
+
+    assert!(
+        CommandEntry::poll(&mut db, 16)
+            .await
+            .expect("poll after ack")
+            .next()
+            .is_none()
+    );
 }

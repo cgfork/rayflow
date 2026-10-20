@@ -4,8 +4,11 @@ use jiff::Timestamp;
 use toasty::Executor;
 
 use super::Error;
-use super::model::{CommandEntryModel, CommandPollOffsetModel, unacked_filter};
+use super::model::CommandEntryModel;
+use super::poll;
 use crate::{CommandEmit, CommandEntry, CommandPoll};
+
+const LOG: &str = "command_entry";
 
 impl<B> CommandEmit<B> for CommandEntry
 where
@@ -18,7 +21,6 @@ where
             .uuid(self.id)
             .data_id(self.data_id)
             .graph_id(self.graph_id)
-            .shard(self.shard)
             .command(self.command.clone())
             .created_at(self.created_at)
             .exec(&mut *backend)
@@ -35,36 +37,24 @@ where
 
     async fn poll(
         backend: &mut B,
-        maxium: usize,
-        shards: &[u32],
+        maximum: usize,
     ) -> Result<impl Iterator<Item = Self>, Self::Err> {
-        let mut offset_query = CommandPollOffsetModel::all();
-        if !shards.is_empty() {
-            offset_query =
-                offset_query.filter(CommandPollOffsetModel::fields().shard().in_list(shards));
-        }
-        let offsets: Vec<(u32, u64)> = offset_query
-            .exec(&mut *backend)
-            .await?
-            .into_iter()
-            .map(|row| (row.shard, row.offset))
-            .collect();
-
+        let state = poll::load(&mut *backend, LOG).await?;
         let fields = CommandEntryModel::fields();
-        let mut query = CommandEntryModel::all();
-        if !shards.is_empty() {
-            query = query.filter(fields.shard().in_list(shards));
-        }
-        if let Some(filter) = unacked_filter(&offsets, fields.shard(), fields.id()) {
-            query = query.filter(filter);
-        }
-        let rows = query
+        let rows = CommandEntryModel::all()
+            .filter(fields.id().gt(state.offset))
             .order_by(fields.id().asc())
-            .limit(maxium)
+            .limit(maximum)
             .exec(&mut *backend)
             .await?;
 
-        Ok(rows
+        let plan = poll::plan(rows, state, Timestamp::now(), |row| row.id);
+        if plan.changed {
+            poll::save(&mut *backend, LOG, plan.state).await?;
+        }
+
+        Ok(plan
+            .rows
             .into_iter()
             .map(CommandEntryModel::into_command_entry)
             .collect::<Result<Vec<_>, _>>()?
@@ -72,31 +62,6 @@ where
     }
 
     async fn ack(&self, backend: &mut B) -> Result<(), Self::Err> {
-        // Advance the shard's offset, but never move it backwards.
-        let now = Timestamp::now();
-        match CommandPollOffsetModel::filter_by_shard(self.shard)
-            .first()
-            .exec(&mut *backend)
-            .await?
-        {
-            Some(row) if row.offset < self.command_offset => {
-                CommandPollOffsetModel::filter_by_id(row.id)
-                    .update()
-                    .offset(self.command_offset)
-                    .updated_at(now)
-                    .exec(&mut *backend)
-                    .await?;
-            }
-            None => {
-                CommandPollOffsetModel::create()
-                    .shard(self.shard)
-                    .offset(self.command_offset)
-                    .updated_at(now)
-                    .exec(&mut *backend)
-                    .await?;
-            }
-            _ => {}
-        }
-        Ok(())
+        poll::ack(&mut *backend, LOG, self.command_offset).await
     }
 }

@@ -1,12 +1,12 @@
 [workspace]
 members = [
     "server",
+    "pilot",
     "crates/dag",
     "crates/runtime",
     "crates/scheduler",
     "crates/executor",
-    "crates/shardtable",
-    "crates/swim",
+    "crates/coordinator",
 ]
 resolver = "2"
 
@@ -20,9 +20,7 @@ dag = {path = "crates/dag"}
 runtime = {path = "crates/runtime"}
 scheduler = {path = "crates/scheduler"}
 executor = {path = "crates/executor"}
-shardtable = {path = "crates/shardtable"}
-swim = {path = "crates/swim"}
-siphasher = "1"
+coordinator = {path = "crates/coordinator"}
 axum = "0.8"
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
 toasty = { version = "0.11", features = ["mysql", "serde", "jiff"] }

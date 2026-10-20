@@ -7,26 +7,6 @@ use dag::{Graph, Id};
 use jiff::Timestamp;
 use uuid::Uuid;
 
-/// Stable FNV-1a hash of a data id, used to place it in the shard table.
-pub fn hash_data_id(data_id: Uuid) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    for byte in data_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
-/// Maps a data id to its shard index in the shard table.
-///
-/// The result is always in `0..shards`, so it can be stored in the `shard`
-/// columns and used for ownership lookups.
-pub fn shard_of(data_id: Uuid, shards: u32) -> u32 {
-    (hash_data_id(data_id) % u64::from(shards)) as u32
-}
-
 /// The node status.
 /// 1. Ready -> Running -> Succeeded/Failed/Terminated
 /// 2. Ready -> Running -> Pending -> Succeeded/Failed/Terminated
@@ -95,18 +75,12 @@ pub trait CommandPoll<B>: Send + Sized {
     /// Error returned when polling or acknowledging a command entry.
     type Err: std::error::Error;
 
-    /// Returns up to `maxium` command entries that have not been acknowledged.
-    ///
-    /// When `shards` is non-empty, only entries routed to one of those shards
-    /// are returned; when it is empty, entries are returned across every shard.
-    async fn poll(
-        backend: &mut B,
-        maxium: usize,
-        shards: &[u32],
-    ) -> Result<impl Iterator<Item = Self>, Self::Err>;
+    /// Returns up to `maximum` command entries from the first unacknowledged
+    /// contiguous offset.
+    async fn poll(backend: &mut B, maximum: usize)
+    -> Result<impl Iterator<Item = Self>, Self::Err>;
 
-    /// Acknowledges this entry, advancing the recorded offset of its shard to
-    /// `self.command_offset`.
+    /// Acknowledges this entry, advancing the recorded command offset.
     async fn ack(&self, backend: &mut B) -> Result<(), Self::Err>;
 }
 
@@ -133,12 +107,10 @@ pub struct CommandEntry {
     pub command_offset: u64,
     /// Unique entry identifier.
     pub id: Uuid,
-    /// Data identifier used to route the entry to a shard.
+    /// Data identifier the command applies to.
     pub data_id: Uuid,
     /// Graph identifier that owns the entry.
     pub graph_id: Uuid,
-    /// Shard this entry is routed to.
-    pub shard: u32,
     /// Command carried by this entry.
     pub command: Command,
     /// Time at which the entry was created.
@@ -148,26 +120,16 @@ pub struct CommandEntry {
 impl CommandEntry {
     /// Creates a command entry that has not yet been appended to a log.
     ///
-    /// The offset is assigned when the entry is emitted, so it is left at `0`
-    /// here. The entry is not routed to a shard; use [`routed`](Self::routed)
-    /// before emitting so it lands on the right shard.
+    /// The offset is assigned when the entry is emitted, so it is left at `0`.
     pub fn new(data_id: Uuid, graph_id: Uuid, command: Command) -> Self {
         Self {
             command_offset: 0,
             id: Uuid::new_v4(),
             data_id,
             graph_id,
-            shard: 0,
             command,
             created_at: Timestamp::now(),
         }
-    }
-
-    /// Creates a command entry routed to the shard of `data_id` over `shards` shards.
-    pub fn routed(data_id: Uuid, graph_id: Uuid, command: Command, shards: u32) -> Self {
-        let mut entry = Self::new(data_id, graph_id, command);
-        entry.shard = shard_of(data_id, shards);
-        entry
     }
 }
 
@@ -197,17 +159,12 @@ pub trait TaskPoll<B>: Send + Sized {
     /// Error returned when polling or acknowledging a task.
     type Err: std::error::Error;
 
-    /// Returns up to `maxium` tasks that have not been acknowledged.
-    ///
-    /// When `shards` is non-empty, only tasks routed to one of those shards are
-    /// returned; when it is empty, tasks are returned across every shard.
-    async fn poll(
-        backend: &mut B,
-        maxium: usize,
-        shards: &[u32],
-    ) -> Result<impl Iterator<Item = Self>, Self::Err>;
+    /// Returns up to `maximum` tasks from the first unacknowledged contiguous
+    /// offset.
+    async fn poll(backend: &mut B, maximum: usize)
+    -> Result<impl Iterator<Item = Self>, Self::Err>;
 
-    /// Acknowledges this task, advancing the recorded offset of its shard to `self.task_offset`.
+    /// Acknowledges this task, advancing the recorded task offset.
     async fn ack(&self, backend: &mut B) -> Result<(), Self::Err>;
 }
 
@@ -218,10 +175,8 @@ pub struct Task {
     pub task_offset: u64,
     /// Unique task identifier.
     pub id: Uuid,
-    /// Data identifier used to route the task to a shard.
+    /// Data identifier of the task.
     pub data_id: Uuid,
-    /// Shard this task is routed to.
-    pub shard: u32,
     /// Graph identifier that owns the task.
     pub graph_id: Uuid,
     /// Node identifier within the graph.
@@ -432,11 +387,9 @@ pub trait TaskEventPoll: Send + Sync {
     /// Error returned when polling or acknowledging a task event.
     type Err: std::error::Error + Send + Sync + 'static;
 
-    /// Returns up to `max` task events that have not yet been consumed.
-    ///
-    /// When `shards` is non-empty, only events routed to one of those shards are
-    /// returned; when it is empty, events are returned across every shard.
-    async fn poll(&self, max: usize, shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err>;
+    /// Returns up to `max` task events from the first unacknowledged contiguous
+    /// offset.
+    async fn poll(&self, max: usize) -> Result<Vec<TaskEventEntry>, Self::Err>;
 
     /// Acknowledges `event`, so it is not polled again.
     async fn ack(&self, event: &TaskEventEntry) -> Result<(), Self::Err>;
@@ -454,7 +407,7 @@ pub struct TaskEventEntry {
     pub id: Uuid,
     /// Identifier of the task whose run produced the event.
     pub task_id: Uuid,
-    /// Data identifier used to route the event to a shard.
+    /// Data identifier of the run that produced the event.
     pub data_id: Uuid,
     /// Graph identifier that owns the event.
     pub graph_id: Uuid,
@@ -462,8 +415,6 @@ pub struct TaskEventEntry {
     pub node_id: Uuid,
     /// Identifier of the node run the event drives.
     pub node_run_id: u64,
-    /// Shard this event is routed to.
-    pub shard: u32,
     /// Event the run reported.
     pub event: TaskEvent,
     /// Time at which the event was created.
@@ -483,7 +434,6 @@ impl TaskEventEntry {
             graph_id: task.graph_id,
             node_id: task.node_id,
             node_run_id: task.node_run_id,
-            shard: task.shard,
             event,
             created_at: Timestamp::now(),
         }

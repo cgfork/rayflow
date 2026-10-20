@@ -6,7 +6,7 @@ use server::{App, Config, StaticGraphStore};
 ///
 /// Configuration is layered from defaults, then `rayflow.yaml`, then the
 /// environment; see [`server::config`]. Everything the server needs — the bind
-/// address, the shard count, and the database URL — comes from that config.
+/// address and the database URL — comes from that config.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;

@@ -3,8 +3,8 @@
 //! Most operations are expressed with the Toasty [`Model`](toasty::Model)s in
 //! [`model`]; register them on the [`Db`](toasty::Db) with [`models`] (or let
 //! [`Backend::connect`] do it) before issuing queries. The task, command, and
-//! task-event pollers first fetch the relevant per-shard offsets, then query the
-//! log with those offsets applied.
+//! task-event pollers first fetch the global offset for their log, then select
+//! the first contiguous run of rows after it.
 
 use toasty::Db;
 use uuid::Uuid;
@@ -14,6 +14,7 @@ mod entry;
 mod event;
 mod lock;
 pub mod model;
+mod poll;
 mod scheduled;
 mod task;
 
@@ -71,20 +72,14 @@ pub enum Error {
 #[derive(Clone)]
 pub struct Backend<S> {
     db: Db,
-    shards: u32,
     graph_store: S,
 }
 
 impl<S> Backend<S> {
-    /// Creates a backend from an existing database handle, the number of shards in
-    /// the shard table, and the graph store used to resolve graph structure.
-    pub fn new(db: Db, shards: u32, graph_store: S) -> Self {
-        assert!(shards > 0, "shards must be at least 1");
-        Self {
-            db,
-            shards,
-            graph_store,
-        }
+    /// Creates a backend from an existing database handle and the graph store
+    /// used to resolve graph structure.
+    pub fn new(db: Db, graph_store: S) -> Self {
+        Self { db, graph_store }
     }
 
     /// Connects to `url`, registering the runtime's Toasty models.
@@ -92,11 +87,11 @@ impl<S> Backend<S> {
     /// This is the recommended constructor: the models must be registered on the
     /// [`Db`] for the query builders the backend uses to work. Combine with
     /// [`models`] when constructing the [`Db`] yourself.
-    pub async fn connect(url: &str, shards: u32, graph_store: S) -> Result<Self, Error> {
+    pub async fn connect(url: &str, graph_store: S) -> Result<Self, Error> {
         let mut builder = toasty::Db::builder();
         builder.models(models());
         let db = builder.connect(url).await?;
-        Ok(Self::new(db, shards, graph_store))
+        Ok(Self::new(db, graph_store))
     }
 
     /// Returns the underlying database handle.

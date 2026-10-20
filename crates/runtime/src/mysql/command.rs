@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::lock::lock_transition;
 use super::model::{NodeRunModel, RunModel};
 use super::{Backend, Error};
-use crate::{Command, CommandApply, CommandEntry, GraphStore, Status, Task, TaskWrite, shard_of};
+use crate::{Command, CommandApply, CommandEntry, GraphStore, Status, Task, TaskWrite};
 
 impl<S> CommandApply<Backend<S>> for CommandEntry
 where
@@ -136,13 +136,11 @@ impl<S> Backend<S> {
             return Err(Error::AlreadyStarted);
         }
 
-        let shard = shard_of(data_id, self.shards);
         let now = Timestamp::now();
         let run = RunModel::create()
             .uuid(Uuid::new_v4())
             .data_id(data_id)
             .graph_id(graph_id)
-            .shard(shard)
             .version(version)
             .revision(0)
             .created_at(now)
@@ -157,7 +155,6 @@ impl<S> Backend<S> {
                 .data_id(data_id)
                 .graph_id(graph_id)
                 .node_id(*node_id)
-                .shard(shard)
                 .revision(0)
                 .status(Status::Ready.to_string())
                 .created_at(now)
@@ -170,7 +167,6 @@ impl<S> Backend<S> {
                 task_offset: 0,
                 id: Uuid::new_v4(),
                 data_id,
-                shard,
                 graph_id,
                 node_id: *node_id,
                 node_run_id,
@@ -250,13 +246,11 @@ impl<S> Backend<S> {
             .exec(&mut *tx)
             .await?;
 
-        let shard = shard_of(data_id, self.shards);
         let node_run_id = NodeRunModel::create()
             .run_id(run.uuid)
             .data_id(data_id)
             .graph_id(graph_id)
             .node_id(node)
-            .shard(shard)
             .revision(revision)
             .status(Status::Ready.to_string())
             .created_at(now)
@@ -269,7 +263,6 @@ impl<S> Backend<S> {
             task_offset: 0,
             id: Uuid::new_v4(),
             data_id,
-            shard,
             graph_id,
             node_id: node,
             node_run_id,
@@ -338,8 +331,6 @@ impl<S> Backend<S> {
             .exec(&mut *tx)
             .await?;
 
-        let shard = shard_of(data_id, self.shards);
-
         // Mock each target's direct predecessors as `Succeeded` so the target is
         // runnable without executing its upstream. A node that is itself a target
         // is written `Ready` below, and a shared predecessor is only written once.
@@ -354,7 +345,6 @@ impl<S> Backend<S> {
                     .data_id(data_id)
                     .graph_id(graph_id)
                     .node_id(predecessor)
-                    .shard(shard)
                     .revision(revision)
                     .status(Status::Succeeded.to_string())
                     .created_at(now)
@@ -371,7 +361,6 @@ impl<S> Backend<S> {
                 .data_id(data_id)
                 .graph_id(graph_id)
                 .node_id(*node)
-                .shard(shard)
                 .revision(revision)
                 .status(Status::Ready.to_string())
                 .created_at(now)
@@ -384,7 +373,6 @@ impl<S> Backend<S> {
                 task_offset: 0,
                 id: Uuid::new_v4(),
                 data_id,
-                shard,
                 graph_id,
                 node_id: *node,
                 node_run_id,
@@ -554,8 +542,6 @@ impl<S> Backend<S> {
             .await
             .map_err(|error| Error::Graph(Box::new(error)))?;
         let succeeded = Status::Succeeded.to_string();
-        let shard = shard_of(data_id, self.shards);
-
         for successor in graph.successors(node).map(|node| node.id) {
             let mut ready = true;
             for predecessor in graph.incoming_edges(successor) {
@@ -606,7 +592,6 @@ impl<S> Backend<S> {
                         .data_id(data_id)
                         .graph_id(graph_id)
                         .node_id(successor)
-                        .shard(shard)
                         .revision(run.revision)
                         .status(Status::Ready.to_string())
                         .created_at(now)
@@ -621,7 +606,6 @@ impl<S> Backend<S> {
                 task_offset: 0,
                 id: Uuid::new_v4(),
                 data_id,
-                shard,
                 graph_id,
                 node_id: successor,
                 node_run_id: successor_run_id,

@@ -88,11 +88,11 @@ impl TaskRunner for MockRunner {
 impl TaskEventPoll for MockRunner {
     type Err = Infallible;
 
-    async fn poll(&self, max: usize, shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err> {
+    async fn poll(&self, max: usize) -> Result<Vec<TaskEventEntry>, Self::Err> {
         let mut events = self.events.lock().unwrap();
         let mut taken = Vec::new();
         events.retain(|entry| {
-            if taken.len() < max && (shards.is_empty() || shards.contains(&entry.shard)) {
+            if taken.len() < max {
                 taken.push(entry.clone());
                 false
             } else {
@@ -155,7 +155,7 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
 
 /// Writes `Start` to the command log, then consumes and applies it.
 async fn start_run(db: &mut Db, backend: &Backend<TestGraphStore>, data_id: Uuid, graph_id: Uuid) {
-    let entry = CommandEntry::routed(data_id, graph_id, Command::Start { nodes: Vec::new() }, 1);
+    let entry = CommandEntry::new(data_id, graph_id, Command::Start { nodes: Vec::new() });
     entry.emit(db).await.expect("emit Start");
     consume_commands(db, backend).await;
 }
@@ -163,7 +163,7 @@ async fn start_run(db: &mut Db, backend: &Backend<TestGraphStore>, data_id: Uuid
 /// Polls the command log and applies every unacknowledged command, in offset
 /// order. Returns how many commands were applied.
 async fn consume_commands(db: &mut Db, backend: &Backend<TestGraphStore>) -> usize {
-    let entries: Vec<CommandEntry> = CommandEntry::poll(db, 256, &[])
+    let entries: Vec<CommandEntry> = CommandEntry::poll(db, 256)
         .await
         .expect("poll commands")
         .collect();
@@ -280,8 +280,8 @@ async fn mysql_scheduler_runs_a_chain_to_completion() {
     };
     let graph_id = dag.id;
 
-    let producer = Backend::new(db.clone(), 1, TestGraphStore(dag.clone()));
-    let consumer = Backend::new(db.clone(), 1, TestGraphStore(dag));
+    let producer = Backend::new(db.clone(), TestGraphStore(dag.clone()));
+    let consumer = Backend::new(db.clone(), TestGraphStore(dag));
     let mut scheduler = Scheduler::new(producer, MockRunner::succeed(), 16);
 
     start_run(&mut db, &consumer, data_id, graph_id).await;
@@ -295,7 +295,7 @@ async fn mysql_scheduler_runs_a_chain_to_completion() {
     assert_eq!(failed, 0);
 
     // Every emitted command was consumed.
-    let pending: Vec<CommandEntry> = CommandEntry::poll(&mut db, 256, &[])
+    let pending: Vec<CommandEntry> = CommandEntry::poll(&mut db, 256)
         .await
         .expect("poll commands")
         .collect();
@@ -311,8 +311,8 @@ async fn mysql_scheduler_stops_downstream_after_failure() {
     let graph_id = dag.id;
     let middle = dag.nodes[1].id;
 
-    let producer = Backend::new(db.clone(), 1, TestGraphStore(dag.clone()));
-    let consumer = Backend::new(db.clone(), 1, TestGraphStore(dag));
+    let producer = Backend::new(db.clone(), TestGraphStore(dag.clone()));
+    let consumer = Backend::new(db.clone(), TestGraphStore(dag));
     let mut scheduler = Scheduler::new(producer, MockRunner::fail(vec![middle]), 16);
 
     start_run(&mut db, &consumer, data_id, graph_id).await;
@@ -339,8 +339,8 @@ async fn mysql_scheduler_reruns_a_succeeded_node() {
     // `c` (index 2), rerun once the whole graph has succeeded.
     let middle = dag.nodes[2].id;
 
-    let producer = Backend::new(db.clone(), 1, TestGraphStore(dag.clone()));
-    let consumer = Backend::new(db.clone(), 1, TestGraphStore(dag));
+    let producer = Backend::new(db.clone(), TestGraphStore(dag.clone()));
+    let consumer = Backend::new(db.clone(), TestGraphStore(dag));
     let mut scheduler = Scheduler::new(producer, MockRunner::succeed(), 16);
 
     start_run(&mut db, &consumer, data_id, graph_id).await;
@@ -350,7 +350,7 @@ async fn mysql_scheduler_reruns_a_succeeded_node() {
     );
 
     // Rerun `c`: it is reset to `Ready` at a new revision and enqueued again.
-    let entry = CommandEntry::routed(data_id, graph_id, Command::Rerun { node: middle }, 1);
+    let entry = CommandEntry::new(data_id, graph_id, Command::Rerun { node: middle });
     entry.emit(&mut db).await.expect("emit Rerun");
     consume_commands(&mut db, &consumer).await;
 
