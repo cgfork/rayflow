@@ -6,6 +6,7 @@ members = [
     "crates/scheduler",
     "crates/executor",
     "crates/shardtable",
+    "crates/swim",
 ]
 resolver = "2"
 
@@ -20,6 +21,7 @@ runtime = {path = "crates/runtime"}
 scheduler = {path = "crates/scheduler"}
 executor = {path = "crates/executor"}
 shardtable = {path = "crates/shardtable"}
+swim = {path = "crates/swim"}
 siphasher = "1"
 axum = "0.8"
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
