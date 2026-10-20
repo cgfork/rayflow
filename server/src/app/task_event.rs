@@ -41,7 +41,6 @@ mod tests {
     fn config() -> Config {
         Config {
             addr: "0.0.0.0:0".parse().unwrap(),
-            shards: 4,
             database_url: String::new(),
         }
     }
@@ -57,7 +56,6 @@ mod tests {
             task_offset: 0,
             id: Uuid::new_v4(),
             data_id: Uuid::from_u128(0xda7a),
-            shard: 2,
             graph_id: Uuid::from_u128(0x9a1),
             node_id: Uuid::from_u128(1),
             node_run_id: 7,
@@ -76,7 +74,6 @@ mod tests {
         assert_eq!(entry.graph_id, task.graph_id);
         assert_eq!(entry.node_id, task.node_id);
         assert_eq!(entry.node_run_id, task.node_run_id);
-        assert_eq!(entry.shard, task.shard);
         assert_eq!(entry.event, TaskEvent::Pend);
         let row = TaskEventModel::filter_by_uuid(entry.id)
             .first()

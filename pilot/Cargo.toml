@@ -1,0 +1,17 @@
+[package]
+name = "pilot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+config = { workspace = true }
+coordinator = { workspace = true }
+runtime = { workspace = true }
+scheduler = { workspace = true }
+serde = { workspace = true }
+server = { path = "../server" }
+thiserror = { workspace = true }
+toasty = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+uuid = { workspace = true }

@@ -35,8 +35,6 @@ pub struct EmitTaskEventRequest {
 pub struct EmitTaskEventResponse {
     /// Identifier of the emitted task event.
     pub id: Uuid,
-    /// Shard the event was routed to.
-    pub shard: u32,
 }
 
 /// Emits a task event for an existing task.
@@ -53,10 +51,7 @@ where
         .await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(EmitTaskEventResponse {
-            id: entry.id,
-            shard: entry.shard,
-        }),
+        Json(EmitTaskEventResponse { id: entry.id }),
     ))
 }
 

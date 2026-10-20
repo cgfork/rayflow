@@ -17,13 +17,12 @@ use crate::Config;
 
 /// Application over a MySQL backend and a graph store.
 ///
-/// `App` owns the shared per-shard offsets and hands out a [`RunApp`] for a
+/// `App` owns the shared command offset and hands out a [`RunApp`] for a
 /// specific `(data_id, graph_id)` run through [`run_with`](Self::run_with). It
 /// is the state the HTTP API is served from.
 #[derive(Clone)]
 pub struct App<S> {
     db: Db,
-    config: Config,
     offsets: Offsets,
     graph_store: S,
 }
@@ -31,7 +30,6 @@ pub struct App<S> {
 /// A single run: the commands that drive it and the state it produces.
 pub struct RunApp<S> {
     db: Db,
-    shards: u32,
     data_id: Uuid,
     graph_id: Uuid,
     offsets: Offsets,
@@ -39,13 +37,12 @@ pub struct RunApp<S> {
 }
 
 impl<S> App<S> {
-    /// Creates an app over `db`, tracking one offset per shard and serving
-    /// graphs from `graph_store`.
-    pub fn new(db: Db, config: Config, graph_store: S) -> Self {
-        let offsets = Offsets::new(config.shards);
+    /// Creates an app over `db`, tracking the consumed command offset and
+    /// serving graphs from `graph_store`.
+    pub fn new(db: Db, _config: Config, graph_store: S) -> Self {
+        let offsets = Offsets::new();
         Self {
             db,
-            config,
             offsets,
             graph_store,
         }
@@ -60,10 +57,10 @@ impl<S> App<S> {
         Ok(Self::new(db, config, graph_store))
     }
 
-    /// Returns the shared per-shard offsets.
+    /// Returns the shared command offset.
     ///
-    /// A consumer that advances a shard calls [`Offsets::set`], which wakes every
-    /// waiter blocked on that shard.
+    /// A consumer that advances the offset calls [`Offsets::set`], which wakes
+    /// every waiter.
     pub fn offsets(&self) -> &Offsets {
         &self.offsets
     }
@@ -75,7 +72,6 @@ impl<S> App<S> {
     {
         RunApp {
             db: self.db.clone(),
-            shards: self.config.shards,
             data_id,
             graph_id,
             offsets: self.offsets.clone(),

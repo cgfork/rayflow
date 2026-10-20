@@ -1,17 +1,16 @@
-//! Integration test for multi-shard task polling.
+//! Integration tests for contiguous task polling.
 //!
-//! It needs a MySQL instance. Set `DATABASE_URL` (for example
-//! `mysql://root:password@127.0.0.1:3306/rayflow`) to run it; the test resets
-//! the database and pushes the schema from the Toasty models itself. Without
-//! `DATABASE_URL` the test is skipped.
+//! Set `DATABASE_URL` to run these tests. Without it they skip.
 #![cfg(feature = "mysql")]
 
+use std::time::Duration;
+
+use jiff::Timestamp;
+use runtime::mysql::model::{PollOffsetModel, TaskModel};
 use runtime::{Task, TaskPoll, TaskWrite};
 use toasty::Db;
 use uuid::Uuid;
 
-/// Connects and rebuilds the schema from the Toasty models, or returns `None`
-/// when no `DATABASE_URL` is configured.
 async fn setup() -> Option<Db> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
@@ -28,53 +27,101 @@ async fn setup() -> Option<Db> {
     Some(db)
 }
 
-fn task(node: u128, shard: u32) -> Task {
+fn task(node: u128) -> Task {
     Task {
         task_offset: 0,
         id: Uuid::new_v4(),
         data_id: Uuid::from_u128(0xda7a),
-        shard,
         graph_id: Uuid::from_u128(0x9a1),
         node_id: Uuid::from_u128(node),
         node_run_id: 1,
-        created_at: jiff::Timestamp::now(),
+        created_at: Timestamp::now(),
     }
 }
 
 #[tokio::test]
-async fn polls_selected_shards_and_acks_independently() {
+async fn polls_and_acknowledges_contiguous_tasks() {
     let Some(mut db) = setup().await else {
         eprintln!("skipping: set DATABASE_URL to run the MySQL task poll test");
         return;
     };
 
-    for (node, shard) in [(1, 0), (2, 1), (3, 2)] {
-        task(node, shard).write(&mut db).await.expect("write task");
+    for node in [1, 2, 3] {
+        task(node).write(&mut db).await.expect("write task");
     }
 
-    let selected: Vec<Task> = Task::poll(&mut db, 16, &[0, 2])
-        .await
-        .expect("poll shards 0 and 2")
-        .collect();
+    let polled: Vec<Task> = Task::poll(&mut db, 16).await.expect("poll tasks").collect();
     assert_eq!(
-        selected.iter().map(|task| task.node_id).collect::<Vec<_>>(),
-        vec![Uuid::from_u128(1), Uuid::from_u128(3)]
+        polled.iter().map(|task| task.node_id).collect::<Vec<_>>(),
+        vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
     );
 
-    for task in &selected {
+    for task in &polled {
         task.ack(&mut db).await.expect("ack task");
     }
 
-    let selected_again: Vec<Task> = Task::poll(&mut db, 16, &[0, 2])
-        .await
-        .expect("poll acknowledged shards")
-        .collect();
-    assert!(selected_again.is_empty());
+    assert!(
+        Task::poll(&mut db, 16)
+            .await
+            .expect("poll acknowledged tasks")
+            .next()
+            .is_none()
+    );
+}
 
-    let remaining: Vec<Task> = Task::poll(&mut db, 16, &[])
+#[tokio::test]
+async fn skips_a_task_gap_only_after_the_timeout() {
+    let Some(mut db) = setup().await else {
+        eprintln!("skipping: set DATABASE_URL to run the MySQL task poll test");
+        return;
+    };
+
+    task(1).write(&mut db).await.expect("write first");
+    let gap = task(2);
+    gap.write(&mut db).await.expect("write gap row");
+    task(3).write(&mut db).await.expect("write after gap");
+    let gap_id = TaskModel::filter_by_uuid(gap.id)
+        .first()
+        .exec(&mut db)
         .await
-        .expect("poll all shards")
+        .expect("read gap row")
+        .expect("gap row")
+        .id;
+    toasty::sql::statement("DELETE FROM task WHERE id = ?")
+        .bind(gap_id)
+        .exec(&mut db)
+        .await
+        .expect("delete gap row");
+
+    let first: Vec<Task> = Task::poll(&mut db, 16)
+        .await
+        .expect("poll fresh gap")
         .collect();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].shard, 1);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].node_id, Uuid::from_u128(1));
+    first[0].ack(&mut db).await.expect("ack first");
+
+    assert!(
+        Task::poll(&mut db, 16)
+            .await
+            .expect("fresh gap blocks later tasks")
+            .next()
+            .is_none()
+    );
+
+    let now = Timestamp::now();
+    PollOffsetModel::filter_by_name("task".to_string())
+        .update()
+        .gap_since(Some(now - Duration::from_secs(11)))
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .expect("age task gap");
+
+    let after: Vec<Task> = Task::poll(&mut db, 16)
+        .await
+        .expect("skip aged gap")
+        .collect();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].node_id, Uuid::from_u128(3));
 }

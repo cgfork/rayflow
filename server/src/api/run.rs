@@ -42,8 +42,6 @@ pub struct StartRunRequest {
 pub struct StartRunResponse {
     /// Identifier of the emitted command entry.
     pub id: Uuid,
-    /// Shard the entry was routed to.
-    pub shard: u32,
 }
 
 /// Emits `Command::Start`, beginning a run.
@@ -59,10 +57,7 @@ where
     let entry = run.start(request.nodes).await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(StartRunResponse {
-            id: entry.id,
-            shard: entry.shard,
-        }),
+        Json(StartRunResponse { id: entry.id }),
     ))
 }
 
@@ -82,8 +77,6 @@ pub struct RerunRunRequest {
 pub struct RerunRunResponse {
     /// Identifier of the emitted command entry.
     pub id: Uuid,
-    /// Shard the entry was routed to.
-    pub shard: u32,
 }
 
 /// Emits `Command::Rerun`, resetting one node to `Ready`.
@@ -99,10 +92,7 @@ where
     let entry = run.rerun(request.node).await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(RerunRunResponse {
-            id: entry.id,
-            shard: entry.shard,
-        }),
+        Json(RerunRunResponse { id: entry.id }),
     ))
 }
 
@@ -123,8 +113,6 @@ pub struct DryrunRunRequest {
 pub struct DryrunRunResponse {
     /// Identifier of the emitted command entry.
     pub id: Uuid,
-    /// Shard the entry was routed to.
-    pub shard: u32,
 }
 
 /// Emits `Command::Dryrun`, mock-succeeding the nodes' predecessors.
@@ -140,10 +128,7 @@ where
     let entry = run.dryrun(request.nodes).await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(DryrunRunResponse {
-            id: entry.id,
-            shard: entry.shard,
-        }),
+        Json(DryrunRunResponse { id: entry.id }),
     ))
 }
 

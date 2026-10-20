@@ -25,8 +25,6 @@ pub struct NodeState {
     pub graph_id: Uuid,
     /// Node identifier from the node run.
     pub node_id: Uuid,
-    /// Shard the node run is routed to.
-    pub shard: u32,
     /// Revision the node run was read at.
     pub revision: u64,
     /// Node status, e.g. `Succeeded`.
@@ -52,7 +50,6 @@ impl NodeState {
             data_id: node_run.data_id,
             graph_id: node_run.graph_id,
             node_id: node_run.node_id,
-            shard: node_run.shard,
             revision: node_run.revision,
             status: node_run.status,
             created_at: node_run.created_at,
@@ -185,7 +182,6 @@ where
 #[cfg(test)]
 mod tests {
     use runtime::Status;
-    use runtime::shard_of;
     use uuid::Uuid;
 
     use super::*;
@@ -227,7 +223,6 @@ mod tests {
             .uuid(Uuid::new_v4())
             .data_id(data_id)
             .graph_id(graph_id)
-            .shard(shard_of(data_id, 4))
             .version(7)
             .revision(0)
             .created_at(now)
@@ -241,7 +236,6 @@ mod tests {
             .data_id(data_id)
             .graph_id(graph_id)
             .node_id(node_id)
-            .shard(shard_of(data_id, 4))
             .revision(0)
             .status(Status::Running.to_string())
             .created_at(now)
@@ -252,7 +246,6 @@ mod tests {
 
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
-            shards: 4,
             database_url: String::new(),
         };
         let app = App::new(db, config, TestGraphStore(graph));
@@ -301,7 +294,6 @@ mod tests {
             .uuid(Uuid::new_v4())
             .data_id(data_id)
             .graph_id(graph_id)
-            .shard(shard_of(data_id, 4))
             .version(7)
             .revision(1)
             .created_at(now)
@@ -322,7 +314,6 @@ mod tests {
                 .data_id(data_id)
                 .graph_id(graph_id)
                 .node_id(node_id)
-                .shard(shard_of(data_id, 4))
                 .revision(revision)
                 .status(status.to_string())
                 .created_at(now)
@@ -334,7 +325,6 @@ mod tests {
 
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
-            shards: 4,
             database_url: String::new(),
         };
         let app = App::new(db, config, TestGraphStore(graph));
@@ -367,7 +357,6 @@ mod tests {
 
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
-            shards: 4,
             database_url: String::new(),
         };
         let app = App::new(db, config, TestGraphStore::default());

@@ -1,17 +1,16 @@
-use runtime::{Command, CommandEmit, CommandEntry, shard_of};
+use runtime::{Command, CommandEmit, CommandEntry};
 use uuid::Uuid;
 
 use crate::app::{AppError, RunApp};
 
 impl<S> RunApp<S> {
-    /// Waits until this run's shard reaches `offset`.
+    /// Waits until the command log reaches `offset`.
     ///
-    /// The wait is served from the app's shared per-shard offsets, so it resolves
-    /// as soon as a consumer publishes the advance — no database polling, and it
-    /// may block for a long time.
+    /// The wait is served from the app's shared command offset, so it resolves as
+    /// soon as a consumer publishes the advance — no database polling, and it may
+    /// block for a long time.
     pub async fn wait_offset(&self, offset: u64) {
-        let shard = shard_of(self.data_id, self.shards);
-        self.offsets.wait(shard, offset).await;
+        self.offsets.wait(offset).await;
     }
 
     /// Starts the run, beginning at `nodes` (empty starts the graph's roots).
@@ -24,7 +23,7 @@ impl<S> RunApp<S> {
     /// Starts the run and waits until the command has been consumed.
     ///
     /// Waits on the emitted command's offset via [`wait_offset`](Self::wait_offset),
-    /// so it resolves once a consumer advances this run's shard past the command.
+    /// so it resolves once a consumer advances past the command.
     pub async fn start_wait(&mut self, nodes: Vec<Uuid>) -> Result<(), AppError> {
         self.emit_and_wait(Command::Start { nodes }).await
     }
@@ -39,7 +38,7 @@ impl<S> RunApp<S> {
     /// Reruns `node` and waits until the command has been consumed.
     ///
     /// Waits on the emitted command's offset via [`wait_offset`](Self::wait_offset),
-    /// so it resolves once a consumer advances this run's shard past the command.
+    /// so it resolves once a consumer advances past the command.
     pub async fn rerun_wait(&mut self, node: Uuid) -> Result<(), AppError> {
         self.emit_and_wait(Command::Rerun { node }).await
     }
@@ -54,23 +53,23 @@ impl<S> RunApp<S> {
     /// Dry-runs `nodes` and waits until the command has been consumed.
     ///
     /// Waits on the emitted command's offset via [`wait_offset`](Self::wait_offset),
-    /// so it resolves once a consumer advances this run's shard past the command.
+    /// so it resolves once a consumer advances past the command.
     pub async fn dryrun_wait(&mut self, nodes: Vec<Uuid>) -> Result<(), AppError> {
         self.emit_and_wait(Command::Dryrun { nodes }).await
     }
 
-    /// Appends `command` to the command log, routed to this run's shard, and
-    /// waits until the command has been consumed.
+    /// Appends `command` to the command log and waits until the command has been
+    /// consumed.
     async fn emit_and_wait(&mut self, command: Command) -> Result<(), AppError> {
         let entry = self.emit(command).await?;
         self.wait_offset(entry.command_offset).await;
         Ok(())
     }
 
-    /// Appends `command` to the command log, routed to this run's shard, and
-    /// returns the recorded entry (with the offset the log assigned it).
+    /// Appends `command` to the command log and returns the recorded entry (with
+    /// the offset the log assigned it).
     async fn emit(&mut self, command: Command) -> Result<CommandEntry, AppError> {
-        let mut entry = CommandEntry::routed(self.data_id, self.graph_id, command, self.shards);
+        let mut entry = CommandEntry::new(self.data_id, self.graph_id, command);
         let offset = entry.emit(&mut self.db).await?;
         entry.command_offset = offset;
         Ok(entry)
@@ -90,7 +89,6 @@ mod tests {
     fn app(db: Db) -> App<TestGraphStore> {
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
-            shards: 4,
             database_url: String::new(),
         };
         App::new(db, config, TestGraphStore::default())
@@ -134,7 +132,6 @@ mod tests {
         for entry in &entries {
             assert_eq!(entry.data_id, data_id);
             assert_eq!(entry.graph_id, graph_id);
-            assert_eq!(entry.shard, shard_of(data_id, 4));
         }
     }
 
@@ -149,7 +146,6 @@ mod tests {
         let graph_id = Uuid::from_u128(0x9a1);
         let app = app(db.clone());
         let offsets = app.offsets().clone();
-        let shard = shard_of(data_id, 4);
         let mut run = app.run_with(data_id, graph_id);
 
         let waiter = tokio::spawn(async move { run.start_wait(vec![]).await });
@@ -170,7 +166,7 @@ mod tests {
             !waiter.is_finished(),
             "start_wait should block until the command is consumed"
         );
-        offsets.set(shard, offset);
+        offsets.set(offset);
 
         tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
             .await

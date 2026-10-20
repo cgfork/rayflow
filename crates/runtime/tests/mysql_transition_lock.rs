@@ -67,10 +67,10 @@ async fn concurrent_applications_visit_a_transition_once() {
         return;
     };
 
-    let backend = Backend::new(db.clone(), 1, TestGraphStore(dag.clone()));
+    let backend = Backend::new(db.clone(), TestGraphStore(dag.clone()));
     let node = dag.nodes[0].id;
 
-    CommandEntry::routed(data_id, graph_id, Command::Start { nodes: Vec::new() }, 1)
+    CommandEntry::new(data_id, graph_id, Command::Start { nodes: Vec::new() })
         .apply(backend.clone())
         .await
         .expect("start run");
@@ -78,7 +78,7 @@ async fn concurrent_applications_visit_a_transition_once() {
     // Two consumers race to apply the same transition. The transaction-scoped
     // lock makes the loser wait, after which it observes Running and rejects the
     // duplicate transition instead of visiting the node's state twice.
-    let transition = CommandEntry::routed(data_id, graph_id, Command::Run { node }, 1);
+    let transition = CommandEntry::new(data_id, graph_id, Command::Run { node });
     let (first, second) = tokio::join!(
         transition.apply(backend.clone()),
         transition.apply(backend.clone())

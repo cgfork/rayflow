@@ -122,8 +122,8 @@ where
 {
     type Err = Error;
 
-    async fn poll(&self, max: usize, shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err> {
-        self.runner.poll(max, shards).await.map_err(runner_err)
+    async fn poll(&self, max: usize) -> Result<Vec<TaskEventEntry>, Self::Err> {
+        self.runner.poll(max).await.map_err(runner_err)
     }
 
     async fn ack(&self, event: &TaskEventEntry) -> Result<(), Self::Err> {

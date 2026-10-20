@@ -55,7 +55,7 @@ impl TaskRunner for MockRunner {
 impl TaskEventPoll for MockRunner {
     type Err = Infallible;
 
-    async fn poll(&self, _max: usize, _shards: &[u32]) -> Result<Vec<TaskEventEntry>, Self::Err> {
+    async fn poll(&self, _max: usize) -> Result<Vec<TaskEventEntry>, Self::Err> {
         Ok(Vec::new())
     }
 
@@ -80,7 +80,6 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
         .uuid(Uuid::new_v4())
         .data_id(data_id)
         .graph_id(graph_id)
-        .shard(0)
         .version(1)
         .revision(1)
         .created_at(now)
@@ -94,7 +93,6 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
         .data_id(data_id)
         .graph_id(graph_id)
         .node_id(node_id)
-        .shard(0)
         .revision(1)
         .status(runtime::Status::Running.to_string())
         .created_at(now)
@@ -144,7 +142,6 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
         task_offset: 0,
         id: Uuid::new_v4(),
         data_id,
-        shard: 0,
         graph_id,
         node_id,
         node_run_id: node_run.id,
@@ -156,7 +153,6 @@ async fn dispatcher_records_scheduled_task_with_resolved_references() {
         .graph_id(graph_id)
         .node_id(node_id)
         .node_run_id(node_run.id)
-        .shard(0)
         .created_at(now)
         .exec(&mut db)
         .await

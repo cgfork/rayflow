@@ -7,37 +7,24 @@ CREATE TABLE IF NOT EXISTS task (
     graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
     node_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'node unique identifier',
     node_run_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'owning node run id',
-    shard      INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'shard index derived from data_id',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     PRIMARY KEY (id),
     UNIQUE KEY uk_task_uuid (uuid),
-    KEY idx_task_node_run_id (node_run_id),
-    KEY idx_task_shard (shard)
+    KEY idx_task_node_run_id (node_run_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'task record';
-
-CREATE TABLE IF NOT EXISTS task_poll_offset (
-    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
-    shard      INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'shard index',
-    `offset`   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'last acknowledged task offset',
-    updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_task_poll_offset_shard (shard)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'per-shard task offset';
 
 CREATE TABLE IF NOT EXISTS run (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
     uuid       CHAR(36)        NOT NULL DEFAULT '' COMMENT 'run unique identifier',
     data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
     graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
-    shard      INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'shard index derived from data_id',
     version    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'graph version under execution',
     revision   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'run revision, incremented on rerun/dryrun',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     PRIMARY KEY (id),
     UNIQUE KEY uk_run_uuid (uuid),
-    UNIQUE KEY uk_run_data_graph_version (data_id, graph_id, version),
-    KEY idx_run_shard (shard)
+    UNIQUE KEY uk_run_data_graph_version (data_id, graph_id, version)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'dag execution run, one row per (data_id, graph_id, version)';
 
 CREATE TABLE IF NOT EXISTS run_config (
@@ -75,15 +62,13 @@ CREATE TABLE IF NOT EXISTS node_run (
     data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
     graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
     node_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'node unique identifier',
-    shard      INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'shard index derived from data_id',
     revision   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'node revision, incremented on rerun/dryrun',
     status     VARCHAR(16)     NOT NULL DEFAULT 'Ready' COMMENT 'node status',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     PRIMARY KEY (id),
     UNIQUE KEY uk_node_run_run_node_revision (run_id, node_id, revision),
-    KEY idx_node_run_data_graph (data_id, graph_id),
-    KEY idx_node_run_shard (shard)
+    KEY idx_node_run_data_graph (data_id, graph_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node status within a dag execution run, one row per revision';
 
 CREATE TABLE IF NOT EXISTS transition_lock (
@@ -120,22 +105,11 @@ CREATE TABLE IF NOT EXISTS command_entry (
     uuid       CHAR(36)        NOT NULL DEFAULT '' COMMENT 'command unique identifier',
     data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
     graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
-    shard      INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'shard index derived from data_id',
     command    JSON            NOT NULL COMMENT 'serialized command payload',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_command_entry_uuid (uuid),
-    KEY idx_command_entry_shard (shard)
+    UNIQUE KEY uk_command_entry_uuid (uuid)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'append-only command event log';
-
-CREATE TABLE IF NOT EXISTS command_poll_offset (
-    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
-    shard      INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'shard index',
-    `offset`   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'last acknowledged command offset',
-    updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_command_poll_offset_shard (shard)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'per-shard command offset';
 
 CREATE TABLE IF NOT EXISTS task_event (
     id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key, used as the event offset',
@@ -145,20 +119,25 @@ CREATE TABLE IF NOT EXISTS task_event (
     graph_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
     node_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'node unique identifier',
     node_run_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'owning node run id',
-    shard       INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'shard index derived from data_id',
     event       VARCHAR(16)     NOT NULL DEFAULT '' COMMENT 'task event name',
     created_at  DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     PRIMARY KEY (id),
     UNIQUE KEY uk_task_event_uuid (uuid),
-    KEY idx_task_event_task_id (task_id),
-    KEY idx_task_event_shard (shard)
+    KEY idx_task_event_task_id (task_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'append-only task event log';
 
-CREATE TABLE IF NOT EXISTS task_event_poll_offset (
-    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
-    shard      INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'shard index',
-    `offset`   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'last acknowledged task event offset',
+CREATE TABLE IF NOT EXISTS poll_offset (
+    name       VARCHAR(64)     NOT NULL COMMENT 'log name: command_entry, task, or task_event',
+    `offset`   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'last acknowledged row offset',
+    gap_since  DATETIME(6)     NULL DEFAULT NULL COMMENT 'when the current missing-id gap was first observed',
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_task_event_poll_offset_shard (shard)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'per-shard task event offset';
+    PRIMARY KEY (name)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'global append-only log offset and gap state';
+
+CREATE TABLE IF NOT EXISTS leader_election (
+    name       VARCHAR(128)    NOT NULL COMMENT 'coordinator role name',
+    leader_id  VARCHAR(128)    NOT NULL DEFAULT '' COMMENT 'current lease holder, empty when unheld',
+    expires_at DATETIME(6)     NOT NULL COMMENT 'lease expiry timestamp',
+    updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last acquisition or renewal timestamp',
+    PRIMARY KEY (name)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'named coordinator leader leases';
