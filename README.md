@@ -5,12 +5,14 @@ A run walks the nodes of a graph through a small status state machine, persistin
 every transition so the work can be driven forward, deferred, and resumed across
 processes.
 
-The workspace splits into five core modules plus the `server` binary, which
+The workspace splits into six core modules plus the `server` binary, which
 exposes them over HTTP:
 
 - **`dag`** — pure graph primitives. No I/O.
 - **`shardtable`** — a precomputed shard-to-member table driven by a pluggable
   `Membership` trait.
+- **`swim`** — a small SWIM-style membership implementation behind a transport
+  abstraction.
 - **`runtime`** — command driving and task read/write/consume, with a MySQL-backed
   store behind the default `mysql` feature.
 - **`scheduler`** — the task scheduler: consumes tasks and drives node status by
@@ -77,6 +79,19 @@ two.
   member, and returns the `ShardMigration`s between the old and new tables.
   Readers receive immutable `Arc<HashTable>` snapshots, so lookups can continue
   while a new table is being built and published.
+
+### `swim` — membership
+
+A compact SWIM state machine that implements `shardtable::Membership`.
+
+- `Swim` — tracks alive, suspect, and dead members; probes peers with ping/ack;
+  refutes suspicion with increasing incarnations; and publishes alive-member
+  snapshots through the shared `watch` subscription.
+- `Message` / `Outbound` — protocol messages and the addresses they should be
+  sent to. `Swim::tick` advances failure detection and `Swim::handle` processes
+  incoming messages.
+- `Transport` — a minimal async send abstraction. Callers can use UDP, an
+  in-memory bus, or another transport without coupling it to the state machine.
 
 ### `runtime` — execution runtime
 
@@ -353,6 +368,7 @@ DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow cargo test -p schedule
 crates/
   dag/         pure graph model (Graph/Id traits, DAG types)
   shardtable/  Membership + HashTable + Coordinator
+  swim/        SWIM membership + Transport abstraction
   runtime/     Command/Status/Task/RunConfig/NodeConfig traits + src/mysql/ backend
   scheduler/   TaskEvent/TaskRunner/TaskEventPoll/Store + Scheduler + AutoRunner/Dispatcher
   executor/    JobContext/Runnable/TaskState + script.rs Script
