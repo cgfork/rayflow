@@ -1,13 +1,15 @@
 //! Integration tests for contiguous task polling.
 //!
 //! Set `DATABASE_URL` to run these tests. Without it they skip.
-#![cfg(feature = "mysql")]
 
 use std::time::Duration;
 
+use event::Emit as TaskWrite;
+use event::Poll as TaskPoll;
+use event::poll::PollOffset as PollOffsetModel;
+use event::task::Task as TaskModel;
+use event::task::Task;
 use jiff::Timestamp;
-use runtime::mysql::model::{PollOffsetModel, TaskModel};
-use runtime::{Task, TaskPoll, TaskWrite};
 use toasty::Db;
 use uuid::Uuid;
 
@@ -15,7 +17,7 @@ async fn setup() -> Option<Db> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
     let mut builder = Db::builder();
-    builder.models(runtime::mysql::models());
+    builder.models(event::models());
     let db = builder
         .connect(&url)
         .await
@@ -47,7 +49,7 @@ async fn polls_and_acknowledges_contiguous_tasks() {
     };
 
     for node in [1, 2, 3] {
-        task(node).write(&mut db).await.expect("write task");
+        task(node).emit(&mut db).await.expect("write task");
     }
 
     let polled: Vec<Task> = Task::poll(&mut db, 16).await.expect("poll tasks").collect();
@@ -76,17 +78,17 @@ async fn skips_a_task_gap_only_after_the_timeout() {
         return;
     };
 
-    task(1).write(&mut db).await.expect("write first");
+    task(1).emit(&mut db).await.expect("write first");
     let gap = task(2);
-    gap.write(&mut db).await.expect("write gap row");
-    task(3).write(&mut db).await.expect("write after gap");
-    let gap_id = TaskModel::filter_by_uuid(gap.id)
+    gap.emit(&mut db).await.expect("write gap row");
+    task(3).emit(&mut db).await.expect("write after gap");
+    let gap_id = TaskModel::filter_by_id(gap.id)
         .first()
         .exec(&mut db)
         .await
         .expect("read gap row")
         .expect("gap row")
-        .id;
+        .task_offset;
     toasty::sql::statement("DELETE FROM task WHERE id = ?")
         .bind(gap_id)
         .exec(&mut db)

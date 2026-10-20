@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+event = { workspace = true }
 axum = { workspace = true }
 config = { workspace = true }
 runtime = { workspace = true }
-dag = { workspace = true }
+graph = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -121,3 +121,21 @@ pub trait Graph {
         self.outgoing_edges(node_id).count()
     }
 }
+
+/// Loads graphs by id.
+///
+/// `load` returns a `Send` future so a graph store can be awaited from an async
+/// context that must itself be `Send` (a request handler, say).
+pub trait GraphStore<I: Id> {
+    /// The graph type this store loads.
+    type G: Graph<GraphId = I>;
+    /// Error returned when loading a graph.
+    type Err: std::error::Error;
+
+    /// Loads the graph with the given id, at `version` when one is given.
+    fn load(
+        &self,
+        graph_id: I,
+        version: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<Self::G, Self::Err>> + Send;
+}

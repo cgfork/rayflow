@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{ErrorCode, JobContext, Runnable, TaskState};
-use runtime::TaskEvent;
+use event::task_event::TaskEvent;
 
 /// A script job: source run through an interpreter.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

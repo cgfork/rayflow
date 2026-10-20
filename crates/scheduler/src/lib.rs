@@ -16,8 +16,8 @@
 //! scheduler emits the command that drives each node to its next status as a
 //! [`CommandEntry`].
 //! Commands are appended to the store's command log (via
-//! [`CommandEmit`](runtime::CommandEmit)) rather than applied inline: consuming
-//! and applying them (via [`CommandPoll`](runtime::CommandPoll) +
+//! [`CommandEmit`](event::Emit)) rather than applied inline: consuming
+//! and applying them (via [`CommandPoll`](event::Poll) +
 //! [`CommandApply`](runtime::CommandApply)) is what drives node status. Because
 //! the terminal transitions are ordinary events, a node that is `Pending` can
 //! also be driven to a terminal status by feeding a [`TaskEvent`] back through
@@ -25,24 +25,36 @@
 //!
 //! The scheduler is backend-agnostic: it depends only on the [`Store`],
 //! [`TaskRunner`], and [`TaskEventPoll`] traits. A
-//! [`mysql`](runtime::mysql) [`Store`] implementation is provided behind the
-//! default `mysql` feature, along with the [`AutoRunner`] and [`Dispatcher`]
-//! components.
+//! MySQL implementations are provided for [`Store`] and [`Dispatcher`].
 
-use runtime::{Command, CommandEntry, Task, TaskEventPoll};
+use event::command::Command;
+use event::command::CommandEntry;
+use event::task::Task;
 use uuid::Uuid;
 
-#[cfg(feature = "mysql")]
-pub mod auto;
-#[cfg(feature = "mysql")]
 pub mod dispatcher;
 
-pub use runtime::{TaskEvent, TaskEventEntry};
+pub use event::task_event::TaskEvent;
+pub use event::task_event::TaskEventEntry;
 
-#[cfg(feature = "mysql")]
-pub use auto::AutoRunner;
-#[cfg(feature = "mysql")]
 pub use dispatcher::Dispatcher;
+
+pub mod scheduled;
+pub use scheduled::{ScheduledTask, ScheduledTaskRead, ScheduledTaskWrite};
+
+/// Polls and acknowledges the task events produced by runs.
+#[allow(async_fn_in_trait)]
+pub trait TaskEventPoll: Send + Sync {
+    /// Error returned when polling or acknowledging a task event.
+    type Err: std::error::Error + Send + Sync + 'static;
+
+    /// Returns up to `max` task events from the first unacknowledged contiguous
+    /// offset.
+    async fn poll(&self, max: usize) -> Result<Vec<TaskEventEntry>, Self::Err>;
+
+    /// Acknowledges `event`, so it is not polled again.
+    async fn ack(&self, event: &TaskEventEntry) -> Result<(), Self::Err>;
+}
 
 /// Executes scheduled tasks.
 #[allow(async_fn_in_trait)]
@@ -50,7 +62,8 @@ pub trait TaskRunner: Send + Sync {
     /// Error returned when running a task.
     type Err: std::error::Error + Send + Sync + 'static;
 
-    /// Runs `task`, executing the work.
+    /// Runs `task`, executing the work. Calls may be retried after a failure or
+    /// crash before acknowledgement; implementations must deduplicate by task ID.
     ///
     /// The event the run produces is recorded and later returned by
     /// [`TaskEventPoll::poll`], so running a task does not itself report the
@@ -209,12 +222,19 @@ where
     /// Consumes up to [`batch`](Self::batch) tasks, schedules and runs each, then
     /// polls the events the runs produced and drives each node by its event.
     ///
+    /// A task remains unacknowledged until its runner succeeds and the scheduling
+    /// transaction commits. Runner effects may survive a failed commit, so a
+    /// retry uses the same task ID and runners must handle repeated calls.
     /// Returns the number of tasks processed.
     pub async fn tick(&mut self) -> Result<usize, Error> {
         let tasks = self.store.poll_tasks(self.batch).await.map_err(store_err)?;
         for task in &tasks {
-            self.schedule(task).await?;
+            let entry = Self::entry(task, Command::Run { node: task.node_id });
+            let mut tx = self.store.transaction().await.map_err(store_err)?;
+            tx.emit(&entry).await.map_err(store_err)?;
             self.runner.run(task).await.map_err(runner_err)?;
+            tx.ack(task).await.map_err(store_err)?;
+            tx.commit().await.map_err(store_err)?;
         }
         self.drive_events().await?;
         Ok(tasks.len())
@@ -253,15 +273,13 @@ where
     }
 }
 
-#[cfg(feature = "mysql")]
 mod mysql {
     //! [`Store`] implementation backed by the MySQL task backend.
 
-    use dag::Graph;
-    use runtime::{
-        CommandEmit, CommandEntry, GraphStore, Task, TaskPoll,
-        mysql::{Backend, Error},
-    };
+    use event::{Emit as CommandEmit, Poll as TaskPoll, command::CommandEntry, task::Task};
+    use graph::Graph;
+    use graph::GraphStore;
+    use runtime::{Error, backend::Backend};
     use uuid::Uuid;
 
     use super::{Store, StoreTx};
@@ -308,7 +326,8 @@ mod mysql {
         }
 
         async fn ack(&mut self, task: &Task) -> Result<(), Self::Err> {
-            task.ack(&mut self.tx).await
+            task.ack(&mut self.tx).await?;
+            Ok(())
         }
 
         async fn commit(self) -> Result<(), Self::Err> {
@@ -342,43 +361,45 @@ mod tests {
             Self: 'a;
 
         async fn poll_tasks(&self, max: usize) -> Result<Vec<Task>, Self::Err> {
-            let mut pending = self.pending.borrow_mut();
-            let mut taken = Vec::new();
-            pending.retain(|task| {
-                if taken.len() < max {
-                    taken.push(task.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            Ok(taken)
+            Ok(self.pending.borrow().iter().take(max).cloned().collect())
         }
 
         async fn transaction(&mut self) -> Result<Self::Tx<'_>, Self::Err> {
-            Ok(MemTx { store: &*self })
+            Ok(MemTx {
+                store: &*self,
+                emitted: Vec::new(),
+                acked: Vec::new(),
+            })
         }
     }
 
     /// A [`StoreTx`] that records emitted commands and acked tasks in memory.
     struct MemTx<'a> {
         store: &'a MemStore,
+        emitted: Vec<CommandEntry>,
+        acked: Vec<Uuid>,
     }
 
     impl StoreTx for MemTx<'_> {
         type Err = Infallible;
 
         async fn emit(&mut self, entry: &CommandEntry) -> Result<(), Self::Err> {
-            self.store.emitted.borrow_mut().push(entry.clone());
+            self.emitted.push(entry.clone());
             Ok(())
         }
 
         async fn ack(&mut self, task: &Task) -> Result<(), Self::Err> {
-            self.store.acked.borrow_mut().push(task.id);
+            self.acked.push(task.id);
             Ok(())
         }
 
         async fn commit(self) -> Result<(), Self::Err> {
+            self.store
+                .pending
+                .borrow_mut()
+                .retain(|task| !self.acked.contains(&task.id));
+            self.store.emitted.borrow_mut().extend(self.emitted);
+            self.store.acked.borrow_mut().extend(self.acked);
             Ok(())
         }
     }
@@ -444,6 +465,65 @@ mod tests {
         }
     }
 
+    struct RetryRunner {
+        attempts: std::sync::atomic::AtomicUsize,
+        inner: FixedRunner,
+    }
+
+    impl TaskRunner for RetryRunner {
+        type Err = std::io::Error;
+
+        async fn run(&self, task: &Task) -> Result<(), Self::Err> {
+            if self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return Err(std::io::Error::other("temporary runner failure"));
+            }
+            self.inner.run(task).await.unwrap();
+            Ok(())
+        }
+    }
+
+    impl TaskEventPoll for RetryRunner {
+        type Err = Infallible;
+
+        async fn poll(&self, max: usize) -> Result<Vec<TaskEventEntry>, Self::Err> {
+            self.inner.poll(max).await
+        }
+
+        async fn ack(&self, event: &TaskEventEntry) -> Result<(), Self::Err> {
+            self.inner.ack(event).await
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_failure_leaves_task_available_for_retry() {
+        let mut scheduler = Scheduler::new(
+            MemStore::default(),
+            RetryRunner {
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+                inner: FixedRunner::new(TaskEvent::Succeed),
+            },
+            16,
+        );
+        let task = task(1);
+        scheduler
+            .store_mut()
+            .pending
+            .borrow_mut()
+            .push_back(task.clone());
+        assert!(scheduler.tick().await.is_err());
+        assert!(scheduler.store().acked.borrow().is_empty());
+        assert!(scheduler.store().emitted.borrow().is_empty());
+        assert_eq!(scheduler.store().pending.borrow().len(), 1);
+        assert_eq!(scheduler.tick().await.unwrap(), 1);
+        assert_eq!(&*scheduler.store().acked.borrow(), &[task.id]);
+        assert_eq!(scheduler.store().emitted.borrow().len(), 2);
+        assert_eq!(scheduler.tick().await.unwrap(), 0);
+    }
+
     #[test]
     fn events_map_to_commands() {
         let node = Uuid::from_u128(7);
@@ -477,8 +557,11 @@ mod tests {
         let store = scheduler.into_store();
         let emitted = store.emitted.borrow();
         assert_eq!(emitted.len(), 2);
-        assert_eq!(emitted[0].command, Command::Run { node: task.node_id });
-        assert_eq!(emitted[1].command, Command::Succeed { node: task.node_id });
+        assert_eq!(emitted[0].command.0, Command::Run { node: task.node_id });
+        assert_eq!(
+            emitted[1].command.0,
+            Command::Succeed { node: task.node_id }
+        );
         assert_eq!(&*store.acked.borrow(), &[task.id]);
     }
 
@@ -498,7 +581,10 @@ mod tests {
 
         let store = scheduler.into_store();
         let emitted = store.emitted.borrow();
-        let commands: Vec<_> = emitted.iter().map(|entry| entry.command.clone()).collect();
+        let commands: Vec<_> = emitted
+            .iter()
+            .map(|entry| entry.command.0.clone())
+            .collect();
         assert_eq!(
             commands,
             vec![

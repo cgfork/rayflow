@@ -1,6 +1,10 @@
 //! Task-event emission.
 
-use runtime::{Task, TaskEvent, TaskEventEntry, TaskEventWrite, TaskRead};
+use event::Emit as TaskEventWrite;
+use event::Read as TaskRead;
+use event::task::Task;
+use event::task_event::TaskEvent;
+use event::task_event::TaskEventEntry;
 use uuid::Uuid;
 
 use crate::app::{App, AppError};
@@ -20,19 +24,19 @@ impl<S> App<S> {
         let task = Task::read(&mut db, task_id)
             .await
             .map_err(|error| match error {
-                runtime::mysql::Error::TaskNotFound(task_id) => AppError::TaskNotFound(task_id),
-                error => AppError::Backend(error),
+                event::Error::TaskNotFound(task_id) => AppError::TaskNotFound(task_id),
+                error => AppError::from(error),
             })?;
         let entry = TaskEventEntry::new(&task, event);
-        entry.write(&mut db).await?;
+        entry.emit(&mut db).await?;
         Ok(entry)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use runtime::TaskWrite;
-    use runtime::mysql::model::TaskEventModel;
+    use event::Emit as TaskWrite;
+    use event::task_event::TaskEventEntry as TaskEventModel;
 
     use super::*;
     use crate::app::test::{TestGraphStore, setup};
@@ -61,7 +65,7 @@ mod tests {
             node_run_id: 7,
             created_at: jiff::Timestamp::now(),
         };
-        task.write(&mut db).await.expect("write task");
+        task.emit(&mut db).await.expect("write task");
 
         let app = App::new(db.clone(), config(), TestGraphStore::default());
         let entry = app
@@ -75,14 +79,14 @@ mod tests {
         assert_eq!(entry.node_id, task.node_id);
         assert_eq!(entry.node_run_id, task.node_run_id);
         assert_eq!(entry.event, TaskEvent::Pend);
-        let row = TaskEventModel::filter_by_uuid(entry.id)
+        let row = TaskEventModel::filter_by_id(entry.id)
             .first()
             .exec(&mut db)
             .await
             .expect("read task event")
             .expect("task event written");
-        assert!(row.id > 0);
-        assert_eq!(row.event, TaskEvent::Pend.to_string());
+        assert!(row.event_offset > 0);
+        assert_eq!(row.event, TaskEvent::Pend);
 
         let error = app
             .emit_task_event(Uuid::new_v4(), TaskEvent::Succeed)

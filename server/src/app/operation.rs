@@ -1,4 +1,6 @@
-use runtime::{Command, CommandEmit, CommandEntry};
+use event::Emit as CommandEmit;
+use event::command::Command;
+use event::command::CommandEntry;
 use uuid::Uuid;
 
 use crate::app::{AppError, RunApp};
@@ -78,7 +80,7 @@ impl<S> RunApp<S> {
 
 #[cfg(test)]
 mod tests {
-    use runtime::mysql::model::CommandEntryModel;
+    use event::command::CommandEntry as CommandEntryModel;
     use toasty::Db;
 
     use super::*;
@@ -116,11 +118,13 @@ mod tests {
             .await
             .expect("read command log")
             .into_iter()
-            .map(|row| row.into_command_entry().expect("decode command"))
             .collect();
         entries.sort_by_key(|entry| entry.command_offset);
 
-        let commands: Vec<Command> = entries.iter().map(|entry| entry.command.clone()).collect();
+        let commands: Vec<Command> = entries
+            .iter()
+            .map(|entry| entry.command.0.clone())
+            .collect();
         assert_eq!(
             commands,
             vec![
@@ -157,7 +161,7 @@ mod tests {
                 .await
                 .expect("read command log");
             if let Some(row) = rows.into_iter().next() {
-                break row.id;
+                break row.command_offset;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };

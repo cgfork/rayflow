@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 
-use dag::types::DAG;
-use runtime::GraphStore;
+use graph::GraphStore;
+use graph::types::DAG;
 use uuid::Uuid;
 
 /// Serves graphs from an in-memory registry keyed by graph id.

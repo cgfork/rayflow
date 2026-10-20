@@ -71,15 +71,6 @@ CREATE TABLE IF NOT EXISTS node_run (
     KEY idx_node_run_data_graph (data_id, graph_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node status within a dag execution run, one row per revision';
 
-CREATE TABLE IF NOT EXISTS transition_lock (
-    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
-    data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
-    graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
-    updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last lock acquisition timestamp',
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_transition_lock_run (data_id, graph_id)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'transaction-scoped locks serializing run transitions';
-
 CREATE TABLE IF NOT EXISTS scheduled_task (
     id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
     uuid           CHAR(36)        NOT NULL DEFAULT '' COMMENT 'scheduled task unique identifier',

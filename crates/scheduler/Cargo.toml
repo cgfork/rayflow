@@ -5,19 +5,19 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+coordinator = { workspace = true, features = ["mysql"] }
+event = { workspace = true }
 runtime = { path = "../runtime", default-features = false }
 uuid = { workspace = true }
 thiserror = { workspace = true }
-dag = { workspace = true, optional = true }
-jiff = { workspace = true, optional = true }
-toasty = { workspace = true, optional = true }
+graph = { workspace = true }
+jiff = { workspace = true }
+toasty = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 jiff = { workspace = true }
 serde_json = { workspace = true }
 toasty = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
-
-[features]
-default = ["mysql"]
-mysql = ["runtime/mysql", "dep:dag", "dep:jiff", "dep:toasty"]

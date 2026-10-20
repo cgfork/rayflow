@@ -5,18 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-dag = {workspace=true}
+event = { workspace = true }
+graph = {workspace=true}
 uuid = {workspace=true}
 jiff = {workspace=true}
 serde = {workspace=true}
 serde_json = { workspace = true }
-thiserror = { workspace = true, optional = true }
-toasty = { workspace = true, optional = true }
-coordinator = { workspace = true, optional = true }
-
-[features]
-default = ["mysql"]
-mysql = ["dep:thiserror", "dep:toasty", "dep:coordinator"]
+thiserror = { workspace = true }
+toasty = { workspace = true }
+coordinator = { workspace = true, features = ["mysql"] }
 
 [dev-dependencies]
 jiff = { workspace = true }

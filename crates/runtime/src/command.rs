@@ -1,16 +1,73 @@
 //! [`CommandApply`] implementation driving the node state of a run.
 
-use dag::Graph;
+use graph::Graph;
 use std::collections::BTreeSet;
 
 use jiff::Timestamp;
 use toasty::Executor;
 use uuid::Uuid;
 
-use super::lock::lock_transition;
-use super::model::{NodeRunModel, RunModel};
-use super::{Backend, Error};
-use crate::{Command, CommandApply, CommandEntry, GraphStore, Status, Task, TaskWrite};
+use crate::{CommandApply, backend::Status};
+use crate::{Error, backend::Backend};
+use event::{
+    Emit,
+    command::{Command, CommandEntry},
+    task::Task,
+};
+use graph::GraphStore;
+
+/// A run of a graph version for a `(data_id, graph_id)`.
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "run"]
+#[unique(data_id, graph_id, version)]
+pub struct Run {
+    #[key]
+    #[auto]
+    pub id: u64,
+    #[unique]
+    pub uuid: Uuid,
+    pub data_id: Uuid,
+    pub graph_id: Uuid,
+    pub version: u64,
+    pub revision: u64,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+/// A node's status within a run, one row per revision.
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "node_run"]
+#[unique(run_id, node_id, revision)]
+#[index(data_id, graph_id)]
+pub struct NodeRun {
+    #[key]
+    #[auto]
+    pub id: u64,
+    pub run_id: Uuid,
+    pub data_id: Uuid,
+    pub graph_id: Uuid,
+    pub node_id: Uuid,
+    pub revision: u64,
+    #[column(type = varchar(16))]
+    pub status: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[belongs_to(key = run_id, references = uuid)]
+    pub run: toasty::Deferred<Run>,
+}
+
+/// Registers command state and canonical event log models.
+pub fn models() -> toasty::ModelSet {
+    toasty::models!(
+        Run,
+        NodeRun,
+        event::command::CommandEntry,
+        event::task::Task,
+        event::task_event::TaskEventEntry,
+        event::poll::PollOffset,
+        coordinator::mysql::LeaderElectionModel
+    )
+}
 
 impl<S> CommandApply<Backend<S>> for CommandEntry
 where
@@ -26,57 +83,7 @@ where
         let mut db = backend.db.clone();
         let mut tx = db.transaction().await?;
 
-        // Serialize command application per run across consumers. The lock row is
-        // held until this transaction commits or rolls back.
-        lock_transition(&mut tx, self.data_id, self.graph_id).await?;
-
-        match &self.command {
-            Command::Start { nodes } => {
-                backend
-                    .start(&mut tx, self.data_id, self.graph_id, nodes.clone())
-                    .await?;
-            }
-            Command::Rerun { node } => {
-                backend
-                    .rerun(&mut tx, self.data_id, self.graph_id, *node)
-                    .await?;
-            }
-            Command::Dryrun { nodes } => {
-                backend
-                    .dryrun(&mut tx, self.data_id, self.graph_id, nodes.clone())
-                    .await?;
-            }
-            Command::Run { node } => {
-                backend
-                    .run(&mut tx, self.data_id, self.graph_id, *node)
-                    .await?;
-            }
-            Command::Pend { node } => {
-                backend
-                    .pend(&mut tx, self.data_id, self.graph_id, *node)
-                    .await?;
-            }
-            Command::Succeed { node } => {
-                backend
-                    .succeed(&mut tx, self.data_id, self.graph_id, *node)
-                    .await?;
-            }
-            Command::Fail { node } => {
-                backend
-                    .fail(&mut tx, self.data_id, self.graph_id, *node)
-                    .await?;
-            }
-            Command::Cancel { node } => {
-                backend
-                    .cancel(&mut tx, self.data_id, self.graph_id, *node)
-                    .await?;
-            }
-            Command::Terminate { node } => {
-                backend
-                    .terminate(&mut tx, self.data_id, self.graph_id, *node)
-                    .await?;
-            }
-        };
+        backend.apply_in(&mut tx, self).await?;
 
         tx.commit().await?;
         Ok(())
@@ -84,6 +91,60 @@ where
 }
 
 impl<S> Backend<S> {
+    /// Applies a command inside a caller-owned transaction. Commit its log
+    /// acknowledgement in the same transaction to make recovery atomic.
+    pub async fn apply_in(
+        &mut self,
+        tx: &mut toasty::Transaction<'_>,
+        entry: &CommandEntry,
+    ) -> Result<(), Error>
+    where
+        S: GraphStore<Uuid>,
+        <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
+        <S as GraphStore<Uuid>>::G: Graph<NodeId = Uuid>,
+    {
+        match &entry.command.0 {
+            Command::Start { nodes } => {
+                self.start(&mut *tx, entry.data_id, entry.graph_id, nodes.clone())
+                    .await?;
+            }
+            Command::Rerun { node } => {
+                self.rerun(&mut *tx, entry.data_id, entry.graph_id, *node)
+                    .await?;
+            }
+            Command::Dryrun { nodes } => {
+                self.dryrun(&mut *tx, entry.data_id, entry.graph_id, nodes.clone())
+                    .await?;
+            }
+            Command::Run { node } => {
+                self.run(&mut *tx, entry.data_id, entry.graph_id, *node)
+                    .await?;
+            }
+            Command::Pend { node } => {
+                self.pend(&mut *tx, entry.data_id, entry.graph_id, *node)
+                    .await?;
+            }
+            Command::Succeed { node } => {
+                self.succeed(&mut *tx, entry.data_id, entry.graph_id, *node)
+                    .await?;
+            }
+            Command::Fail { node } => {
+                self.fail(&mut *tx, entry.data_id, entry.graph_id, *node)
+                    .await?;
+            }
+            Command::Cancel { node } => {
+                self.cancel(&mut *tx, entry.data_id, entry.graph_id, *node)
+                    .await?;
+            }
+            Command::Terminate { node } => {
+                self.terminate(&mut *tx, entry.data_id, entry.graph_id, *node)
+                    .await?;
+            }
+        };
+
+        Ok(())
+    }
+
     /// Starts `nodes`, marking them `Ready`.
     ///
     /// The graph is loaded from the backend's graph store. When `nodes` is empty
@@ -127,17 +188,16 @@ impl<S> Backend<S> {
         }
 
         // A run may only be started once per graph version; rerun it to run it again.
-        let started =
-            RunModel::filter_by_data_id_and_graph_id_and_version(data_id, graph_id, version)
-                .first()
-                .exec(&mut *tx)
-                .await?;
+        let started = Run::filter_by_data_id_and_graph_id_and_version(data_id, graph_id, version)
+            .first()
+            .exec(&mut *tx)
+            .await?;
         if started.is_some() {
             return Err(Error::AlreadyStarted);
         }
 
         let now = Timestamp::now();
-        let run = RunModel::create()
+        let run = Run::create()
             .uuid(Uuid::new_v4())
             .data_id(data_id)
             .graph_id(graph_id)
@@ -150,7 +210,7 @@ impl<S> Backend<S> {
         let run_id = run.uuid;
 
         for node_id in &targets {
-            let node_run_id = NodeRunModel::create()
+            let node_run_id = NodeRun::create()
                 .run_id(run_id)
                 .data_id(data_id)
                 .graph_id(graph_id)
@@ -172,7 +232,7 @@ impl<S> Backend<S> {
                 node_run_id,
                 created_at: Timestamp::now(),
             };
-            task.write(&mut *tx).await?;
+            task.emit(&mut *tx).await?;
         }
 
         Ok(run_id)
@@ -199,8 +259,8 @@ impl<S> Backend<S> {
     where
         E: Executor,
     {
-        let run = RunModel::filter_by_data_id_and_graph_id(data_id, graph_id)
-            .order_by(RunModel::fields().version().desc())
+        let run = Run::filter_by_data_id_and_graph_id(data_id, graph_id)
+            .order_by(Run::fields().version().desc())
             .first()
             .exec(&mut *tx)
             .await?
@@ -209,12 +269,11 @@ impl<S> Backend<S> {
 
         // The node run must exist and be in a status that can be rerun; a node
         // that is still running or pending cannot be restarted.
-        let node_run =
-            NodeRunModel::filter_by_run_id_and_node_id_and_revision(run.uuid, node, revision)
-                .first()
-                .exec(&mut *tx)
-                .await?
-                .ok_or(Error::NodeRunNotFound(node))?;
+        let node_run = NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, revision)
+            .first()
+            .exec(&mut *tx)
+            .await?
+            .ok_or(Error::NodeRunNotFound(node))?;
 
         let allowed: Vec<String> = [
             Status::Ready,
@@ -238,15 +297,15 @@ impl<S> Backend<S> {
         // applies when no concurrent transaction has advanced it first.
         let revision = revision + 1;
         let now = Timestamp::now();
-        RunModel::filter_by_id(run.id)
-            .filter(RunModel::fields().revision().eq(revision - 1))
+        Run::filter_by_id(run.id)
+            .filter(Run::fields().revision().eq(revision - 1))
             .update()
             .revision(revision)
             .updated_at(now)
             .exec(&mut *tx)
             .await?;
 
-        let node_run_id = NodeRunModel::create()
+        let node_run_id = NodeRun::create()
             .run_id(run.uuid)
             .data_id(data_id)
             .graph_id(graph_id)
@@ -268,7 +327,7 @@ impl<S> Backend<S> {
             node_run_id,
             created_at: Timestamp::now(),
         };
-        task.write(&mut *tx).await?;
+        task.emit(&mut *tx).await?;
 
         Ok(run.uuid)
     }
@@ -301,8 +360,8 @@ impl<S> Backend<S> {
             .await
             .map_err(|error| Error::Graph(Box::new(error)))?;
 
-        let run = RunModel::filter_by_data_id_and_graph_id(data_id, graph_id)
-            .order_by(RunModel::fields().version().desc())
+        let run = Run::filter_by_data_id_and_graph_id(data_id, graph_id)
+            .order_by(Run::fields().version().desc())
             .first()
             .exec(&mut *tx)
             .await?
@@ -323,8 +382,8 @@ impl<S> Backend<S> {
 
         // Advance the run revision; the node runs are written at the new revision.
         let now = Timestamp::now();
-        RunModel::filter_by_id(run.id)
-            .filter(RunModel::fields().revision().eq(revision - 1))
+        Run::filter_by_id(run.id)
+            .filter(Run::fields().revision().eq(revision - 1))
             .update()
             .revision(revision)
             .updated_at(now)
@@ -340,7 +399,7 @@ impl<S> Backend<S> {
                 if targets.contains(&predecessor) || !mocked.insert(predecessor) {
                     continue;
                 }
-                NodeRunModel::create()
+                NodeRun::create()
                     .run_id(run.uuid)
                     .data_id(data_id)
                     .graph_id(graph_id)
@@ -356,7 +415,7 @@ impl<S> Backend<S> {
 
         // Mark each target `Ready` and enqueue a task so it can be driven forward.
         for node in &targets {
-            let node_run_id = NodeRunModel::create()
+            let node_run_id = NodeRun::create()
                 .run_id(run.uuid)
                 .data_id(data_id)
                 .graph_id(graph_id)
@@ -378,7 +437,7 @@ impl<S> Backend<S> {
                 node_run_id,
                 created_at: Timestamp::now(),
             };
-            task.write(&mut *tx).await?;
+            task.emit(&mut *tx).await?;
         }
 
         Ok(run.uuid)
@@ -397,19 +456,19 @@ impl<S> Backend<S> {
         node: Uuid,
         allowed: &[Status],
         next: Status,
-    ) -> Result<RunModel, Error>
+    ) -> Result<Run, Error>
     where
         E: Executor,
     {
-        let run = RunModel::filter_by_data_id_and_graph_id(data_id, graph_id)
-            .order_by(RunModel::fields().version().desc())
+        let run = Run::filter_by_data_id_and_graph_id(data_id, graph_id)
+            .order_by(Run::fields().version().desc())
             .first()
             .exec(&mut *tx)
             .await?
             .ok_or(Error::RunNotFound { data_id, graph_id })?;
 
         let node_run =
-            NodeRunModel::filter_by_run_id_and_node_id_and_revision(run.uuid, node, run.revision)
+            NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, run.revision)
                 .first()
                 .exec(&mut *tx)
                 .await?
@@ -427,9 +486,9 @@ impl<S> Backend<S> {
         // Guard the update on the node run's revision and status so a concurrent
         // change cannot be lost.
         let status = node_run.status.clone();
-        NodeRunModel::filter_by_id(node_run.id)
-            .filter(NodeRunModel::fields().revision().eq(run.revision))
-            .filter(NodeRunModel::fields().status().eq(status.clone()))
+        NodeRun::filter_by_id(node_run.id)
+            .filter(NodeRun::fields().revision().eq(run.revision))
+            .filter(NodeRun::fields().status().eq(status.clone()))
             .update()
             .status(next.to_string())
             .updated_at(Timestamp::now())
@@ -438,7 +497,7 @@ impl<S> Backend<S> {
 
         // The guarded update matches nothing when the node run changed under us;
         // re-read to detect it.
-        let current = NodeRunModel::filter_by_id(node_run.id)
+        let current = NodeRun::filter_by_id(node_run.id)
             .first()
             .exec(&mut *tx)
             .await?;
@@ -547,10 +606,10 @@ impl<S> Backend<S> {
             for predecessor in graph.incoming_edges(successor) {
                 // A node may have a node run per revision, so take the latest one
                 // at or before the current revision; that is its live status.
-                let status = NodeRunModel::filter_by_run_id(run.uuid)
-                    .filter(NodeRunModel::fields().node_id().eq(predecessor))
-                    .filter(NodeRunModel::fields().revision().le(run.revision))
-                    .order_by(NodeRunModel::fields().revision().desc())
+                let status = NodeRun::filter_by_run_id(run.uuid)
+                    .filter(NodeRun::fields().node_id().eq(predecessor))
+                    .filter(NodeRun::fields().revision().le(run.revision))
+                    .order_by(NodeRun::fields().revision().desc())
                     .first()
                     .exec(&mut *tx)
                     .await?
@@ -568,7 +627,7 @@ impl<S> Backend<S> {
             // mocked by a dry run that is itself a target, say), so update it in
             // place when it exists and insert it otherwise.
             let now = Timestamp::now();
-            let successor_run_id = match NodeRunModel::filter_by_run_id_and_node_id_and_revision(
+            let successor_run_id = match NodeRun::filter_by_run_id_and_node_id_and_revision(
                 run.uuid,
                 successor,
                 run.revision,
@@ -578,7 +637,7 @@ impl<S> Backend<S> {
             .await?
             {
                 Some(row) => {
-                    NodeRunModel::filter_by_id(row.id)
+                    NodeRun::filter_by_id(row.id)
                         .update()
                         .status(Status::Ready.to_string())
                         .updated_at(now)
@@ -587,7 +646,7 @@ impl<S> Backend<S> {
                     row.id
                 }
                 None => {
-                    NodeRunModel::create()
+                    NodeRun::create()
                         .run_id(run.uuid)
                         .data_id(data_id)
                         .graph_id(graph_id)
@@ -611,7 +670,7 @@ impl<S> Backend<S> {
                 node_run_id: successor_run_id,
                 created_at: Timestamp::now(),
             };
-            task.write(&mut *tx).await?;
+            task.emit(&mut *tx).await?;
         }
 
         Ok(run.revision)

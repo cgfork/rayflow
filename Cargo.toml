@@ -2,7 +2,8 @@
 members = [
     "server",
     "pilot",
-    "crates/dag",
+    "crates/graph",
+    "crates/event",
     "crates/runtime",
     "crates/scheduler",
     "crates/executor",
@@ -16,11 +17,12 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-dag = {path = "crates/dag"}
+event = {path = "crates/event"}
+graph = {path = "crates/graph"}
 runtime = {path = "crates/runtime"}
 scheduler = {path = "crates/scheduler"}
 executor = {path = "crates/executor"}
-coordinator = {path = "crates/coordinator"}
+coordinator = {path = "crates/coordinator", default-features = false}
 axum = "0.8"
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
 toasty = { version = "0.11", features = ["mysql", "serde", "jiff"] }

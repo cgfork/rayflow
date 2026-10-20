@@ -5,10 +5,15 @@
 use std::env;
 use std::time::Duration;
 
-use coordinator::LeaderElection;
+use coordinator::mysql::MySqlLeaderElection;
+use event::Emit as CommandEmit;
+use event::Poll as CommandPoll;
+use event::command::Command;
+use event::command::CommandEntry;
+use event::task::Task;
+use event::task_event::TaskEventEntry;
 use pilot::{Pilot, Step};
-use runtime::mysql::Backend;
-use runtime::{Command, CommandEmit, CommandEntry, CommandPoll, Task, TaskEventEntry, TaskPoll};
+use runtime::backend::Backend;
 use server::StaticGraphStore;
 use toasty::Db;
 use uuid::Uuid;
@@ -32,8 +37,9 @@ async fn only_the_leader_consumes_commands_tasks_and_events() {
     };
 
     let role = format!("pilot-test-{}", Uuid::new_v4());
-    let first = LeaderElection::new(db.clone(), role.clone(), "first", Duration::from_secs(30));
-    let second = LeaderElection::new(db.clone(), role, "second", Duration::from_secs(30));
+    let first =
+        MySqlLeaderElection::new(db.clone(), role.clone(), "first", Duration::from_secs(30));
+    let second = MySqlLeaderElection::new(db.clone(), role, "second", Duration::from_secs(30));
     let mut leader = Pilot::new(first, backend.clone(), 64, Duration::from_millis(10));
     let mut standby = Pilot::new(second, backend, 64, Duration::from_millis(10));
 

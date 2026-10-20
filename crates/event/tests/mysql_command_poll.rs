@@ -2,13 +2,15 @@
 //!
 //! Set `DATABASE_URL` to run these tests. Without it they skip, matching the
 //! other MySQL integration tests in the workspace.
-#![cfg(feature = "mysql")]
 
 use std::time::Duration;
 
+use event::Emit as CommandEmit;
+use event::Poll as CommandPoll;
+use event::command::Command;
+use event::command::CommandEntry;
+use event::poll::PollOffset as PollOffsetModel;
 use jiff::Timestamp;
-use runtime::mysql::model::PollOffsetModel;
-use runtime::{Command, CommandEmit, CommandEntry, CommandPoll};
 use toasty::Db;
 use uuid::Uuid;
 
@@ -16,7 +18,7 @@ async fn setup() -> Option<Db> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
     let mut builder = Db::builder();
-    builder.models(runtime::mysql::models());
+    builder.models(event::models());
     let db = builder
         .connect(&url)
         .await
@@ -66,13 +68,13 @@ async fn polls_and_acknowledges_contiguous_commands() {
         .collect();
     assert_eq!(polled.len(), 3);
     assert_eq!(
-        polled[0].command,
+        polled[0].command.0,
         Command::Run {
             node: Uuid::from_u128(1)
         }
     );
     assert_eq!(
-        polled[2].command,
+        polled[2].command.0,
         Command::Run {
             node: Uuid::from_u128(3)
         }
@@ -130,7 +132,7 @@ async fn waits_for_a_fresh_gap_then_skips_it_after_ten_seconds() {
         .collect();
     assert_eq!(after.len(), 1);
     assert_eq!(
-        after[0].command,
+        after[0].command.0,
         Command::Run {
             node: Uuid::from_u128(3)
         }

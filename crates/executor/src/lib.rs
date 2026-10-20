@@ -9,7 +9,7 @@
 
 pub mod script;
 
-use runtime::TaskEvent;
+use event::task_event::TaskEvent;
 use uuid::Uuid;
 
 pub struct JobContext {

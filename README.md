@@ -5,15 +5,15 @@ A run walks the nodes of a graph through a small status state machine, persistin
 every transition so the work can be driven forward, deferred, and resumed across
 processes.
 
-The workspace splits into five core modules plus the `server` and `pilot`
+The workspace splits into six core modules plus the `server` and `pilot`
 binaries:
 
-- **`dag`** — pure graph primitives. No I/O.
+- **`event`** — backend-independent `Event`, `Emit`, `Read`, and `Poll` contracts.
+- **`graph`** — pure graph primitives. No I/O.
 - **`coordinator`** — MySQL-backed leader election for the active consumer.
-- **`runtime`** — command driving and task read/write/consume, with a MySQL-backed
-  store behind the default `mysql` feature.
+- **`runtime`** — command application and execution state, with an always-available MySQL backend.
 - **`scheduler`** — the task scheduler: consumes tasks and drives node status by
-  task events, with the MySQL-backed `AutoRunner` and `Dispatcher`.
+  task events, with the MySQL-backed `Dispatcher`.
 - **`executor`** — job primitives for executing task work, including the built-in
   script job.
 - **`server`** — an HTTP API (axum) that serves the runtime.
@@ -22,7 +22,7 @@ binaries:
 
 ```text
                  +---------+      +----------------+
-   graph model   |   dag   |<-----|    runtime     |
+   graph model   |  graph  |<-----|    runtime     |
                  +---------+      |  Command/Status |
                                   |  Task read/write|
                                   +--------+--------+
@@ -45,7 +45,7 @@ binaries:
 
 ## Core Modules
 
-### `dag` — graph model
+### `graph` — graph model
 
 Pure, I/O-free graph primitives.
 
@@ -61,68 +61,45 @@ Pure, I/O-free graph primitives.
 
 ### `coordinator` — leader election
 
-`LeaderElection` grants one pilot at a time the right to consume the global
+`LeaderElection` abstracts lease ownership; `MySqlLeaderElection` grants one pilot at a time the right to consume the global
 logs. Each role has one row in `leader_election`; acquisition and renewal use a
 single atomic MySQL upsert, so standbys observe the lease holder rather than
 racing it.
 
-- `LeaderElection::new(db, name, node_id, lease)` creates a handle for a named
+- `coordinator::mysql::MySqlLeaderElection::new(db, name, node_id, lease)` creates a handle for a named
   coordinator role.
 - `try_acquire_or_renew` takes an expired lease or renews the current holder's
   lease and returns whether this node is the leader.
 - `is_leader` checks that this node still owns an unexpired lease, and `resign`
   releases it during shutdown.
+The MySQL implementation, models, and error type live in `coordinator::mysql`,
+behind the default-enabled `mysql` feature. Disable default features to use only
+the backend-independent election traits.
+
 - `LeaderElectionModel` is registered with the runtime models so the same
   `toasty::Db` can host both execution state and coordination state.
 
 ### `runtime` — execution runtime
 
-The execution state machine and the storage-facing traits.
+Runtime owns `CommandApply` and the execution backend. Command entries, tasks,
+and task events come from `event`; `GraphStore` comes from `graph`.
+Like `event`, runtime uses flat modules, a shared `Error` in `lib.rs`, and
+unconditional MySQL support.
 
-- `Status` — `Ready`, `Running`, `Pending`, `Succeeded`, `Failed`, `Terminated`.
-- `Command` / `CommandEntry` — the commands that drive a node and their
-  append-only event log. An entry carries `(data_id, graph_id, command)` plus its
-  log position (`command_offset`, `id`, `created_at`). `CommandApply`
-  applies an entry to a backend; `CommandEmit` appends one and `CommandPoll`
-  consumes the first unacknowledged contiguous run (`poll` + `ack`). They are
-  generic over any `toasty::Executor`, so they run against a `Db` or a
-  `Transaction`.
-- `transition_lock` — a transaction-scoped distributed lock keyed by
-  `(data_id, graph_id)`. `CommandApply` upserts the lock row before applying a
-  command, so concurrent consumers serialize command application for a run; the
-  InnoDB row lock is released on commit or rollback.
-- `Task` — a task waiting to be processed, with `TaskWrite` (produce),
-  `TaskRead` (read by id), and `TaskPoll` (consume the first unacknowledged
-  contiguous run with `poll` + `ack`).
-- `TaskEvent` / `TaskEventEntry` — the event a task run reports and its
-  append-only log. `TaskEventWrite` appends an event, and the MySQL
-  `TaskEventEntry` log operations `poll` and `ack` consume them. The
-  `TaskEventPoll` trait is the scheduler-facing contract for a component that
-  supplies and acknowledges those events, so event reporting survives a process
-  restart.
-- `ScheduledTask` — a task that has been dispatched to a runner, materializing
-  the task, its run, node run, and the node and run configurations in effect
-  plus a status. `ScheduledTaskWrite` records one and `ScheduledTaskRead` reads
-  it back by the task it dispatches.
-- `RunConfig` — a run's annotation map (`HashMap<String, String>`) at a given
-  revision, keyed by the owning run's `uuid`.
-- `NodeConfig` — a node's configuration payload at a given version, plus the
-  `annotation_match` expression that selects it.
-- `GraphStore` — loads a graph by id and optional version.
-- `src/mysql/` — the MySQL backend. `model.rs` defines the Toasty `Model`s for
-  the schema (one per table) and `models()` registers them on the `Db`;
-  `Backend::connect` builds a `Db` with those models. `command.rs` drives node
-  state, `task.rs`/`entry.rs`/`event.rs`/`scheduled.rs` persist and poll tasks,
-  commands, events, and scheduled tasks through the generated query builders.
-  `poll.rs` stores one global offset per log in `poll_offset`. A poll selects
-  rows after that offset, stops at the first missing auto-increment id, and
-  persists when that gap was first observed. A gap is skipped only after it has
-  remained missing for 10 seconds; the persisted offset then advances to just
-  before the first returned row, so a crash cannot lose that row.
-  `runtime.sql` mirrors the models as a standalone schema for deployments
-  (`task`, `run` (+ `uuid`), `run_config`, `node_config`, `node_run`,
-  `transition_lock`, `scheduled_task`, `command_entry`, `task_event`,
-  `poll_offset`, `leader_election`).
+- `CommandApply` applies an `event::command::CommandEntry` to a backend.
+- `backend::Status` describes execution state. `command::{Run, NodeRun}` own
+  command state models; scheduler owns run and node configuration models.
+- `backend::Backend::apply_in` applies a command in a caller-owned transaction so
+  its effects can commit with the event-log acknowledgement.
+- Command consumers must serialize application, as the pilot does through its
+  leader lease. Transitions append new tasks through `event::Emit`.
+- `runtime::models()` registers backend state, the canonical `event` models, and
+  leader election. Dispatch and configuration storage are owned by `scheduler`; applications using
+  `Dispatcher` should register `scheduler::scheduled::models()` instead.
+
+`event::poll` owns the shared contiguous offsets and persisted 10-second gap
+timeout. `runtime.sql` remains the deployment schema for all crates; this
+ownership split does not change its table layouts.
 
 `Command` variants and the transition each applies:
 
@@ -146,7 +123,7 @@ depends only on three traits:
 - `Store` — `poll_tasks` (consume the first unacknowledged contiguous tasks) and
   `transaction`, which opens a `StoreTx` the scheduler drives commands and task
   acks through. Atomicity lives in the store: the MySQL
-  `runtime::mysql::Backend` opens a real SQL transaction, so a command append and
+  `runtime::backend::Backend` opens a real SQL transaction, so a command append and
   its task ack commit together.
 - `TaskRunner` — runs a scheduled task (`run`, which only executes the work).
 - `TaskEventPoll` — supplies the events task runs produced (`poll`) and
@@ -155,26 +132,26 @@ depends only on three traits:
   returns it, and `ack` consumes it.
 
 - `TaskEvent` — `Pend`, `Succeed`, `Fail`, `Terminate`, `Cancel`; each maps to the
-  matching `Command` via `TaskEvent::command(node)`. Defined in `runtime` and
+  matching `Command` via `TaskEvent::command(node)`. Defined in `event::task_event` and
   re-exported here.
 - `TaskEventEntry` — the recorded event (its `task_id`/`node_id` plus the
   `TaskEvent`), so a polled event can be routed back to its node; built from a
-  task with `TaskEventEntry::new`. Also defined in `runtime` and re-exported.
+  task with `TaskEventEntry::new`. Also defined in `event::task_event` and re-exported.
 - `Scheduler` — `schedule` (consume a task and emit `Run`, i.e. `Ready -> Running`,
   then `ack`), `drive` (emit a `TaskEvent`), `drive_events` (poll task events and
   drive each), `tick` (one batch: poll tasks, schedule and run each, then poll
   events and drive them), and `drain` (loop until a tick consumes nothing).
-- `AutoRunner` (in `src/auto.rs`, behind `mysql`) — implements `TaskRunner` and
-  `TaskEventPoll`; `run` records a successful event for the task, `poll` reads
-  the unconsumed events back, and `ack` advances the global event offset once the
-  scheduler has driven them.
-- `Dispatcher` (in `src/dispatcher.rs`, behind `mysql`) — wraps another
+- `Dispatcher` (in `src/dispatcher.rs`) — wraps another
   `TaskRunner` and adds dispatch tracking. On `run`, it first records a
   `ScheduledTask` referencing the task, its run, node run, and the node and run
   configurations in effect (the node's latest version and the run's latest
   revision at or before the run's revision), then forwards the task. As a
   `TaskEventPoll`, `poll` is forwarded unchanged and `ack` settles the record's
   status to the acknowledged event's status before forwarding.
+
+`ScheduledTask`, its MySQL model, and the read/write implementations live in
+`scheduler::scheduled` and are re-exported at the crate root.
+`TaskEventPoll` is the scheduler-owned contract for a runner's event stream.
 
 The scheduler is a command **producer**: it appends commands to the command log
 (`CommandEmit`) rather than applying them. Each step runs on a `Store::transaction`:
@@ -346,8 +323,8 @@ mysql < runtime.sql
 
 The models are the source of truth; `runtime.sql` mirrors them for direct
 provisioning. The backend queries through Toasty models, so the models must be
-registered on the `Db`: use `runtime::mysql::Backend::connect` (which does it for
-you), or chain `.models(runtime::mysql::models())` onto `Db::builder()` when you
+registered on the `Db`: use `runtime::backend::Backend::connect` (which does it for
+you), or chain `.models(runtime::models())` onto `Db::builder()` when you
 build the `Db` yourself.
 
 Integration tests that drive the MySQL backend are skipped unless `DATABASE_URL`
@@ -363,12 +340,52 @@ DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow cargo test -p schedule
 
 ```text
 crates/
-  dag/         pure graph model (Graph/Id traits, DAG types)
+  graph/       pure graph model (Graph/Id traits, DAG types)
   coordinator/ MySQL-backed LeaderElection
-  runtime/     Command/Status/Task/RunConfig/NodeConfig traits + src/mysql/ backend
-  scheduler/   TaskEvent/TaskRunner/TaskEventPoll/Store + Scheduler + AutoRunner/Dispatcher
+  event/       Command/Task/TaskEvent logs, polling, and Reactive consumer
+  runtime/     CommandApply + execution backend and state
+  scheduler/   TaskRunner/TaskEventPoll/Store + ScheduledTask + Scheduler/Dispatcher
   executor/    JobContext/Runnable/TaskState + script.rs Script
 server/        axum HTTP API binary (router + RAYFLOW_ADDR bind)
 pilot/         leader-elected command/task/task-event consumer binary
-runtime.sql    MySQL schema (task, run, run_config, node_config, node_run, transition_lock, scheduled_task, task_event, command_entry, poll offsets)
+runtime.sql    MySQL schema (task, run, run_config, node_config, node_run, scheduled_task, task_event, command_entry, poll offsets)
 ```
+
+### Shared event log API
+
+`Event` exposes `offset() -> u64` and
+`id() -> Uuid` for each record. `Emit<B>` appends a record and
+returns its offset, `Read<I, B>` reads by identity, and `Poll<B>` returns pending
+records and acknowledges them in order. Acknowledgements update consumer state;
+they never modify or delete log entries. Pass a transaction as `B` when effects
+and acknowledgements must commit together.
+
+The `event` crate implements these traits directly for `CommandEntry`, `Task`,
+and `TaskEventEntry`. Runtime, scheduler, server, pilot, and executor import
+these canonical types rather than defining separate event-log models.
+
+The standalone `event::command` module is always available.
+It owns `Command`, `CommandEntry`, and Toasty models; it does not
+depend on `runtime`. Register `event::command::models()` and import the shared
+`Emit`, `Read`, and `Poll` traits. Its tables match `command_entry` and
+`poll_offset` in `runtime.sql`, including contiguous polling and the persisted
+10-second gap timeout. Use one serialized consumer for the global command cursor.
+
+`event::task::Task` implements the same emit/read/poll/ack contracts for the
+`task` table, with no runtime dependency. Use `event::task::models()` for tasks
+alone or `event::models()` to register commands, tasks, task events, and the
+shared offset table together. The three logs maintain independent consumer cursors.
+
+`event::task_event` provides `TaskEvent` and `TaskEventEntry` with the same
+emit/read/poll/ack contracts. Each event has its own UUID, and multiple events
+can reference one task. Event names retain their existing `VARCHAR(16)` storage.
+Register `event::task_event::models()` alone or `event::models()` for all logs.
+
+`event::Reactive<B>` extends `Poll<B>` with `handle(&self, &mut B)`
+and a continuous `run(backend, batch, poll_interval, shutdown)` loop. It handles
+records in order, acknowledges only successful handlers, and waits between
+partial batches. Errors return to the caller with the failed record unacknowledged.
+Shutdown waits for an in-flight handler and acknowledgement to finish. Handlers
+must tolerate replay, and callers must ensure exclusive ownership of the cursor.
+
+All standalone logs and polling state use the shared `event::Error` type.

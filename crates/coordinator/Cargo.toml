@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["mysql"]
+mysql = ["dep:jiff", "dep:thiserror", "dep:toasty"]
+
 [dependencies]
-jiff = { workspace = true }
-thiserror = { workspace = true }
-toasty = { workspace = true }
+jiff = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+toasty = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 uuid = { workspace = true }

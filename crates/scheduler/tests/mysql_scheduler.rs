@@ -13,19 +13,23 @@
 //! database and pushes the schema from the Toasty models itself. Without
 //! `DATABASE_URL` the test is skipped, so it is safe to run in environments
 //! without a database.
-#![cfg(feature = "mysql")]
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Mutex;
 
-use dag::types::{DAG, Node};
-use runtime::mysql::Backend;
-use runtime::mysql::model::{NodeRunModel, RunModel};
-use runtime::{
-    Command, CommandApply, CommandEmit, CommandEntry, CommandPoll, GraphStore, Status, Task,
-    TaskEventPoll,
-};
+use event::Emit as CommandEmit;
+use event::Poll as CommandPoll;
+use event::command::Command;
+use event::command::CommandEntry;
+use event::task::Task;
+use graph::GraphStore;
+use graph::types::{DAG, Node};
+use runtime::CommandApply;
+use runtime::backend::Backend;
+use runtime::backend::Status;
+use runtime::command::{NodeRun, Run};
+use scheduler::TaskEventPoll;
 use scheduler::{Scheduler, TaskEvent, TaskEventEntry, TaskRunner};
 use toasty::Db;
 use uuid::Uuid;
@@ -123,7 +127,7 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
     let mut builder = Db::builder();
-    builder.models(runtime::mysql::models());
+    builder.models(runtime::models());
     let db = builder
         .connect(&url)
         .await
@@ -194,8 +198,8 @@ async fn run_to_quiescence(
 }
 
 /// Returns the latest node run per `(run_id, node_id)`.
-fn latest_node_runs(rows: &[NodeRunModel]) -> Vec<&NodeRunModel> {
-    let mut latest: HashMap<(Uuid, Uuid), &NodeRunModel> = HashMap::new();
+fn latest_node_runs(rows: &[NodeRun]) -> Vec<&NodeRun> {
+    let mut latest: HashMap<(Uuid, Uuid), &NodeRun> = HashMap::new();
     for row in rows {
         match latest.get(&(row.run_id, row.node_id)) {
             Some(current) if current.revision >= row.revision => {}
@@ -209,10 +213,7 @@ fn latest_node_runs(rows: &[NodeRunModel]) -> Vec<&NodeRunModel> {
 
 /// Counts the current node runs (the latest revision per node) with `status`.
 async fn count_status(db: &mut Db, status: Status) -> i64 {
-    let rows = NodeRunModel::all()
-        .exec(&mut *db)
-        .await
-        .expect("load node runs");
+    let rows = NodeRun::all().exec(&mut *db).await.expect("load node runs");
     let expected = status.to_string();
     latest_node_runs(&rows)
         .into_iter()
@@ -229,7 +230,7 @@ async fn status_counts(db: &mut Db) -> (i64, i64) {
 
 /// Reads the current revision of the run for `(data_id, graph_id)`.
 async fn run_revision(db: &mut Db, data_id: Uuid, graph_id: Uuid) -> u64 {
-    RunModel::filter_by_data_id_and_graph_id(data_id, graph_id)
+    Run::filter_by_data_id_and_graph_id(data_id, graph_id)
         .first()
         .exec(&mut *db)
         .await
@@ -240,9 +241,9 @@ async fn run_revision(db: &mut Db, data_id: Uuid, graph_id: Uuid) -> u64 {
 
 /// Reads the `(revision, status)` of `node`'s current node run.
 async fn node_run(db: &mut Db, node: Uuid) -> (u64, String) {
-    let row = NodeRunModel::all()
-        .filter(NodeRunModel::fields().node_id().eq(node))
-        .order_by(NodeRunModel::fields().revision().desc())
+    let row = NodeRun::all()
+        .filter(NodeRun::fields().node_id().eq(node))
+        .order_by(NodeRun::fields().revision().desc())
         .first()
         .exec(&mut *db)
         .await
@@ -253,9 +254,9 @@ async fn node_run(db: &mut Db, node: Uuid) -> (u64, String) {
 
 /// Reads the status of `node`'s node run at `revision`, if any.
 async fn node_run_at(db: &mut Db, node: Uuid, revision: u64) -> Option<String> {
-    NodeRunModel::all()
-        .filter(NodeRunModel::fields().node_id().eq(node))
-        .filter(NodeRunModel::fields().revision().eq(revision))
+    NodeRun::all()
+        .filter(NodeRun::fields().node_id().eq(node))
+        .filter(NodeRun::fields().revision().eq(revision))
         .first()
         .exec(&mut *db)
         .await
@@ -265,7 +266,7 @@ async fn node_run_at(db: &mut Db, node: Uuid, revision: u64) -> Option<String> {
 
 /// Counts every node run row, including superseded revisions.
 async fn node_run_rows(db: &mut Db) -> i64 {
-    NodeRunModel::all()
+    NodeRun::all()
         .exec(&mut *db)
         .await
         .expect("load node runs")

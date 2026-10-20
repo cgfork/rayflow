@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 
-use dag::Graph;
-use dag::types::{DAG, Input, Node, Output};
+use graph::Graph;
+use graph::GraphStore;
+use graph::types::{DAG, Input, Node, Output};
 use jiff::Timestamp;
-use runtime::GraphStore;
-use runtime::mysql::model::{NodeRunModel, RunModel};
+use runtime::command::{NodeRun, Run};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -45,7 +45,7 @@ pub struct NodeState {
 
 impl NodeState {
     /// Combines a node run row with the graph's node.
-    fn join(node_run: NodeRunModel, node: Node) -> Self {
+    fn join(node_run: NodeRun, node: Node) -> Self {
         Self {
             data_id: node_run.data_id,
             graph_id: node_run.graph_id,
@@ -95,10 +95,10 @@ where
         let mut db = self.db.clone();
         // A node may have a node run per revision; its live state is the row
         // with the greatest revision at or before the run's current revision.
-        let node_run = NodeRunModel::filter_by_run_id(run.uuid)
-            .filter(NodeRunModel::fields().node_id().eq(node_id))
-            .filter(NodeRunModel::fields().revision().le(run.revision))
-            .order_by(NodeRunModel::fields().revision().desc())
+        let node_run = NodeRun::filter_by_run_id(run.uuid)
+            .filter(NodeRun::fields().node_id().eq(node_id))
+            .filter(NodeRun::fields().revision().le(run.revision))
+            .order_by(NodeRun::fields().revision().desc())
             .first()
             .exec(&mut db)
             .await?
@@ -119,14 +119,14 @@ where
         // an await (it keeps this future `Send`, so it can be used as a handler).
         let graph = self.graph(run.version).await?;
         let mut db = self.db.clone();
-        let rows = NodeRunModel::filter_by_run_id(run.uuid)
-            .filter(NodeRunModel::fields().revision().le(run.revision))
+        let rows = NodeRun::filter_by_run_id(run.uuid)
+            .filter(NodeRun::fields().revision().le(run.revision))
             .exec(&mut db)
             .await?;
 
         // A node may have a node run per revision; its live state is the row
         // with the greatest revision at or before the run's current revision.
-        let mut live: HashMap<Uuid, NodeRunModel> = HashMap::new();
+        let mut live: HashMap<Uuid, NodeRun> = HashMap::new();
         for row in rows {
             let replace = live
                 .get(&row.node_id)
@@ -157,10 +157,10 @@ where
     }
 
     /// Loads this run, or fails with [`AppError::RunNotFound`].
-    async fn run(&self) -> Result<RunModel, AppError> {
+    async fn run(&self) -> Result<Run, AppError> {
         let mut db = self.db.clone();
-        RunModel::filter_by_data_id_and_graph_id(self.data_id, self.graph_id)
-            .order_by(RunModel::fields().version().desc())
+        Run::filter_by_data_id_and_graph_id(self.data_id, self.graph_id)
+            .order_by(Run::fields().version().desc())
             .first()
             .exec(&mut db)
             .await?
@@ -181,7 +181,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use runtime::Status;
+    use runtime::backend::Status;
     use uuid::Uuid;
 
     use super::*;
@@ -219,7 +219,7 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let run = RunModel::create()
+        let run = Run::create()
             .uuid(Uuid::new_v4())
             .data_id(data_id)
             .graph_id(graph_id)
@@ -231,7 +231,7 @@ mod tests {
             .await
             .expect("create run");
 
-        NodeRunModel::create()
+        NodeRun::create()
             .run_id(run.uuid)
             .data_id(data_id)
             .graph_id(graph_id)
@@ -290,7 +290,7 @@ mod tests {
             edges: vec![(first, second)],
         };
 
-        let run = RunModel::create()
+        let run = Run::create()
             .uuid(Uuid::new_v4())
             .data_id(data_id)
             .graph_id(graph_id)
@@ -309,7 +309,7 @@ mod tests {
             (second, 1, Status::Ready),
             (first, 2, Status::Failed),
         ] {
-            NodeRunModel::create()
+            NodeRun::create()
                 .run_id(run.uuid)
                 .data_id(data_id)
                 .graph_id(graph_id)
