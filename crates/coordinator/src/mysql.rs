@@ -102,6 +102,8 @@ impl MySqlLeaderElection {
     /// expires during the work, a successor cannot acquire it before commit.
     pub async fn acquire_in(&self, tx: &mut toasty::Transaction<'_>) -> Result<bool, Error> {
         let micros = i64::try_from(self.lease.as_micros()).unwrap_or(i64::MAX);
+        // Toasty's targeted upsert is unavailable on MySQL. Lease takeover and
+        // renewal must remain atomic and use the database clock.
         toasty::sql::statement(
             "INSERT INTO leader_election (name, leader_id, expires_at, updated_at) \
              VALUES (?, ?, TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)), CURRENT_TIMESTAMP(6)) \
@@ -135,16 +137,18 @@ impl MySqlLeaderElection {
     /// Releases the lease when held by this node.
     pub async fn resign(&self) -> Result<(), Error> {
         let now = Timestamp::now();
-        toasty::sql::statement(
-            "UPDATE leader_election SET leader_id = '', expires_at = ?, updated_at = ? \
-             WHERE name = ? AND leader_id = ?",
-        )
-        .bind(now)
-        .bind(now)
-        .bind(self.name.clone())
-        .bind(self.node_id.clone())
-        .exec(&mut self.db.clone())
-        .await?;
+        LeaderElectionModel::filter_by_name(self.name.clone())
+            .filter(
+                LeaderElectionModel::fields()
+                    .leader_id()
+                    .eq(self.node_id.clone()),
+            )
+            .update()
+            .leader_id("")
+            .expires_at(now)
+            .updated_at(now)
+            .exec(&mut self.db.clone())
+            .await?;
         Ok(())
     }
 }

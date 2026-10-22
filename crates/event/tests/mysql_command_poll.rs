@@ -103,8 +103,8 @@ async fn waits_for_a_fresh_gap_then_skips_it_after_ten_seconds() {
     let first = entry(1).emit(&mut db).await.expect("emit first");
     let missing = entry(2).emit(&mut db).await.expect("emit gap row");
     entry(3).emit(&mut db).await.expect("emit after gap");
-    toasty::sql::statement("DELETE FROM command_entry WHERE id = ?")
-        .bind(missing)
+    CommandEntry::filter_by_command_offset(missing)
+        .delete()
         .exec(&mut db)
         .await
         .expect("delete gap row");

@@ -95,16 +95,14 @@ where
     }
 }
 
-impl<B> Poll<B> for Task
-where
-    B: Executor,
-{
-    type Err = Error;
-
-    async fn poll(
+impl Task {
+    /// Polls using a caller-selected gap timeout. Use the same configuration for
+    /// acknowledgement and serialize access to the shared log cursor.
+    pub async fn poll_with_config<B: Executor>(
         backend: &mut B,
         maximum: usize,
-    ) -> Result<impl Iterator<Item = Self>, Self::Err> {
+        config: poll::Config,
+    ) -> Result<impl Iterator<Item = Self>, Error> {
         let state = poll::load(&mut *backend, LOG).await?;
         let fields = Task::fields();
         let rows = Task::all()
@@ -114,7 +112,7 @@ where
             .exec(&mut *backend)
             .await?;
 
-        let plan = poll::plan(rows, state, Timestamp::now(), |row| row.task_offset);
+        let plan = poll::plan(rows, state, Timestamp::now(), |row| row.task_offset, config);
         if plan.changed {
             poll::save(&mut *backend, LOG, plan.state).await?;
         }
@@ -122,9 +120,29 @@ where
         Ok(plan.rows.into_iter())
     }
 
-    async fn ack(&self, backend: &mut B) -> Result<(), Self::Err> {
-        poll::ack(&mut *backend, LOG, self.task_offset).await?;
+    /// Acknowledges using the same gap timeout as `poll_with_config`.
+    pub async fn ack_with_config<B: Executor>(
+        &self,
+        backend: &mut B,
+        config: poll::Config,
+    ) -> Result<(), Error> {
+        poll::ack(&mut *backend, LOG, self.task_offset, config).await?;
         Ok(())
+    }
+}
+
+impl<B: Executor> Poll<B> for Task {
+    type Err = Error;
+
+    async fn poll(
+        backend: &mut B,
+        maximum: usize,
+    ) -> Result<impl Iterator<Item = Self>, Self::Err> {
+        Self::poll_with_config(backend, maximum, poll::Config::default()).await
+    }
+
+    async fn ack(&self, backend: &mut B) -> Result<(), Self::Err> {
+        self.ack_with_config(backend, poll::Config::default()).await
     }
 }
 

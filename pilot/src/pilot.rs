@@ -4,15 +4,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use coordinator::TransactionalLeaderElection;
-use event::Emit as CommandEmit;
-use event::Poll as CommandPoll;
-use event::command::Command;
-use event::command::CommandEntry;
-use event::task::Task;
-use event::task_event::TaskEvent;
-use event::task_event::TaskEventEntry;
 use runtime::{Error as BackendError, backend::Backend};
-use scheduler::Error as SchedulerError;
+use scheduler::{Actuator, AgentScheduler, Scheduler};
 use server::StaticGraphStore;
 use toasty::Db;
 use tokio::time::{MissedTickBehavior, interval};
@@ -23,44 +16,33 @@ pub enum Error {
     /// The MySQL backend returned an error.
     #[error(transparent)]
     Backend(#[from] BackendError),
-    /// The scheduler returned an error.
+    /// Graph actuation failed.
     #[error(transparent)]
-    Scheduler(#[from] SchedulerError),
+    Actuator(#[from] scheduler::Error),
+    /// The scheduling implementation failed.
+    #[error("scheduling: {0}")]
+    Scheduler(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Leader election returned an error.
     #[error("leader election: {0}")]
     Leader(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
-impl From<event::Error> for Error {
-    fn from(error: event::Error) -> Self {
-        Self::Backend(error.into())
-    }
-}
-
-/// Work consumed by one pilot pass.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Step {
-    /// Command entries applied and acknowledged.
-    pub commands: usize,
-    /// Tasks scheduled and run; task events are consumed by the same pass.
-    pub tasks: usize,
-}
+pub use scheduler::Step;
 
 /// Consumes commands, tasks, and task events while this pilot holds the leader
 /// lease.
-pub struct Pilot<E = coordinator::mysql::MySqlLeaderElection> {
+pub struct Pilot<E = coordinator::mysql::MySqlLeaderElection, S = AgentScheduler> {
     election: E,
-    backend: Backend<StaticGraphStore>,
+    actuator: Actuator<StaticGraphStore>,
     db: Db,
     batch: usize,
     poll_interval: Duration,
+    scheduler: S,
 }
 
-impl<E> Pilot<E>
-where
-    E: for<'tx> TransactionalLeaderElection<toasty::Transaction<'tx>>,
-{
+impl<E> Pilot<E, AgentScheduler> {
     /// Creates a pilot from a leader election and MySQL backend.
+    /// Register `scheduler::models()` and any models required by a custom scheduler.
     pub fn new(
         election: E,
         backend: Backend<StaticGraphStore>,
@@ -73,10 +55,37 @@ where
         let db = backend.db().clone();
         Self {
             election,
-            backend,
+            actuator: Actuator::new(backend, batch),
             db,
             batch,
             poll_interval,
+            scheduler: AgentScheduler::new(),
+        }
+    }
+
+    /// Sets how long an agent claim can go without a poll. Match the API server.
+    pub fn with_job_lease(mut self, lease: Duration) -> Self {
+        self.scheduler = self.scheduler.with_lease(lease);
+        self
+    }
+}
+
+impl<E, S> Pilot<E, S> {
+    /// Sets the missing-offset timeout for command, task, and task-event logs.
+    pub fn with_gap_timeout(mut self, gap_timeout: Duration) -> Self {
+        self.actuator = self.actuator.with_gap_timeout(gap_timeout);
+        self
+    }
+
+    /// Uses another scheduling implementation, such as an external job scheduler.
+    pub fn with_scheduler<T>(self, scheduler: T) -> Pilot<E, T> {
+        Pilot {
+            election: self.election,
+            actuator: self.actuator,
+            db: self.db,
+            batch: self.batch,
+            poll_interval: self.poll_interval,
+            scheduler,
         }
     }
 
@@ -84,7 +93,13 @@ where
     pub fn election(&self) -> &E {
         &self.election
     }
+}
 
+impl<E, S> Pilot<E, S>
+where
+    E: for<'tx> TransactionalLeaderElection<toasty::Transaction<'tx>>,
+    S: for<'tx> Scheduler<toasty::Transaction<'tx>>,
+{
     /// Returns whether this pilot currently holds the leader lease.
     pub async fn is_leader(&self) -> Result<bool, Error> {
         self.election
@@ -93,22 +108,13 @@ where
             .map_err(|e| Error::Leader(Box::new(e)))
     }
 
-    async fn consume_commands(&mut self, tx: &mut toasty::Transaction<'_>) -> Result<usize, Error> {
-        let entries: Vec<CommandEntry> = CommandEntry::poll(&mut *tx, self.batch).await?.collect();
-        let count = entries.len();
-        for entry in entries {
-            self.backend.apply_in(tx, &entry).await?;
-            entry.ack(&mut *tx).await?;
-        }
-        Ok(count)
-    }
-
-    /// Runs one consumer pass: renew the lease, apply commands, and run tasks.
+    /// Runs one pass: renew the lease, apply commands, create jobs, and reclaim expired claims.
     ///
     /// A standby returns [`Step::default`] without touching the logs. The lease
-    /// row is locked for the entire database-only pass, so takeover waits even
-    /// if the lease expires. Effects and all log acknowledgements commit together;
-    /// a failed or interrupted pass rolls them all back.
+    /// row is locked for the entire pass, so takeover waits even
+    /// if the lease expires. Database effects and all log acknowledgements commit
+    /// together. External scheduler submissions must follow the durability and
+    /// retry requirements in [`Scheduler`].
     pub async fn step(&mut self) -> Result<Step, Error> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await.map_err(BackendError::from)?;
@@ -122,38 +128,13 @@ where
             return Ok(Step::default());
         }
 
-        let mut commands = self.consume_commands(&mut tx).await?;
-        let tasks: Vec<Task> = Task::poll(&mut tx, self.batch).await?.collect();
-        for task in &tasks {
-            CommandEntry::new(
-                task.data_id,
-                task.graph_id,
-                Command::Run { node: task.node_id },
-            )
-            .emit(&mut tx)
-            .await?;
-            // The pilot's automatic runner only records success; keep that
-            // event and the task acknowledgement in the protected transaction.
-            TaskEventEntry::new(task, TaskEvent::Succeed)
-                .emit(&mut tx)
-                .await?;
-            task.ack(&mut tx).await?;
-        }
-        let events: Vec<_> = TaskEventEntry::poll(&mut tx, self.batch).await?.collect();
-        for event in events {
-            CommandEntry::new(
-                event.data_id,
-                event.graph_id,
-                event.event.command(event.node_id),
-            )
-            .emit(&mut tx)
-            .await?;
-            event.ack(&mut tx).await?;
-        }
-        commands += self.consume_commands(&mut tx).await?;
-        let tasks = tasks.len();
+        let step = self.actuator.tick_in(&mut tx).await?;
+        self.scheduler
+            .schedule(&mut tx)
+            .await
+            .map_err(|error| Error::Scheduler(Box::new(error)))?;
         tx.commit().await.map_err(BackendError::from)?;
-        Ok(Step { commands, tasks })
+        Ok(step)
     }
 
     /// Runs consumer passes until `shutdown` resolves.
