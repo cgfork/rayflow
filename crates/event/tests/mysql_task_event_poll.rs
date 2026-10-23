@@ -107,8 +107,8 @@ async fn waits_for_a_fresh_task_event_gap() {
         .expect("read gap row")
         .expect("gap row")
         .event_offset;
-    toasty::sql::statement("DELETE FROM task_event WHERE id = ?")
-        .bind(gap_id)
+    TaskEventEntry::filter_by_event_offset(gap_id)
+        .delete()
         .exec(&mut db)
         .await
         .expect("delete gap row");

@@ -89,8 +89,8 @@ async fn skips_a_task_gap_only_after_the_timeout() {
         .expect("read gap row")
         .expect("gap row")
         .task_offset;
-    toasty::sql::statement("DELETE FROM task WHERE id = ?")
-        .bind(gap_id)
+    Task::filter_by_task_offset(gap_id)
+        .delete()
         .exec(&mut db)
         .await
         .expect("delete gap row");

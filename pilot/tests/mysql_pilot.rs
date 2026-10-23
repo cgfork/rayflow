@@ -20,9 +20,10 @@ use uuid::Uuid;
 
 async fn setup() -> Option<(Db, Backend<StaticGraphStore>)> {
     let url = env::var("DATABASE_URL").ok()?;
-    let backend = Backend::connect(&url, StaticGraphStore::new())
-        .await
-        .expect("connect to DATABASE_URL");
+    let mut builder = toasty::Db::builder();
+    builder.models(scheduler::models());
+    let db = builder.connect(&url).await.unwrap();
+    let backend = Backend::new(db, StaticGraphStore::new());
     let db = backend.db().clone();
     db.reset_db().await.expect("reset database");
     db.push_schema().await.expect("push schema");

@@ -10,17 +10,21 @@ use event::task::Task;
 use event::task_event::TaskEventEntry;
 use pilot::Pilot;
 use runtime::{backend::Backend, command::Run};
+use scheduler::{DEFAULT_JOB_LEASE, JobRead, ResourceCapacity, poll_polled, poll_scheduled};
 use server::StaticGraphStore;
 use uuid::Uuid;
+
+const AGENT: Uuid = Uuid::from_u128(1);
 
 #[tokio::test]
 async fn interrupted_command_application_can_be_retried() {
     let Ok(url) = std::env::var("DATABASE_URL") else {
         return;
     };
-    let mut backend = Backend::connect(&url, StaticGraphStore::new())
-        .await
-        .unwrap();
+    let mut builder = toasty::Db::builder();
+    builder.models(scheduler::models());
+    let db = builder.connect(&url).await.unwrap();
+    let mut backend = Backend::new(db, StaticGraphStore::new());
     let mut db = backend.db().clone();
     db.reset_db().await.unwrap();
     db.push_schema().await.unwrap();
@@ -90,22 +94,40 @@ async fn interrupted_command_application_can_be_retried() {
     assert!(step.tasks > 0);
     assert!(step.commands > 0);
 
-    // The completion event has an identity independent of the task and command.
-    let events = event::task_event::TaskEventEntry::filter_by_task_id(task.id)
-        .exec(&mut db)
+    // Actuation commits an available job, without fabricating completion.
+    let scheduled = scheduler::Job::read(&mut db, task.id).await.unwrap();
+    assert_eq!(scheduled.status, scheduler::actuator::Status::Scheduled);
+    assert!(scheduled.agent_id.is_none());
+    assert!(
+        TaskEventEntry::filter_by_task_id(task.id)
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut tx = db.transaction().await.unwrap();
+    let (mut claimed, reserved) = poll_polled(&mut tx, AGENT, &[], 64, DEFAULT_JOB_LEASE)
         .await
         .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_ne!(events[0].id, task.id);
-    assert_ne!(events[0].id, entry.id);
-    // Distinct events for one task are still distinct, immutable log records.
-    let next = TaskEventEntry::new(&task, event::task_event::TaskEvent::Pend);
-    event::Emit::emit(&next, &mut db).await.unwrap();
-    let events_after = event::task_event::TaskEventEntry::filter_by_task_id(task.id)
-        .exec(&mut db)
-        .await
-        .unwrap();
-    assert_eq!(events_after.len(), 2);
-    assert!(events_after.iter().any(|event| event.id == events[0].id));
-    assert_ne!(next.id, events[0].id);
+    let remaining = ResourceCapacity {
+        cpu_cores: ResourceCapacity::default()
+            .cpu_cores
+            .saturating_sub(reserved.cpu_cores),
+        memory_bytes: ResourceCapacity::default()
+            .memory_bytes
+            .saturating_sub(reserved.memory_bytes),
+    };
+    claimed.extend(
+        poll_scheduled(&mut tx, AGENT, remaining, 64 - claimed.len())
+            .await
+            .unwrap(),
+    );
+    tx.commit().await.unwrap();
+    assert!(claimed.iter().any(|row| row.task_id == task.id));
+    let event = TaskEventEntry::new(&task, event::task_event::TaskEvent::Succeed);
+    event.emit(&mut db).await.unwrap();
+    pilot.step().await.unwrap();
+    let settled = scheduler::Job::read(&mut db, task.id).await.unwrap();
+    assert_eq!(settled.status, scheduler::actuator::Status::Succeeded);
+    assert_ne!(event.id, task.id);
 }

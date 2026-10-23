@@ -43,6 +43,7 @@ impl Script {
         let (program, args) = self.argv();
         tokio::process::Command::new(program)
             .args(args)
+            .kill_on_drop(true)
             .status()
             .await
     }

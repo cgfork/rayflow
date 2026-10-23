@@ -3,11 +3,10 @@
 Rayflow is a Rust workspace (edition 2024) implementing a DAG-based task runtime.
 It splits into six core crates: `event` (backend-independent append-only log traits), `graph` (pure graph primitives), `coordinator`
 (MySQL-backed leader election),
-`runtime` (execution state machine with a MySQL-backed store behind the default
-`mysql` feature),
-`scheduler` (consumes tasks, drives node status by task events, and hosts the
-MySQL-backed `Dispatcher`), and `executor` (job primitives that
-execute task work). The `server` and `pilot` directories are binary crates built
+`runtime` (execution state machine with a MySQL-backed store),
+`scheduler` (actuates graph state and abstracts scheduling destinations),
+and `executor` (job primitives that
+execute task work). The `server`, `pilot`, and `agent` directories are binary crates built
 on those libraries.
 
 ## Project Structure & Module Organization
@@ -15,11 +14,15 @@ on those libraries.
 - `crates/graph/` — graph model. `src/lib.rs` defines the `Graph`/`Id`/`GraphStore` traits; `src/types.rs` holds node/edge types. No I/O here.
 - `crates/coordinator/` — leader election. `mysql::MySqlLeaderElection` (behind the default `mysql` feature) implements `LeaderElection` and competes for a named, expiring lease in the `leader_election` table; pilots renew it before every consumer pass.
 - `crates/runtime/` — command application and execution backend. `src/lib.rs` defines `CommandApply`; `src/backend.rs` holds `Status`; `src/command.rs` owns the `Run` and `NodeRun` models; scheduler owns `RunConfig` and `NodeConfig`. `src/backend.rs` also provides the MySQL backend; `command.rs` holds run state models and transitions. MySQL support is unconditional, as in `event`. All log types and polling come from `event`.
-- `crates/scheduler/` — task scheduler. `src/lib.rs` defines the `TaskRunner`/`TaskEventPoll`/`Store` traits, and `Scheduler`, which consumes tasks (`Ready -> Running`) and drives status by applying task events. Task and event polls consume the first unacknowledged contiguous offset. `scheduled.rs` owns `ScheduledTask`, its persistence model and registration, along with run/node configuration models. MySQL persistence and `Dispatcher` are always available.
+- `crates/scheduler/` — `Actuator` (`actuator.rs`) consumes command/task/task-event logs, applies commands, and creates `Job` instances from logical `Task` records that drive the FSM. `Scheduler<B>` (`scheduler.rs`) abstracts job scheduling to agents or external schedulers such as Kubernetes Volcano. `actuator.rs` also owns job and configuration models plus `JobRead`/`JobWrite` persistence contracts. No worker dependency; MySQL support is unconditional.
+- `crates/scheduler/src/agent.rs` — `AgentScheduler` implements direct resource-aware job polling with guarded ORM claims and lease expiry. `ResourceCapacity` reports the agent CPU/memory budget including existing claims; jobs copy flattened requirements from `NodeConfig`. Polls renew unstarted claims and explicitly listed active pending jobs, reserve their resources, and claim fitting jobs. Unstarted claims are redelivered; expired Polled/Pending claims recover. Terminal events clear claims. No registry or queue tables are used.
 - `crates/executor/` — task executor. `src/lib.rs` defines `JobContext`, `Runnable`, `TaskState`, and `ErrorCode`; `src/script.rs` implements the script job. Keep these job primitives feature-agnostic.
 - `pilot/` — leader-elected consumer binary. `src/pilot.rs` renews the leader lease and, while leader, continuously consumes commands, schedules tasks, consumes task events, and applies the resulting commands. `src/config.rs` layers `rayflow.yaml` and `RAYFLOW_PILOT_*` overrides.
 - `server/` — axum HTTP API binary.
-- `runtime.sql` — MySQL schema (`task`, `run`, `run_config`, `node_config`, `node_run`, `scheduled_task`, `command_entry`, `task_event`, `poll_offset`, and `leader_election`). Apply it before using the MySQL backend.
+- `agent/` — samples live CPU/memory with sysinfo, polls `POST /jobs/poll` via reqwest with resource capacity and active job UUIDs, executes pinned script configs concurrently, and reports Pending/terminal statuses to `POST /jobs/{job_id}/status`. Server updates the job and appends its task event atomically. Retried reports append no duplicate events. Settings use `rayflow.yaml` and `RAYFLOW_AGENT_*` overrides; CPU/memory settings are optional caps. Each process needs a unique UUID and polls sequentially. Shutdown cancels interpreters and attempts Terminated reports within `shutdown_timeout_ms`.
+- Pilot calls `Actuator::tick_in` and `Scheduler::schedule` inside one leader-protected transaction. The default `AgentScheduler` reclaims expired agent claims after `job_lease_ms` (30000 by default). Match that timeout on the server. `Pilot::with_scheduler` injects other destinations; external adapters must submit committed requests and reconcile retries after rollback.
+- Missing log offsets use configurable `gap_timeout_ms` (10000 by default), wired through `Actuator::with_gap_timeout`. Direct event consumers use matching `event::poll::Config` for `poll_with_config` and `ack_with_config`; `Poll` trait methods retain defaults. Agent HTTP deadlines use `request_timeout_ms`.
+- `runtime.sql` — MySQL schema (`task`, `run`, `run_config`, `node_config`, `node_run`, `job`, `command_entry`, `task_event`, `poll_offset`, and `leader_election`). Apply it before using the MySQL backend.
 - `Cargo.toml` — workspace manifest with shared dependency versions.
 
 ## Build, Test, and Development Commands
@@ -28,13 +31,15 @@ on those libraries.
 - `cargo check --workspace` — type-check everything.
 - `cargo test` — run the test suite.
 - `cargo run -p pilot` — run the leader-elected consumer (requires MySQL).
+- `cargo run -p agent` — poll and claim jobs from the HTTP API.
 - `cargo fmt` — format with rustfmt.
 - `cargo clippy` — lint the workspace.
 
 ## Coding Style & Naming Conventions
 - 4-space indentation; run `cargo fmt` before committing.
 - `snake_case` for functions/modules, `CamelCase` for types, `SCREAMING_SNAKE_CASE` for constants.
-- Keep `graph` free of I/O; database logic belongs in the persistence modules. The scheduler's core stays backend-agnostic behind `Store`/`TaskRunner`; its MySQL-backed `Dispatcher` is always available.
+- Keep `graph` free of I/O; database logic belongs in the persistence modules. Keep graph actuation in `Actuator`, resource matching and claims in `AgentScheduler`, and persistence models free of workflow logic.
+- Prefer Toasty ORM operations for database access. Use raw SQL only when the ORM cannot express the required behavior, such as MySQL atomic upserts, explicit row locks, or database-clock expressions, and explain the exception in a comment.
 - Gate coordinator MySQL code with its `mysql` feature. MySQL support in `event`, `runtime`, and `scheduler` is always available; keep core traits backend-agnostic.
 
 ## Testing Guidelines

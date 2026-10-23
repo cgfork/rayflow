@@ -5,42 +5,33 @@ A run walks the nodes of a graph through a small status state machine, persistin
 every transition so the work can be driven forward, deferred, and resumed across
 processes.
 
-The workspace splits into six core modules plus the `server` and `pilot`
+The workspace splits into six core modules plus the `server`, `pilot`, and `agent`
 binaries:
 
 - **`event`** — backend-independent `Event`, `Emit`, `Read`, and `Poll` contracts.
 - **`graph`** — pure graph primitives. No I/O.
 - **`coordinator`** — MySQL-backed leader election for the active consumer.
 - **`runtime`** — command application and execution state, with an always-available MySQL backend.
-- **`scheduler`** — the task scheduler: consumes tasks and drives node status by
-  task events, with the MySQL-backed `Dispatcher`.
+- **`scheduler`** — `Actuator` consumes logs and drives graph state; the `Scheduler`
+  trait abstracts scheduling to agents or external job schedulers. `poll_polled`
+  renews or redelivers existing claims, while `poll_scheduled` claims new jobs
+  that fit the remaining resource capacity.
 - **`executor`** — job primitives for executing task work, including the built-in
   script job.
 - **`server`** — an HTTP API (axum) that serves the runtime.
 - **`pilot`** — a continuously running, leader-elected command, task, and
   task-event consumer.
+- **`agent`** — polls jobs that fit its reported resource capacity through the HTTP API.
 
-```text
-                 +---------+      +----------------+
-   graph model   |  graph  |<-----|    runtime     |
-                 +---------+      |  Command/Status |
-                                  |  Task read/write|
-                                  +--------+--------+
-                                           ^
-                                           |
-                                  +---+--------+---+
-                                      ^        ^
-                                      |        |
-                         +------------+--+  +--+-----------+
-                         |    scheduler    |  |   executor   |
-                         | consume + drive |  | job + script |
-                         | auto + dispatch |  +--------------+
-                         +-----------------+
-
-                                  +-----------------+
-                                  |   coordinator   |
-                                  | leader election |
-                                  +-----------------+
+```mermaid
+flowchart LR
+    logs[Command, task, and task-event logs] --> actuator[Actuator]
+    actuator --> state[Runtime graph state]
+    actuator --> jobs[Job]
+    jobs --> scheduler[Scheduler trait]
+    agent[Agent via HTTP] -->|POST /jobs/poll| jobs
+    scheduler --> leases[Job claim leases]
+    scheduler -. external adapter .-> external[Kubernetes / Volcano]
 ```
 
 ## Core Modules
@@ -95,10 +86,10 @@ unconditional MySQL support.
   leader lease. Transitions append new tasks through `event::Emit`.
 - `runtime::models()` registers backend state, the canonical `event` models, and
   leader election. Dispatch and configuration storage are owned by `scheduler`; applications using
-  `Dispatcher` should register `scheduler::scheduled::models()` instead.
+  `Actuator` should register `scheduler::models()` instead.
 
-`event::poll` owns the shared contiguous offsets and persisted 10-second gap
-timeout. `runtime.sql` remains the deployment schema for all crates; this
+`event::poll` owns the shared contiguous offsets and a configurable gap timeout
+(10 seconds by default). `runtime.sql` remains the deployment schema for all crates; this
 ownership split does not change its table layouts.
 
 `Command` variants and the transition each applies:
@@ -115,52 +106,60 @@ ownership split does not change its table layouts.
 | `Cancel { node }` | `Pending`/`Running -> Terminated`. |
 | `Terminate { node }` | `Pending`/`Running -> Terminated`. |
 
-### `scheduler` — task scheduler
+### `scheduler` — actuation and scheduling contracts
 
-Consumes tasks and drives node status by task events. It is backend-agnostic and
-depends only on three traits:
+`Actuator` consumes commands, tasks, and task events to drive graph state.
+`Task` is the logical input driving the FSM. `Job` is its execution instance,
+scheduled to an agent or another executor and linked back through `task_id`.
+`Actuator::tick_in(tx)` applies command entries, turns tasks into `Job`
+records, emits `Run` commands, consumes task events, and applies their resulting
+commands. It acknowledges logs in the same transaction as their effects.
+Configuration resolution uses the node's latest configuration version and the
+run's latest configuration revision at or before its current revision.
+`Actuator::tick()` wraps a pass in its own transaction; callers must serialize
+consumption, as the pilot does through leader election.
 
-- `Store` — `poll_tasks` (consume the first unacknowledged contiguous tasks) and
-  `transaction`, which opens a `StoreTx` the scheduler drives commands and task
-  acks through. Atomicity lives in the store: the MySQL
-  `runtime::backend::Backend` opens a real SQL transaction, so a command append and
-  its task ack commit together.
-- `TaskRunner` — runs a scheduled task (`run`, which only executes the work).
-- `TaskEventPoll` — supplies the events task runs produced (`poll`) and
-  acknowledges them (`ack`) once
-  driven. Running and consuming are separate: `run` records the event, `poll`
-  returns it, and `ack` consumes it.
+`Scheduler<B>` defines `schedule(&self, backend: &mut B)`, returning the number
+of scheduling changes with an implementation-specific error. The default
+`AgentScheduler` reclaims expired claims; agents directly claim fitting jobs
+through `POST /jobs/poll`. Other implementations can submit jobs to an external
+scheduler such as Kubernetes Volcano.
+`Pilot::with_scheduler(implementation)` selects an implementation; the pilot
+invokes it only while holding the leader lease. External adapters must submit
+durably committed requests and reconcile submissions after uncertain responses.
+The pilot can create task and job UUIDs inside the current transaction;
+those identities may change if that pass rolls back. An adapter can select only
+requests visible through a separate committed database connection and use their
+persisted UUIDs to deduplicate remote jobs. A Kubernetes/Volcano adapter can
+implement this trait with its own client and submission tracking; no Kubernetes
+client is bundled here.
 
-- `TaskEvent` — `Pend`, `Succeed`, `Fail`, `Terminate`, `Cancel`; each maps to the
-  matching `Command` via `TaskEvent::command(node)`. Defined in `event::task_event` and
-  re-exported here.
-- `TaskEventEntry` — the recorded event (its `task_id`/`node_id` plus the
-  `TaskEvent`), so a polled event can be routed back to its node; built from a
-  task with `TaskEventEntry::new`. Also defined in `event::task_event` and re-exported.
-- `Scheduler` — `schedule` (consume a task and emit `Run`, i.e. `Ready -> Running`,
-  then `ack`), `drive` (emit a `TaskEvent`), `drive_events` (poll task events and
-  drive each), `tick` (one batch: poll tasks, schedule and run each, then poll
-  events and drive them), and `drain` (loop until a tick consumes nothing).
-- `Dispatcher` (in `src/dispatcher.rs`) — wraps another
-  `TaskRunner` and adds dispatch tracking. On `run`, it first records a
-  `ScheduledTask` referencing the task, its run, node run, and the node and run
-  configurations in effect (the node's latest version and the run's latest
-  revision at or before the run's revision), then forwards the task. As a
-  `TaskEventPoll`, `poll` is forwarded unchanged and `ack` settles the record's
-  status to the acknowledged event's status before forwarding.
+`Job` and its `JobRead`/`JobWrite` persistence contracts live in `actuator.rs`.
+Register `scheduler::models()` for scheduling, runtime, event, configuration,
+and election models.
 
-`ScheduledTask`, its MySQL model, and the read/write implementations live in
-`scheduler::scheduled` and are re-exported at the crate root.
-`TaskEventPoll` is the scheduler-owned contract for a runner's event stream.
+Jobs have their own `actuator::Status` enum: `Scheduled`, `Polled`, `Pending`,
+`Succeeded`, `Failed`, and `Terminated`; the last three are terminal states.
+The agent reports `Pending` before execution. Consuming its `Pend` task event
+preserves the job's claim; terminal events settle it once.
+`TaskEvent` and `TaskEventEntry` come from `event` and are re-exported here.
 
-The scheduler is a command **producer**: it appends commands to the command log
-(`CommandEmit`) rather than applying them. Each step runs on a `Store::transaction`:
-`schedule` opens a transaction, emits `Run` and acks the consumed task on it, then
-commits, so the command and the task offset advance together; `drive` emits the
-event command on its own transaction. Node status is driven when a consumer polls
-that log (`CommandPoll`) and applies each entry (`CommandApply`); because applying
-`Succeed` enqueues successors, a producer and consumer are run until the run
-reaches quiescence (see `crates/scheduler/tests/mysql_scheduler.rs`).
+### Direct agent polling and resource requirements
+
+`NodeConfig.required_cpu_cores` and `NodeConfig.required_memory_bytes` describe
+minimum job resources. When the actuator creates a `Job`, it copies these values
+from the node's latest configuration. The polling flow calls `poll_polled` to
+renew active claims, redeliver unstarted claims, and calculate reserved
+resources. It then passes the remaining CPU and memory capacity to
+`poll_scheduled`, which applies both limits in its database query. Guarded ORM
+updates make claims atomic; concurrent agents cannot claim the same job. Pending
+claims renew when listed in `active_jobs`.
+
+Claims expire after 30 seconds without a poll by default. The pilot requeues
+expired claims, and the polling endpoint also reclaims expired jobs before
+claiming new work. Configure the same `job_lease_ms` on the server and pilot.
+Terminal task events set the job to `Succeeded`, `Failed`, or `Terminated` and
+clear its claim. A restarted agent can recover old work after the lease expires.
 
 ### Command event log (event sourcing)
 
@@ -211,6 +210,8 @@ produced once a consumer has applied them.
 | `POST` | `/runs/start` | `{ data_id, graph_id, nodes? }` | Emit `Command::Start` (empty `nodes` = graph roots). |
 | `POST` | `/runs/rerun` | `{ data_id, graph_id, node }` | Emit `Command::Rerun` for one node. |
 | `POST` | `/runs/dryrun` | `{ data_id, graph_id, nodes? }` | Emit `Command::Dryrun`. |
+| `POST` | `/jobs/poll` | `{ agent_id, batch, resources: { cpu_cores, memory_bytes }, active_jobs? }` | Claim resource-matching jobs with execution config and context. |
+| `POST` | `/jobs/{job_id}/status` | `{ agent_id, status }` | Record job status and append its task event atomically. |
 | `POST` | `/task_events` | `{ task_id, event }` | Emit a `TaskEvent` for an existing task. |
 | `GET` | `/runs/graph_state` | `?data_id=&graph_id=` | Current `GraphState` (run `uuid`, `version`, `revision`, `edges`, and each node's state). |
 
@@ -248,25 +249,136 @@ take over after the lease expires or is released. On every pass the leader:
 
 1. Acquires or renews the leader lease.
 2. Polls and applies command entries, then acknowledges them.
-3. Runs `Scheduler::tick`, which consumes tasks and task events.
-4. Applies the commands emitted by that scheduling pass.
+3. Delegates task and task-event consumption to `Actuator::tick_in`, including
+   application of resulting commands.
+4. Calls the configured `Scheduler::schedule` implementation (by default,
+   `AgentScheduler` releases expired job claims).
+5. Commits log effects, offsets, and claim recovery together.
 
 Command, task, and task-event consumption all use a persisted global offset and
-skip an auto-increment gap only after it has remained missing for 10 seconds.
+skip an auto-increment gap only after `gap_timeout_ms` (10000 by default).
 
 Configuration is layered like the server's: defaults, then `rayflow.yaml`, then
 the environment. Pilot settings include `batch`, `poll_interval_ms`,
-`leader_name`, and `leader_lease_ms`; `RAYFLOW_PILOT_*` variables override them.
+`leader_name`, `leader_lease_ms`, `job_lease_ms`, and `gap_timeout_ms`;
+`RAYFLOW_PILOT_*` variables override them.
 Run it with:
 
 ```sh
 DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow cargo run -p pilot
 ```
 
+### `agent` — job consumer
+
+The agent samples CPU usage and available memory on every poll, then sends
+`POST /jobs/poll` with its identity, batch size, resource capacity, and active
+job UUIDs. CPU capacity is estimated from current utilization and rounded to
+whole cores. Memory respects host and cgroup limits when available. Optional
+`cpu_cores` and `memory_bytes` settings cap the agent's resource budget.
+
+```json
+{"agent_id":"83f17806-0e06-4185-bfd0-f682d47c1111","batch":64,"resources":{"cpu_cores":8,"memory_bytes":17179869184},"active_jobs":[]}
+```
+
+The capacity includes active reservations because the server subtracts existing
+claims before selecting more work. The agent adds reservations to live available
+resources, bounded by its limits, to avoid subtracting running jobs' memory twice.
+Each agent process needs its own UUID and sends one poll at a time.
+
+The response is an array of `{ job, context, config, lease_ms }` objects. The
+context identifies the original run, graph version, node, and node revision;
+`config` is the pinned `NodeConfig.config` payload. The built-in agent executes
+scripts using this payload:
+
+```json
+{"interpreter":"sh","source":"echo hello"}
+```
+
+For each claim, the agent reports `Pending` before executing the script, then
+reports `Succeeded` for exit code zero or `Failed` for nonzero exit, a signal,
+an invalid config, or a spawn error. Jobs run concurrently while polling
+continues. Ctrl-C stops the interpreters and reports `Terminated`, allowing up
+to `shutdown_timeout_ms` for status delivery.
+
+The server accepts reports at `POST /jobs/{job_id}/status`, validates the claim,
+and updates the job and appends its task event in one ORM transaction:
+
+| Job status | Task event |
+| --- | --- |
+| `Pending` | `Pend` |
+| `Succeeded` | `Succeed` |
+| `Failed` | `Fail` |
+| `Terminated` | `Terminate` |
+
+Repeated status reports append no duplicate event. Expired claims, reports by
+another agent, and terminal regressions return `409 Conflict`; invalid reported
+statuses return `400 Bad Request`. Retried jobs emit `Pend` only once for the
+logical task. The pilot consumes these task events to drive graph state.
+
+Start the API server and pilot, then run an agent:
+
+```sh
+cargo run -p agent
+```
+
+Agent settings come from optional `rayflow.yaml` and `RAYFLOW_AGENT_*` overrides.
+Defaults are a generated UUID, `api_url=http://127.0.0.1:8080`, host CPU/memory
+limits, `batch=64`, `poll_interval_ms=250`, `request_timeout_ms=30000`, and
+`shutdown_timeout_ms=5000`. `RAYFLOW_AGENT_CONFIG` (or `RAYFLOW_CONFIG`) selects
+another file. The agent uses reqwest and accesses only HTTP.
+
+Polling renews the `Pending` jobs listed in `active_jobs`; unstarted `Polled`
+claims are renewed and redelivered so a lost poll response can recover. Pending
+status reports also renew leases and let executions detect rejected claims.
+Transient HTTP failures retry within the confirmed lease; execution stops if the
+claim is lost. Expired `Polled` and `Pending` jobs become `Scheduled` again.
+Delivery remains at least once, so scripts should tolerate retries after an
+agent failure. Terminal jobs retain their outcome.
+
+Timeouts use milliseconds and can be configured in the file or environment:
+
+| Component | Field | Default | Environment override |
+| --- | --- | --- | --- |
+| Server | `job_lease_ms` | 30000 | `RAYFLOW_JOB_LEASE_MS` |
+| Pilot | `job_lease_ms` | 30000 | `RAYFLOW_PILOT_JOB_LEASE_MS` |
+| Pilot | `gap_timeout_ms` | 10000 | `RAYFLOW_PILOT_GAP_TIMEOUT_MS` |
+| Agent | `request_timeout_ms` | 30000 | `RAYFLOW_AGENT_REQUEST_TIMEOUT_MS` |
+| Agent | `shutdown_timeout_ms` | 5000 | `RAYFLOW_AGENT_SHUTDOWN_TIMEOUT_MS` |
+
+Match `job_lease_ms` between server and pilot and keep the agent's poll interval
+comfortably below it. Library callers can use `Pilot::with_job_lease`,
+`AgentScheduler::with_lease`, `poll_polled`, and `poll_scheduled`.
+`Pilot::with_gap_timeout` or `Actuator::with_gap_timeout` configures missing log
+offsets.
+
+Existing databases must be migrated before restarting binaries. If necessary,
+rename `scheduling_task` (or the older `scheduled_task`) to `job` first. For an
+existing `job` table that does not yet have these columns:
+
+```sql
+ALTER TABLE job
+    ADD COLUMN required_cpu_cores INT UNSIGNED NOT NULL DEFAULT 0,
+    ADD COLUMN required_memory_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    ADD COLUMN agent_id CHAR(36) NULL,
+    ADD COLUMN polled_at DATETIME(6) NULL,
+    ADD KEY idx_job_agent_id (agent_id),
+    ADD KEY idx_job_polled_at (polled_at);
+ALTER TABLE node_config
+    ADD COLUMN required_cpu_cores INT UNSIGNED NOT NULL DEFAULT 0,
+    ADD COLUMN required_memory_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0;
+UPDATE job SET status = 'Scheduled' WHERE status IN ('Ready', 'Running');
+ALTER TABLE job ALTER COLUMN status SET DEFAULT 'Scheduled';
+DROP TABLE IF EXISTS worker_queue;
+DROP TABLE IF EXISTS worker;
+```
+
+The `status` column is `VARCHAR(16)`, so adding `Pending` needs no column change.
+New databases use `runtime.sql` directly.
+
 ## Node State Transition
 
-A node advances through the following statuses. **Schedule** is the scheduler
-consuming a `Ready` task and running it; the other arrows are **task events**
+A node advances through the following statuses. **Schedule** is the actuator
+consuming a `Ready` task and applying `Run`; the other arrows are **task events**
 (`Pend`, `Succeed`, `Fail`, `Terminate`, `Cancel`) applied to the node.
 
 ```text
@@ -333,7 +445,7 @@ is set; when it is, they rebuild the schema straight from the models with
 exist (the tests recreate the tables, not the database). For example:
 
 ```sh
-DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow cargo test -p scheduler
+DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow cargo test -p scheduler -- --test-threads=1
 ```
 
 ## Layout
@@ -344,11 +456,12 @@ crates/
   coordinator/ MySQL-backed LeaderElection
   event/       Command/Task/TaskEvent logs, polling, and Reactive consumer
   runtime/     CommandApply + execution backend and state
-  scheduler/   TaskRunner/TaskEventPoll/Store + ScheduledTask + Scheduler/Dispatcher
+  scheduler/   Actuator + Job + Scheduler trait + direct agent polling
   executor/    JobContext/Runnable/TaskState + script.rs Script
 server/        axum HTTP API binary (router + RAYFLOW_ADDR bind)
 pilot/         leader-elected command/task/task-event consumer binary
-runtime.sql    MySQL schema (task, run, run_config, node_config, node_run, scheduled_task, task_event, command_entry, poll offsets)
+agent/         HTTP job polling binary with resource capacity
+runtime.sql    MySQL schema (task, run, run_config, node_config, node_run, job, task_event, command_entry, poll offsets)
 ```
 
 ### Shared event log API
@@ -369,7 +482,10 @@ It owns `Command`, `CommandEntry`, and Toasty models; it does not
 depend on `runtime`. Register `event::command::models()` and import the shared
 `Emit`, `Read`, and `Poll` traits. Its tables match `command_entry` and
 `poll_offset` in `runtime.sql`, including contiguous polling and the persisted
-10-second gap timeout. Use one serialized consumer for the global command cursor.
+gap timeout (10 seconds by default). Use one serialized consumer for the global command cursor.
+For a custom timeout, call each log model's `poll_with_config` and
+`ack_with_config` with the same `event::poll::Config { gap_timeout }`.
+The `Poll` trait methods use the default timeout.
 
 `event::task::Task` implements the same emit/read/poll/ack contracts for the
 `task` table, with no runtime dependency. Use `event::task::models()` for tasks

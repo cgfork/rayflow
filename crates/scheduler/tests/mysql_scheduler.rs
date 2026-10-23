@@ -1,12 +1,8 @@
 //! Integration test for the MySQL-backed scheduler with a mocked task runner.
 //!
-//! The test drives a whole run end to end. The [`Scheduler`] is a command
-//! producer: it consumes the tasks a run enqueues and *emits* the driving
-//! commands into the command log. A small consumer then polls that log and
-//! applies each command, which advances node status and enqueues the next tasks;
-//! the two are interleaved until the run is quiescent. A [`MockRunner`] plays the
-//! role of the task executor: it runs each scheduled task and records the event
-//! the run produced, which the scheduler polls back to drive the node.
+//! Actuator consumes logs and drives graph state, agents poll work directly, and a
+//! simulated agent claims jobs and emits completion events. The loop
+//! checks success, failure propagation, and rerunning completed graph nodes.
 //!
 //! It needs a MySQL instance. Set `DATABASE_URL` (for example
 //! `mysql://root:password@127.0.0.1:3306/rayflow`) to run it; the test resets the
@@ -16,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Mutex;
 
 use event::Emit as CommandEmit;
 use event::Poll as CommandPoll;
@@ -29,8 +24,10 @@ use runtime::CommandApply;
 use runtime::backend::Backend;
 use runtime::backend::Status;
 use runtime::command::{NodeRun, Run};
-use scheduler::TaskEventPoll;
-use scheduler::{Scheduler, TaskEvent, TaskEventEntry, TaskRunner};
+use scheduler::{
+    Actuator, DEFAULT_JOB_LEASE, ResourceCapacity, TaskEvent, TaskEventEntry, poll_polled,
+    poll_scheduled,
+};
 use toasty::Db;
 use uuid::Uuid;
 
@@ -47,67 +44,16 @@ impl GraphStore<Uuid> for TestGraphStore {
     }
 }
 
-/// A [`TaskRunner`] mock that records the event each run produces.
+/// Agent simulator: selected nodes fail, others succeed.
 struct MockRunner {
-    /// Nodes this runner fails; every other node succeeds.
     failing: Vec<Uuid>,
-    events: Mutex<Vec<TaskEventEntry>>,
 }
-
 impl MockRunner {
-    /// A runner that succeeds every task.
     fn succeed() -> Self {
-        Self {
-            failing: Vec::new(),
-            events: Mutex::new(Vec::new()),
-        }
+        Self { failing: vec![] }
     }
-
-    /// A runner that fails the listed nodes and succeeds the rest.
-    fn fail(nodes: Vec<Uuid>) -> Self {
-        Self {
-            failing: nodes,
-            events: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl TaskRunner for MockRunner {
-    type Err = Infallible;
-
-    async fn run(&self, task: &Task) -> Result<(), Self::Err> {
-        let event = if self.failing.contains(&task.node_id) {
-            TaskEvent::Fail
-        } else {
-            TaskEvent::Succeed
-        };
-        self.events
-            .lock()
-            .unwrap()
-            .push(TaskEventEntry::new(task, event));
-        Ok(())
-    }
-}
-
-impl TaskEventPoll for MockRunner {
-    type Err = Infallible;
-
-    async fn poll(&self, max: usize) -> Result<Vec<TaskEventEntry>, Self::Err> {
-        let mut events = self.events.lock().unwrap();
-        let mut taken = Vec::new();
-        events.retain(|entry| {
-            if taken.len() < max {
-                taken.push(entry.clone());
-                false
-            } else {
-                true
-            }
-        });
-        Ok(taken)
-    }
-
-    async fn ack(&self, _event: &TaskEventEntry) -> Result<(), Self::Err> {
-        Ok(())
+    fn fail(failing: Vec<Uuid>) -> Self {
+        Self { failing }
     }
 }
 
@@ -127,7 +73,7 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
     let url = std::env::var("DATABASE_URL").ok()?;
 
     let mut builder = Db::builder();
-    builder.models(runtime::models());
+    builder.models(scheduler::models());
     let db = builder
         .connect(&url)
         .await
@@ -183,16 +129,44 @@ async fn consume_commands(db: &mut Db, backend: &Backend<TestGraphStore>) -> usi
 /// them, until neither makes progress. Returns the number of tasks scheduled.
 async fn run_to_quiescence(
     db: &mut Db,
-    scheduler: &mut Scheduler<Backend<TestGraphStore>, MockRunner>,
+    runner: &mut MockRunner,
     consumer: &Backend<TestGraphStore>,
 ) -> usize {
-    let mut scheduled = 0;
+    let mut actuator = Actuator::new(consumer.clone(), 16);
+    let mut total = 0;
     loop {
-        let processed = scheduler.tick().await.expect("tick");
-        let applied = consume_commands(db, consumer).await;
-        scheduled += processed;
-        if processed == 0 && applied == 0 {
-            return scheduled;
+        let step = actuator.tick().await.expect("actuate");
+        let mut tx = db.transaction().await.expect("begin job poll");
+        let (mut tasks, reserved) =
+            poll_polled(&mut tx, Uuid::from_u128(1), &[], 16, DEFAULT_JOB_LEASE)
+                .await
+                .expect("poll previously claimed jobs");
+        let remaining = ResourceCapacity {
+            cpu_cores: ResourceCapacity::default()
+                .cpu_cores
+                .saturating_sub(reserved.cpu_cores),
+            memory_bytes: ResourceCapacity::default()
+                .memory_bytes
+                .saturating_sub(reserved.memory_bytes),
+        };
+        tasks.extend(
+            poll_scheduled(&mut tx, Uuid::from_u128(1), remaining, 16 - tasks.len())
+                .await
+                .expect("claim scheduled jobs"),
+        );
+        tx.commit().await.expect("commit job poll");
+        total += tasks.len();
+        for record in &tasks {
+            let task = Task::filter_by_id(record.task_id).get(db).await.unwrap();
+            let event = if runner.failing.contains(&task.node_id) {
+                TaskEvent::Fail
+            } else {
+                TaskEvent::Succeed
+            };
+            TaskEventEntry::new(&task, event).emit(db).await.unwrap();
+        }
+        if tasks.is_empty() && step == scheduler::Step::default() {
+            return total;
         }
     }
 }
@@ -274,6 +248,50 @@ async fn node_run_rows(db: &mut Db) -> i64 {
 }
 
 #[tokio::test]
+async fn actuator_rollback_preserves_tasks_and_graph_state() {
+    let Some((mut db, dag, data_id)) = setup().await else {
+        return;
+    };
+    let graph_id = dag.id;
+    let backend = Backend::new(db.clone(), TestGraphStore(dag));
+    start_run(&mut db, &backend, data_id, graph_id).await;
+    let pending: Vec<_> = Task::poll(&mut db, 16).await.unwrap().collect();
+    assert!(!pending.is_empty());
+
+    let mut actuator = Actuator::new(backend, 16);
+    let mut tx = db.transaction().await.unwrap();
+    let step = actuator.tick_in(&mut tx).await.unwrap();
+    assert_eq!(step.tasks, pending.len());
+    assert_eq!(step.events, 0);
+    assert_eq!(
+        scheduler::Job::all().exec(&mut tx).await.unwrap().len(),
+        pending.len()
+    );
+    assert!(Task::poll(&mut tx, 16).await.unwrap().next().is_none());
+    tx.rollback().await.unwrap();
+
+    assert!(
+        scheduler::Job::all()
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let replay: Vec<_> = Task::poll(&mut db, 16).await.unwrap().collect();
+    assert_eq!(
+        replay.iter().map(|task| task.id).collect::<Vec<_>>(),
+        pending.iter().map(|task| task.id).collect::<Vec<_>>()
+    );
+    for task in &replay {
+        let row = NodeRun::filter_by_id(task.node_run_id)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(row.status, Status::Ready.to_string());
+    }
+}
+
+#[tokio::test]
 async fn mysql_scheduler_runs_a_chain_to_completion() {
     let Some((mut db, dag, data_id)) = setup().await else {
         eprintln!("skipping: set DATABASE_URL to run the MySQL scheduler test");
@@ -281,9 +299,8 @@ async fn mysql_scheduler_runs_a_chain_to_completion() {
     };
     let graph_id = dag.id;
 
-    let producer = Backend::new(db.clone(), TestGraphStore(dag.clone()));
     let consumer = Backend::new(db.clone(), TestGraphStore(dag));
-    let mut scheduler = Scheduler::new(producer, MockRunner::succeed(), 16);
+    let mut scheduler = MockRunner::succeed();
 
     start_run(&mut db, &consumer, data_id, graph_id).await;
 
@@ -312,9 +329,8 @@ async fn mysql_scheduler_stops_downstream_after_failure() {
     let graph_id = dag.id;
     let middle = dag.nodes[1].id;
 
-    let producer = Backend::new(db.clone(), TestGraphStore(dag.clone()));
     let consumer = Backend::new(db.clone(), TestGraphStore(dag));
-    let mut scheduler = Scheduler::new(producer, MockRunner::fail(vec![middle]), 16);
+    let mut scheduler = MockRunner::fail(vec![middle]);
 
     start_run(&mut db, &consumer, data_id, graph_id).await;
 
@@ -340,9 +356,8 @@ async fn mysql_scheduler_reruns_a_succeeded_node() {
     // `c` (index 2), rerun once the whole graph has succeeded.
     let middle = dag.nodes[2].id;
 
-    let producer = Backend::new(db.clone(), TestGraphStore(dag.clone()));
     let consumer = Backend::new(db.clone(), TestGraphStore(dag));
-    let mut scheduler = Scheduler::new(producer, MockRunner::succeed(), 16);
+    let mut scheduler = MockRunner::succeed();
 
     start_run(&mut db, &consumer, data_id, graph_id).await;
     assert_eq!(

@@ -12,6 +12,7 @@ pub mod script;
 use event::task_event::TaskEvent;
 use uuid::Uuid;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct JobContext {
     pub run_id: Uuid,
     pub graph_id: Uuid,

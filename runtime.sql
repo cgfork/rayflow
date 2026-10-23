@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS node_config (
     version          BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'config version',
     annotation_match VARCHAR(255)    NOT NULL DEFAULT '' COMMENT 'run annotation match expression',
     config           JSON            NOT NULL COMMENT 'node configuration payload',
+    required_cpu_cores INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'job CPU requirement in cores',
+    required_memory_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'job memory requirement in bytes',
     created_at       DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at       DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     created_by       VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'creator of the record',
@@ -71,25 +73,32 @@ CREATE TABLE IF NOT EXISTS node_run (
     KEY idx_node_run_data_graph (data_id, graph_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node status within a dag execution run, one row per revision';
 
-CREATE TABLE IF NOT EXISTS scheduled_task (
+CREATE TABLE IF NOT EXISTS job (
     id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
-    uuid           CHAR(36)        NOT NULL DEFAULT '' COMMENT 'scheduled task unique identifier',
+    uuid           CHAR(36)        NOT NULL DEFAULT '' COMMENT 'job unique identifier',
     task_id        CHAR(36)        NOT NULL DEFAULT '' COMMENT 'task unique identifier',
     run_id         CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
     node_run_id    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'owning node run id',
     node_config_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'referenced node config id',
     run_config_id  BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'referenced run config id',
-    status         VARCHAR(16)     NOT NULL DEFAULT 'Ready' COMMENT 'scheduled task status',
+    status         VARCHAR(16)     NOT NULL DEFAULT 'Scheduled' COMMENT 'Scheduled, Polled, Pending, Succeeded, Failed, or Terminated',
+    required_cpu_cores INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'CPU requirement in cores',
+    required_memory_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'memory requirement in bytes',
+    agent_id       CHAR(36) NULL COMMENT 'agent currently holding the polling lease',
+    polled_at      DATETIME(6) NULL COMMENT 'last agent poll that renewed the claim',
     created_at     DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at     DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_scheduled_task_uuid (uuid),
-    KEY idx_scheduled_task_task_id (task_id),
-    KEY idx_scheduled_task_run_id (run_id),
-    KEY idx_scheduled_task_node_run_id (node_run_id),
-    KEY idx_scheduled_task_node_config_id (node_config_id),
-    KEY idx_scheduled_task_run_config_id (run_config_id)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'scheduled task referencing its task, run, node run and configurations';
+    UNIQUE KEY uk_job_uuid (uuid),
+    KEY idx_job_status (status),
+    KEY idx_job_agent_id (agent_id),
+    KEY idx_job_polled_at (polled_at),
+    KEY idx_job_task_id (task_id),
+    KEY idx_job_run_id (run_id),
+    KEY idx_job_node_run_id (node_run_id),
+    KEY idx_job_node_config_id (node_config_id),
+    KEY idx_job_run_config_id (run_config_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'job execution instance referencing its logical task, run, node run and configurations';
 
 CREATE TABLE IF NOT EXISTS command_entry (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key, used as the command offset',

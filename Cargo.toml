@@ -2,6 +2,7 @@
 members = [
     "server",
     "pilot",
+    "agent",
     "crates/graph",
     "crates/event",
     "crates/runtime",
@@ -25,6 +26,8 @@ executor = {path = "crates/executor"}
 coordinator = {path = "crates/coordinator", default-features = false}
 axum = "0.8"
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 toasty = { version = "0.11", features = ["mysql", "serde", "jiff"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

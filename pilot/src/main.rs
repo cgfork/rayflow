@@ -12,7 +12,10 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn StdError>> {
     let config = Config::load()?;
 
-    let backend = Backend::connect(&config.database_url, StaticGraphStore::new()).await?;
+    let mut builder = toasty::Db::builder();
+    builder.models(scheduler::models());
+    let db = builder.connect(&config.database_url).await?;
+    let backend = Backend::new(db, StaticGraphStore::new());
     let node_id = Uuid::new_v4().to_string();
     let election = MySqlLeaderElection::new(
         backend.db().clone(),
@@ -20,7 +23,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         node_id.clone(),
         config.leader_lease(),
     );
-    let mut pilot = Pilot::new(election, backend, config.batch, config.poll_interval());
+    let mut pilot = Pilot::new(election, backend, config.batch, config.poll_interval())
+        .with_job_lease(config.job_lease())
+        .with_gap_timeout(config.gap_timeout());
 
     println!(
         "rayflow pilot {node_id} competing for coordinator role '{}'",

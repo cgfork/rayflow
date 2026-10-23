@@ -46,6 +46,7 @@ mod tests {
         Config {
             addr: "0.0.0.0:0".parse().unwrap(),
             database_url: String::new(),
+            ..Config::default()
         }
     }
 

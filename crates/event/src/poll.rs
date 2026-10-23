@@ -24,8 +24,20 @@ pub struct PollOffset {
     pub updated_at: Timestamp,
 }
 
-/// How long an auto-increment gap must remain missing before it is skipped.
-pub(crate) const GAP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Options shared by polling and acknowledgement of an append-only log.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// How long a missing auto-increment offset is held before it may be skipped.
+    pub gap_timeout: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            gap_timeout: Duration::from_secs(10),
+        }
+    }
+}
 
 /// The persisted position of one log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,7 +77,7 @@ where
 /// Selects the contiguous prefix of `rows` that can be consumed.
 ///
 /// The first missing id starts a gap timer. Rows after that gap are not
-/// returned until the timer exceeds [`GAP_TIMEOUT`]. Once it does, the persisted
+/// returned until the timer reaches [`Config::gap_timeout`]. Once it does, the persisted
 /// offset is safely advanced across the missing ids before the first returned
 /// row, so a crash still leaves that row available to the next consumer.
 pub(crate) fn plan<T>(
@@ -73,6 +85,7 @@ pub(crate) fn plan<T>(
     state: Poll,
     now: Timestamp,
     id: impl Fn(&T) -> u64,
+    config: Config,
 ) -> PollPlan<T> {
     let original = state;
     let mut persisted = state.offset;
@@ -93,7 +106,7 @@ pub(crate) fn plan<T>(
             continue;
         }
 
-        let expired = gap_since.is_some_and(|since| gap_expired(now, since));
+        let expired = gap_since.is_some_and(|since| gap_expired(now, since, config.gap_timeout));
         if selected.is_empty() && expired {
             // No row in this batch is waiting to be acknowledged, so the gap
             // can be crossed safely. The next poll starts at the first returned
@@ -168,7 +181,12 @@ where
 /// belongs to the id after the acknowledged prefix. A non-contiguous
 /// acknowledgement is accepted only after the gap timeout, as a safety net for
 /// callers that acknowledge outside the planner's order.
-pub(crate) async fn ack<E>(backend: &mut E, name: &str, row_offset: u64) -> Result<(), Error>
+pub(crate) async fn ack<E>(
+    backend: &mut E,
+    name: &str,
+    row_offset: u64,
+    config: Config,
+) -> Result<(), Error>
 where
     E: Executor,
 {
@@ -181,7 +199,7 @@ where
     let skip_gap = !contiguous
         && state
             .gap_since
-            .is_some_and(|since| gap_expired(Timestamp::now(), since));
+            .is_some_and(|since| gap_expired(Timestamp::now(), since, config.gap_timeout));
     if !contiguous && !skip_gap {
         return Ok(());
     }
@@ -197,9 +215,9 @@ where
     .await
 }
 
-fn gap_expired(now: Timestamp, since: Timestamp) -> bool {
+fn gap_expired(now: Timestamp, since: Timestamp, timeout: Duration) -> bool {
     since
-        .checked_add(GAP_TIMEOUT)
+        .checked_add(timeout)
         .is_ok_and(|deadline| now >= deadline)
 }
 
@@ -214,7 +232,13 @@ mod tests {
     #[test]
     fn selects_the_contiguous_prefix_and_starts_a_gap_timer() {
         let now = Timestamp::now();
-        let plan = plan(vec![1, 2, 4, 5], state(0, None), now, |row| *row);
+        let plan = plan(
+            vec![1, 2, 4, 5],
+            state(0, None),
+            now,
+            |row| *row,
+            Config::default(),
+        );
 
         assert_eq!(plan.rows, vec![1, 2]);
         assert_eq!(plan.state, state(0, Some(now)));
@@ -225,7 +249,13 @@ mod tests {
     fn does_not_cross_a_fresh_gap() {
         let now = Timestamp::now();
         let since = now - Duration::from_secs(9);
-        let plan = plan(vec![3, 4], state(1, Some(since)), now, |row| *row);
+        let plan = plan(
+            vec![3, 4],
+            state(1, Some(since)),
+            now,
+            |row| *row,
+            Config::default(),
+        );
 
         assert!(plan.rows.is_empty());
         assert_eq!(plan.state, state(1, Some(since)));
@@ -235,8 +265,14 @@ mod tests {
     #[test]
     fn crosses_an_expired_gap_without_acknowledging_the_returned_row() {
         let now = Timestamp::now();
-        let since = now - GAP_TIMEOUT;
-        let plan = plan(vec![3, 4], state(1, Some(since)), now, |row| *row);
+        let since = now - Config::default().gap_timeout;
+        let plan = plan(
+            vec![3, 4],
+            state(1, Some(since)),
+            now,
+            |row| *row,
+            Config::default(),
+        );
 
         assert_eq!(plan.rows, vec![3, 4]);
         assert_eq!(plan.state, state(2, None));
@@ -247,7 +283,13 @@ mod tests {
     fn clears_an_old_gap_timer_after_contiguous_rows() {
         let now = Timestamp::now();
         let since = now - Duration::from_secs(1);
-        let plan = plan(vec![2, 3], state(1, Some(since)), now, |row| *row);
+        let plan = plan(
+            vec![2, 3],
+            state(1, Some(since)),
+            now,
+            |row| *row,
+            Config::default(),
+        );
 
         assert_eq!(plan.rows, vec![2, 3]);
         assert_eq!(plan.state, state(1, None));
@@ -257,9 +299,36 @@ mod tests {
     #[test]
     fn skips_already_acknowledged_rows() {
         let now = Timestamp::now();
-        let plan = plan(vec![1, 2, 3, 5], state(2, None), now, |row| *row);
+        let plan = plan(
+            vec![1, 2, 3, 5],
+            state(2, None),
+            now,
+            |row| *row,
+            Config::default(),
+        );
 
         assert_eq!(plan.rows, vec![3]);
         assert_eq!(plan.state, state(2, Some(now)));
+    }
+
+    #[test]
+    fn uses_the_configured_timeout_at_the_deadline() {
+        let now = Timestamp::now();
+        let since = now - Duration::from_millis(500);
+        let state = state(1, Some(since));
+        let config = Config {
+            gap_timeout: Duration::from_millis(501),
+        };
+        assert!(
+            plan(vec![3], state, now, |row| *row, config)
+                .rows
+                .is_empty()
+        );
+        let config = Config {
+            gap_timeout: Duration::from_millis(500),
+        };
+        let plan = plan(vec![3], state, now, |row| *row, config);
+        assert_eq!(plan.rows, vec![3]);
+        assert_eq!(plan.state.offset, 2);
     }
 }

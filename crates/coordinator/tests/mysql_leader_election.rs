@@ -47,6 +47,8 @@ async fn one_leader_holds_the_lease_until_it_expires_or_resigns() {
 
     first.resign().await.expect("resign");
     assert!(second.try_acquire_or_renew().await.expect("acquire second"));
+    first.resign().await.expect("former leader resigns again");
+    assert!(second.is_leader().await.expect("successor keeps lease"));
 
     let expired = Timestamp::now() - Duration::from_secs(1);
     LeaderElectionModel::filter_by_name(role)
