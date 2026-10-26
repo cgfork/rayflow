@@ -23,6 +23,48 @@ pub struct ResourceCapacity {
     pub memory_bytes: u64,
 }
 
+#[allow(async_fn_in_trait)]
+pub trait JobPoll<B> {
+    type Err: std::error::Error + Send + Sync + 'static;
+
+    async fn poll(
+        &self,
+        backend: &mut B,
+        maximum: usize,
+    ) -> Result<impl Iterator<Item = Job>, Self::Err>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait Report<B> {
+    type Err: std::error::Error + Send + Sync + 'static;
+
+    async fn apply(&self, backend: &mut B) -> Result<(), Self::Err>;
+}
+
+pub struct AgentRef {
+    id: Uuid,
+    active_jobs: Vec<Uuid>,
+    resource: ResourceCapacity,
+}
+
+impl AgentRef {
+    async fn polled<B: Executor>(
+        &self,
+        backend: &mut B,
+        maximum: usize,
+    ) -> Result<Vec<Job>, Error> {
+        unimplemented!()
+    }
+
+    async fn scheduled<B: Executor>(
+        &self,
+        backend: &mut B,
+        maximum: usize,
+    ) -> Result<Vec<Job>, Error> {
+        unimplemented!()
+    }
+}
+
 /// Polls jobs directly instead of assigning them to per-agent queues.
 pub struct AgentScheduler {
     lease: Duration,
