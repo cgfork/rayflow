@@ -1,9 +1,6 @@
 use crate::config::Config;
-use executor::JobContext;
 use scheduler::Job;
-use scheduler::actuator::Status;
 use serde::Deserialize;
-use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -13,11 +10,28 @@ pub struct Client {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PolledJob {
-    pub job: Job,
-    pub context: JobContext,
-    pub config: Value,
-    pub lease_ms: u64,
+pub struct PollJobsResponse {
+    pub jobs: Vec<Job>,
+    pub renewed_jobs: Vec<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum JobAction {
+    Yield,
+    Succeed,
+    Fail,
+    Terminate,
+}
+
+impl JobAction {
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Yield => "yield",
+            Self::Succeed => "succeed",
+            Self::Fail => "fail",
+            Self::Terminate => "terminate",
+        }
+    }
 }
 
 impl Client {
@@ -35,7 +49,7 @@ impl Client {
         config: &Config,
         resources: scheduler::ResourceCapacity,
         active_jobs: &[Uuid],
-    ) -> Result<Vec<PolledJob>, reqwest::Error> {
+    ) -> Result<PollJobsResponse, reqwest::Error> {
         self.http
             .post(&self.poll_url)
             .json(&serde_json::json!({
@@ -51,19 +65,20 @@ impl Client {
             .await
     }
 
-    pub async fn report_status(
+    pub async fn finish_job(
         &self,
         job_id: Uuid,
         agent_id: Uuid,
-        status: Status,
+        action: JobAction,
     ) -> Result<(), reqwest::Error> {
         let url = format!(
-            "{}/jobs/{job_id}/status",
-            self.poll_url.trim_end_matches("/jobs/poll")
+            "{}/job/{}",
+            self.poll_url.trim_end_matches("/jobs/poll"),
+            action.path(),
         );
         self.http
             .post(url)
-            .json(&serde_json::json!({ "agent_id": agent_id, "status": status }))
+            .json(&serde_json::json!({ "job_id": job_id, "agent_id": agent_id }))
             .send()
             .await?
             .error_for_status()?;

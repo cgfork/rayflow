@@ -13,9 +13,9 @@ binaries:
 - **`coordinator`** — MySQL-backed leader election for the active consumer.
 - **`runtime`** — command application and execution state, with an always-available MySQL backend.
 - **`scheduler`** — `Actuator` consumes logs and drives graph state; the `Scheduler`
-  trait abstracts scheduling to agents or external job schedulers. `poll_polled`
-  renews or redelivers existing claims, while `poll_scheduled` claims new jobs
-  that fit the remaining resource capacity.
+  trait abstracts scheduling to agents or external job schedulers. `AgentRef`
+  implements `JobPoll` to renew and redeliver existing claims and claim new jobs
+  that fit the remaining resource capacity in one transaction.
 - **`executor`** — job primitives for executing task work, including the built-in
   script job.
 - **`server`** — an HTTP API (axum) that serves the runtime.
@@ -89,19 +89,20 @@ unconditional MySQL support.
   `Actuator` should register `scheduler::models()` instead.
 
 `event::poll` owns the shared contiguous offsets and a configurable gap timeout
-(10 seconds by default). `runtime.sql` remains the deployment schema for all crates; this
+(10 seconds by default). `rayflow.sql` remains the deployment schema for all crates; this
 ownership split does not change its table layouts.
 
 `Command` variants and the transition each applies:
 
 | Command | Effect |
 | --- | --- |
-| `Start { nodes }` | Create the run and its initial `Ready` node runs (empty `nodes` = graph roots); enqueue a task per node. One-time per `(data_id, graph_id)`. |
-| `Rerun { node }` | Advance the run revision and reset `node` to `Ready`; enqueue a task. |
-| `Dryrun { nodes }` | Mark each target's predecessors `Succeeded` and the target `Ready`; enqueue a task. |
-| `Run { node }` | `Ready -> Running`. |
-| `Pend { node }` | `Ready`/`Running -> Pending`. |
-| `Succeed { node }` | `Pending`/`Running -> Succeeded`; mark each runnable successor `Ready` and enqueue its task. |
+| `Start { nodes }` | Create the run and its initial `Ready` node runs (empty `nodes` = graph roots); enqueue a task per node. One-time per `(data_id, graph_id, version)`. |
+| `Rerun { node }` | Advance the run revision, create a new `Ready` node run, and enqueue its task. |
+| `Dryrun { nodes }` | Mock each target's non-target predecessors as `Succeeded`; mark the targets `Ready` and enqueue their tasks. |
+| `Run { node }` | `Ready -> Running`; do not create a task. |
+| `Pend { node }` | `Ready`/`Running -> Pending` after a `Yield` task event. |
+| `Resume { node }` | `Pending -> Ready`; enqueue a new task in the same node run and revision. The actuator runs the ready task. |
+| `Succeed { node }` | `Pending`/`Running -> Succeeded`; enqueue a task for each runnable successor that becomes `Ready`, skipping successors already `Ready`. |
 | `Fail { node }` | `Pending`/`Running -> Failed`. |
 | `Cancel { node }` | `Pending`/`Running -> Terminated`. |
 | `Terminate { node }` | `Pending`/`Running -> Terminated`. |
@@ -111,9 +112,10 @@ ownership split does not change its table layouts.
 `Actuator` consumes commands, tasks, and task events to drive graph state.
 `Task` is the logical input driving the FSM. `Job` is its execution instance,
 scheduled to an agent or another executor and linked back through `task_id`.
-`Actuator::tick_in(tx)` applies command entries, turns tasks into `Job`
-records, emits `Run` commands, consumes task events, and applies their resulting
-commands. It acknowledges logs in the same transaction as their effects.
+`Actuator::tick_in(tx)` applies command entries, turns tasks into `Job` records,
+activating any `Ready` node as `Running` without emitting another task,
+consumes task events, and applies their resulting commands. It
+acknowledges logs in the same transaction as their effects.
 Configuration resolution uses the node's latest configuration version and the
 run's latest configuration revision at or before its current revision.
 `Actuator::tick()` wraps a pass in its own transaction; callers must serialize
@@ -138,27 +140,50 @@ client is bundled here.
 Register `scheduler::models()` for scheduling, runtime, event, configuration,
 and election models.
 
-Jobs have their own `actuator::Status` enum: `Scheduled`, `Polled`, `Pending`,
-`Succeeded`, `Failed`, and `Terminated`; the last three are terminal states.
-The agent reports `Pending` before execution. Consuming its `Pend` task event
-preserves the job's claim; terminal events settle it once.
+Jobs have their own `actuator::Status` enum: `Scheduled`, `Polled`, `Yielded`,
+`Succeeded`, `Failed`, and `Terminated`; the last four are terminal states.
+Executing jobs remain `Polled`. A `Yielded` report emits `TaskEvent::Yield`,
+releases the claim and its resources, and moves the node to `Pending`.
+`Command::Resume` moves that node back to `Ready` and enqueues a new task.
+The actuator moves it to `Running` when creating its job, without emitting
+another task. The previous job stays `Yielded`.
 `TaskEvent` and `TaskEventEntry` come from `event` and are re-exported here.
 
 ### Direct agent polling and resource requirements
 
 `NodeConfig.required_cpu_cores` and `NodeConfig.required_memory_bytes` describe
 minimum job resources. When the actuator creates a `Job`, it copies these values
-from the node's latest configuration. The polling flow calls `poll_polled` to
-renew active claims, redeliver unstarted claims, and calculate reserved
-resources. It then passes the remaining CPU and memory capacity to
-`poll_scheduled`, which applies both limits in its database query. Guarded ORM
-updates make claims atomic; concurrent agents cannot claim the same job. Pending
-claims renew when listed in `active_jobs`.
+from the node's latest configuration. `AgentRef::new(agent_id, resources,
+active_jobs)` implements `JobPoll::poll(backend, maximum)` to reclaim expired
+claims, renew active claims, redeliver unstarted claims, and claim fitting work
+in one transaction. All existing claims reserve resources, including claims
+outside the delivery limit. Both remaining CPU and
+memory limits apply in the database query. Both Polled redelivery and Scheduled
+claims exclude IDs in `active_jobs`, deduct each selected job from the same
+remaining budget, and stop when either CPU or memory reaches zero. `JobPoll::poll`
+takes `&mut self`; create a fresh `AgentRef` with the current total budget for
+each request. Failed polls leave its budget unchanged. Guarded ORM
+updates make claims atomic; concurrent agents cannot claim the same job.
+`renew_claims` renews only owned `Polled` jobs listed in `active_jobs`.
+Unstarted `Polled` claims also renew when redelivered.
 
-Claims expire after 30 seconds without a poll by default. The pilot requeues
-expired claims, and the polling endpoint also reclaims expired jobs before
-claiming new work. Configure the same `job_lease_ms` on the server and pilot.
-Terminal task events set the job to `Succeeded`, `Failed`, or `Terminated` and
+Each node configuration must specify `node_config.lease` as a positive
+millisecond duration that fits timestamp arithmetic. There is no default lease.
+A missing configuration or `NULL` lease returns `JobLeaseNotFound`; an invalid
+duration returns `InvalidJobLease`. Job creation rejects these configurations,
+and a failed poll rolls back its claims. The pilot and polling endpoint reclaim
+owned `Polled` jobs whose stored `expired_at` is at or before the
+current time, without loading node configurations. Renewal, status reports,
+and the agent's execution deadline use the job's pinned
+configuration, even after a newer node version is created.
+`job.expired_at` is the absolute claim deadline (a timestamp, not a duration). Claims
+and renewals set it to the renewal time plus the pinned node lease. It is `NULL`
+before claiming and after expiry recovery, cancellation, or terminal settlement.
+Reclamation skips claims with a `NULL` deadline; existing claims must be renewed
+or have their deadlines backfilled before they can be reclaimed. Renewal and
+status-report checks can still derive a missing deadline from `polled_at` and
+the pinned lease.
+Task events set the job to `Yielded`, `Succeeded`, `Failed`, or `Terminated` and
 clear its claim. A restarted agent can recover old work after the lease expires.
 
 ### Command event log (event sourcing)
@@ -176,8 +201,10 @@ run's status can be driven — or replayed — from the recorded command sequenc
 
 - `Runnable` — a job that runs in a `JobContext` and returns a `TaskState`.
   `Box<T>` is runnable when `T` is, so jobs can be stored behind a pointer.
-- `JobContext` — identifies the run, graph version, node, and revision a job is
-  executing for.
+- `JobContext` — contains `job: Job` and `agent: Agent`; run, node, and
+  configuration details remain on the job and its loaded relations.
+- `Agent` — carries the executing agent's UUID (`id`) and resource capacity
+  (`resources`) from the poll that delivered the job.
 - `TaskState` / `ErrorCode` — report the event and exit code a run produced, and
   map execution errors to numeric codes.
 - `Script` (in `src/script.rs`) — runs source through an interpreter, e.g.
@@ -209,9 +236,13 @@ produced once a consumer has applied them.
 | --- | --- | --- | --- |
 | `POST` | `/runs/start` | `{ data_id, graph_id, nodes? }` | Emit `Command::Start` (empty `nodes` = graph roots). |
 | `POST` | `/runs/rerun` | `{ data_id, graph_id, node }` | Emit `Command::Rerun` for one node. |
+| `POST` | `/runs/resume` | `{ data_id, graph_id, node }` | Emit `Command::Resume` for a pending node. |
 | `POST` | `/runs/dryrun` | `{ data_id, graph_id, nodes? }` | Emit `Command::Dryrun`. |
 | `POST` | `/jobs/poll` | `{ agent_id, batch, resources: { cpu_cores, memory_bytes }, active_jobs? }` | Claim resource-matching jobs with execution config and context. |
-| `POST` | `/jobs/{job_id}/status` | `{ agent_id, status }` | Record job status and append its task event atomically. |
+| `POST` | `/job/yield` | `{ job_id, agent_id }` | End the job as Yielded and append `TaskEvent::Yield`. |
+| `POST` | `/job/succeed` | `{ job_id, agent_id }` | Complete the job and append `TaskEvent::Succeed`. |
+| `POST` | `/job/fail` | `{ job_id, agent_id }` | Fail the job and append `TaskEvent::Fail`. |
+| `POST` | `/job/terminate` | `{ job_id, agent_id }` | Terminate the job and append `TaskEvent::Terminate`. |
 | `POST` | `/task_events` | `{ task_id, event }` | Emit a `TaskEvent` for an existing task. |
 | `GET` | `/runs/graph_state` | `?data_id=&graph_id=` | Current `GraphState` (run `uuid`, `version`, `revision`, `edges`, and each node's state). |
 
@@ -260,7 +291,7 @@ skip an auto-increment gap only after `gap_timeout_ms` (10000 by default).
 
 Configuration is layered like the server's: defaults, then `rayflow.yaml`, then
 the environment. Pilot settings include `batch`, `poll_interval_ms`,
-`leader_name`, `leader_lease_ms`, `job_lease_ms`, and `gap_timeout_ms`;
+`leader_name`, `leader_lease_ms`, and `gap_timeout_ms`;
 `RAYFLOW_PILOT_*` variables override them.
 Run it with:
 
@@ -285,35 +316,44 @@ claims before selecting more work. The agent adds reservations to live available
 resources, bounded by its limits, to avoid subtracting running jobs' memory twice.
 Each agent process needs its own UUID and sends one poll at a time.
 
-The response is an array of `{ job, context, config, lease_ms }` objects. The
-context identifies the original run, graph version, node, and node revision;
-`config` is the pinned `NodeConfig.config` payload. The built-in agent executes
-scripts using this payload:
+The response is `{ jobs, renewed_jobs }`: `jobs` contains `Job` objects directly,
+including their loaded `run`, `node_run`, and `node_config` relations.
+`renewed_jobs` contains the UUIDs of active claims successfully renewed in the
+poll transaction. The agent passes the full job and its own information in
+`JobContext`, and derives its lease from `node_config.lease`. It executes scripts using
+the pinned `node_config.config` payload:
 
 ```json
 {"interpreter":"sh","source":"echo hello"}
 ```
 
-For each claim, the agent reports `Pending` before executing the script, then
+For each unexpired claim returned by polling, the agent executes the script, then
 reports `Succeeded` for exit code zero or `Failed` for nonzero exit, a signal,
 an invalid config, or a spawn error. Jobs run concurrently while polling
 continues. Ctrl-C stops the interpreters and reports `Terminated`, allowing up
 to `shutdown_timeout_ms` for status delivery.
 
-The server accepts reports at `POST /jobs/{job_id}/status`, validates the claim,
-and updates the job and appends its task event in one ORM transaction:
+The server accepts terminal actions at `POST /job/yield`, `POST /job/succeed`,
+`POST /job/fail`, and `POST /job/terminate`. Each takes `{ job_id, agent_id }`,
+validates the claim, and updates the job and appends its task event in one ORM
+transaction, returning `204 No Content`:
 
 | Job status | Task event |
 | --- | --- |
-| `Pending` | `Pend` |
+| `Yielded` | `Yield` |
 | `Succeeded` | `Succeed` |
 | `Failed` | `Fail` |
 | `Terminated` | `Terminate` |
 
-Repeated status reports append no duplicate event. Expired claims, reports by
-another agent, and terminal regressions return `409 Conflict`; invalid reported
-statuses return `400 Bad Request`. Retried jobs emit `Pend` only once for the
-logical task. The pilot consumes these task events to drive graph state.
+Repeated terminal actions append no duplicate event. Expired claims, reports by
+another agent, and terminal regressions return `409 Conflict`. Claim renewal uses
+only sequential polling with `active_jobs`, not a separate status or renewal API.
+The agent waits at most one-third of the shortest active lease between polls,
+bounded by `poll_interval_ms`. Confirmed renewals extend local execution deadlines; missing
+acknowledgements or elapsed deadlines cancel work without a terminal report.
+Renewals emit no task event. Yielding ends
+the job; retries emit no additional `Yield` event. The pilot consumes task events
+to drive graph state.
 
 Start the API server and pilot, then run an agent:
 
@@ -327,11 +367,13 @@ limits, `batch=64`, `poll_interval_ms=250`, `request_timeout_ms=30000`, and
 `shutdown_timeout_ms=5000`. `RAYFLOW_AGENT_CONFIG` (or `RAYFLOW_CONFIG`) selects
 another file. The agent uses reqwest and accesses only HTTP.
 
-Polling renews the `Pending` jobs listed in `active_jobs`; unstarted `Polled`
-claims are renewed and redelivered so a lost poll response can recover. Pending
+Polling immediately renews owned `Polled` jobs listed in
+`active_jobs`, regardless of delivery limits or available capacity. Fitting
+unstarted `Polled` claims are renewed when redelivered so a lost poll response
+can recover. Other inactive claims keep their existing deadlines. `Polled`
 status reports also renew leases and let executions detect rejected claims.
 Transient HTTP failures retry within the confirmed lease; execution stops if the
-claim is lost. Expired `Polled` and `Pending` jobs become `Scheduled` again.
+claim is lost. Expired `Polled` jobs become `Scheduled` again.
 Delivery remains at least once, so scripts should tolerate retries after an
 agent failure. Terminal jobs retain their outcome.
 
@@ -339,15 +381,14 @@ Timeouts use milliseconds and can be configured in the file or environment:
 
 | Component | Field | Default | Environment override |
 | --- | --- | --- | --- |
-| Server | `job_lease_ms` | 30000 | `RAYFLOW_JOB_LEASE_MS` |
-| Pilot | `job_lease_ms` | 30000 | `RAYFLOW_PILOT_JOB_LEASE_MS` |
 | Pilot | `gap_timeout_ms` | 10000 | `RAYFLOW_PILOT_GAP_TIMEOUT_MS` |
 | Agent | `request_timeout_ms` | 30000 | `RAYFLOW_AGENT_REQUEST_TIMEOUT_MS` |
 | Agent | `shutdown_timeout_ms` | 5000 | `RAYFLOW_AGENT_SHUTDOWN_TIMEOUT_MS` |
 
-Match `job_lease_ms` between server and pilot and keep the agent's poll interval
-comfortably below it. Library callers can use `Pilot::with_job_lease`,
-`AgentScheduler::with_lease`, `poll_polled`, and `poll_scheduled`.
+Keep the agent's poll interval comfortably below the shortest configured node
+lease. Job leases come exclusively from `node_config.lease`; server and pilot
+settings do not supply a fallback. Library callers use `AgentRef` with
+`JobPoll::poll` for polling and `AgentScheduler` for expiry recovery.
 `Pilot::with_gap_timeout` or `Actuator::with_gap_timeout` configures missing log
 offsets.
 
@@ -372,29 +413,67 @@ DROP TABLE IF EXISTS worker_queue;
 DROP TABLE IF EXISTS worker;
 ```
 
-The `status` column is `VARCHAR(16)`, so adding `Pending` needs no column change.
-New databases use `runtime.sql` directly.
+To add per-node leases to an existing database:
+
+```sql
+ALTER TABLE node_config
+    ADD COLUMN lease BIGINT UNSIGNED NULL
+        COMMENT 'required job claim lease in milliseconds; NULL returns a missing lease error';
+```
+
+Before restarting, explicitly backfill the lease for each configuration version
+used by jobs and ensure each runnable node has a configuration with a lease.
+Choose durations for those jobs; leaving the column `NULL` returns an error.
+The nullable column supports reporting missing leases in legacy rows and does
+not provide a fallback.
+
+To persist claim deadlines in an existing database:
+
+```sql
+ALTER TABLE job
+    ADD COLUMN expired_at DATETIME(6) NULL
+        COMMENT 'claim deadline; renewed from the pinned node-config lease',
+    ADD KEY idx_job_expired_at (expired_at);
+```
+
+The job `status` and task-event `event` columns are `VARCHAR(16)`. Before
+restarting binaries, migrate the former job and task-event names:
+
+```sql
+UPDATE job SET status = 'Yielded', agent_id = NULL, polled_at = NULL, expired_at = NULL
+WHERE status = 'Pending';
+UPDATE task_event SET event = 'Yield' WHERE event = 'Pend';
+```
+
+Node status `Pending` and command `Pend` keep their names. Resume a pending node
+through `POST /runs/resume` to schedule its next task.
+
+New databases use `rayflow.sql` directly.
 
 ## Node State Transition
 
-A node advances through the following statuses. **Schedule** is the actuator
-consuming a `Ready` task and applying `Run`; the other arrows are **task events**
-(`Pend`, `Succeed`, `Fail`, `Terminate`, `Cancel`) applied to the node.
+A node advances through the following statuses. A task is emitted when a node
+is created or transitions to `Ready`. `Resume` changes a pending node to `Ready`
+and emits a new task; the actuator then activates it as `Running` without
+emitting another task. The other arrows are
+**task events** (`Yield`, `Succeed`, `Fail`, `Terminate`, `Cancel`) applied to
+the node.
 
 ```text
-1. ready -schedule-> running -pend-> pending -event-> succeeded/failed/terminated
-2. ready -schedule-> running -------------------event-> succeeded/failed/terminated
-3. ready --------------------pend-> pending -----event-> succeeded/failed/terminated
+1. ready -run-> running -yield-> pending -resume-> ready -run-> running
+2. ready -run-> running -event-> succeeded/failed/terminated
+3. ready -yield-> pending -resume-> ready -run-> running
 ```
 
 Equivalently:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Ready
-    Ready --> Running: schedule (Run)
-    Running --> Pending: pend
-    Ready --> Pending: pend
+    [*] --> Ready: new task
+    Ready --> Running: Run
+    Running --> Pending: yield
+    Ready --> Pending: yield
+    Pending --> Ready: Resume (new task)
     Running --> Succeeded: succeed
     Pending --> Succeeded: succeed
     Running --> Failed: fail
@@ -408,14 +487,15 @@ stateDiagram-v2
 
 Notes:
 
-- A task is the unit that carries a node from `Ready` to `Running`, then the
-  runner reports the event that drives the node to its next status.
-- `Pending` is a deferral: a `Pending` node only moves to a terminal status (the
-  transitions do not resume `Pending -> Running`); use `Rerun` to make it `Ready`
-  again.
-- `Rerun` advances the run revision and resets a node to `Ready`; `Dryrun` mocks a
-  target's predecessors as `Succeeded` so the target becomes `Ready` without
-  running its upstream.
+- A task is emitted when a node becomes `Ready`. Scheduling moves it to
+  `Running`, then the runner reports the event driving the next status.
+- `Pending` is a deferral. `Resume` moves it to `Ready` and creates a fresh
+  task without changing the run or node revision. The old job remains terminal
+  as `Yielded`; the new task gets a new job.
+- `Start`, `Rerun`, `Dryrun`, and successor activation in `Succeed` prepare
+  `Ready` nodes and add their tasks directly; they do not call `run`.
+  `Run` only changes status. `Rerun` advances the revision; `Dryrun` mocks
+  upstream success.
 
 ## Build, Test, and Development
 
@@ -427,13 +507,13 @@ cargo fmt                   # format with rustfmt
 cargo clippy                # lint the workspace
 ```
 
-Apply `runtime.sql` to a MySQL instance before using the MySQL backend:
+Apply `rayflow.sql` to a MySQL instance before using the MySQL backend:
 
 ```sh
-mysql < runtime.sql
+mysql < rayflow.sql
 ```
 
-The models are the source of truth; `runtime.sql` mirrors them for direct
+The models are the source of truth; `rayflow.sql` mirrors them for direct
 provisioning. The backend queries through Toasty models, so the models must be
 registered on the `Db`: use `runtime::backend::Backend::connect` (which does it for
 you), or chain `.models(runtime::models())` onto `Db::builder()` when you
@@ -461,7 +541,7 @@ crates/
 server/        axum HTTP API binary (router + RAYFLOW_ADDR bind)
 pilot/         leader-elected command/task/task-event consumer binary
 agent/         HTTP job polling binary with resource capacity
-runtime.sql    MySQL schema (task, run, run_config, node_config, node_run, job, task_event, command_entry, poll offsets)
+rayflow.sql    MySQL schema (task, run, run_config, node_config, node_run, job, task_event, command_entry, poll offsets)
 ```
 
 ### Shared event log API
@@ -481,7 +561,7 @@ The standalone `event::command` module is always available.
 It owns `Command`, `CommandEntry`, and Toasty models; it does not
 depend on `runtime`. Register `event::command::models()` and import the shared
 `Emit`, `Read`, and `Poll` traits. Its tables match `command_entry` and
-`poll_offset` in `runtime.sql`, including contiguous polling and the persisted
+`poll_offset` in `rayflow.sql`, including contiguous polling and the persisted
 gap timeout (10 seconds by default). Use one serialized consumer for the global command cursor.
 For a custom timeout, call each log model's `poll_with_config` and
 `ack_with_config` with the same `event::poll::Config { gap_timeout }`.

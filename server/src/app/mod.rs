@@ -4,7 +4,6 @@ mod operation;
 mod state;
 mod task_event;
 
-pub use job::PolledJob;
 pub use offset::Offsets;
 pub use state::{GraphState, NodeState};
 
@@ -12,7 +11,6 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
-use std::time::Duration;
 use toasty::Db;
 use uuid::Uuid;
 
@@ -28,7 +26,6 @@ pub struct App<S> {
     db: Db,
     offsets: Offsets,
     graph_store: S,
-    job_lease: Duration,
 }
 
 /// A single run: the commands that drive it and the state it produces.
@@ -43,13 +40,12 @@ pub struct RunApp<S> {
 impl<S> App<S> {
     /// Creates an app over `db`, tracking the consumed command offset and
     /// serving graphs from `graph_store`.
-    pub fn new(db: Db, config: Config, graph_store: S) -> Self {
+    pub fn new(db: Db, _config: Config, graph_store: S) -> Self {
         let offsets = Offsets::new();
         Self {
             db,
             offsets,
             graph_store,
-            job_lease: config.job_lease(),
         }
     }
 
@@ -106,8 +102,6 @@ pub enum AppError {
     JobNotFound(Uuid),
     #[error("job claim expired, changed owner, or no longer accepts this status: {0}")]
     JobConflict(Uuid),
-    #[error("agents may only report Pending, Succeeded, Failed, or Terminated")]
-    InvalidJobStatus,
     /// The requested node is not part of the graph.
     #[error("node not found in graph: {0}")]
     NodeNotFound(Uuid),
@@ -153,7 +147,6 @@ impl IntoResponse for AppError {
             | AppError::JobNotFound(_)
             | AppError::NodeNotFound(_) => StatusCode::NOT_FOUND,
             AppError::JobConflict(_) => StatusCode::CONFLICT,
-            AppError::InvalidJobStatus => StatusCode::BAD_REQUEST,
             AppError::Graph(_) | AppError::Backend(_) | AppError::Scheduled(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }

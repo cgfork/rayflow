@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 event = { workspace = true }
-executor = { workspace = true }
 axum = { workspace = true }
 config = { workspace = true }
 runtime = { workspace = true }

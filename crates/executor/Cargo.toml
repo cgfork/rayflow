@@ -6,8 +6,9 @@ license.workspace = true
 
 [dependencies]
 event = { workspace = true }
+scheduler = { workspace = true }
 serde = { workspace = true }
-uuid = { workspace = true, optional = true }
+uuid = { workspace = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["process", "rt", "net", "time"], optional = true }
 hyper = { workspace = true, optional = true }
@@ -16,6 +17,7 @@ http-body-util = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "process", "net", "time"] }
 
 [features]
@@ -29,7 +31,6 @@ docker = [
     "dep:tokio",
 ]
 mysql = [
-    "dep:uuid",
     "dep:thiserror",
     "dep:tokio",
     "docker",

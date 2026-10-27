@@ -6,10 +6,14 @@
 //!
 //! * `POST /runs/start` — emit `Command::Start` for a run.
 //! * `POST /runs/rerun` — emit `Command::Rerun` for one node.
+//! * `POST /runs/resume` — emit `Command::Resume` for a pending node.
 //! * `POST /runs/dryrun` — emit `Command::Dryrun` for the given nodes.
 //! * `POST /task_events` — emit a `TaskEvent` for a task.
 //! * `POST /jobs/poll` — claim jobs matching the agent's CPU and memory capacity.
-//! * `POST /jobs/{job_id}/status` — report a job status and emit its task event.
+//! * `POST /job/yield` — yield a job and emit `TaskEvent::Yield`.
+//! * `POST /job/succeed` — complete a job and emit `TaskEvent::Succeed`.
+//! * `POST /job/fail` — fail a job and emit `TaskEvent::Fail`.
+//! * `POST /job/terminate` — terminate a job and emit `TaskEvent::Terminate`.
 //! * `GET  /runs/graph_state` — read the current state of a run.
 
 pub mod job;
@@ -23,10 +27,11 @@ use uuid::Uuid;
 
 use crate::app::App;
 
-pub use job::{PollJobsRequest, ReportJobStatusRequest};
+pub use job::{JobActionRequest, PollJobsRequest, PollJobsResponse};
 pub use run::{
     DryrunRunRequest, DryrunRunResponse, GetGraphStateRequest, GetGraphStateResponse,
-    RerunRunRequest, RerunRunResponse, StartRunRequest, StartRunResponse,
+    RerunRunRequest, RerunRunResponse, ResumeRunRequest, ResumeRunResponse, StartRunRequest,
+    StartRunResponse,
 };
 pub use task_event::{EmitTaskEventRequest, EmitTaskEventResponse};
 

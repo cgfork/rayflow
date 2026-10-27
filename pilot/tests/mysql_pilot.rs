@@ -18,6 +18,8 @@ use server::StaticGraphStore;
 use toasty::Db;
 use uuid::Uuid;
 
+mod support;
+
 async fn setup() -> Option<(Db, Backend<StaticGraphStore>)> {
     let url = env::var("DATABASE_URL").ok()?;
     let mut builder = toasty::Db::builder();
@@ -45,6 +47,7 @@ async fn only_the_leader_consumes_commands_tasks_and_events() {
     let mut standby = Pilot::new(second, backend, 64, Duration::from_millis(10));
 
     let graph_id = Uuid::parse_str("00000001-0000-0000-0000-000000000000").unwrap();
+    support::configure_graph(&mut db, graph_id).await;
     CommandEntry::new(
         Uuid::new_v4(),
         graph_id,

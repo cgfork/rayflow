@@ -27,7 +27,7 @@ async fn task_events_have_independent_identity_and_append_only_history() {
     .unwrap();
     let mut ids = Vec::new();
     for kind in [
-        TaskEvent::Pend,
+        TaskEvent::Yield,
         TaskEvent::Succeed,
         TaskEvent::Fail,
         TaskEvent::Terminate,

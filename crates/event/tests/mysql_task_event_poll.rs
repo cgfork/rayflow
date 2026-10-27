@@ -90,7 +90,7 @@ async fn waits_for_a_fresh_task_event_gap() {
         return;
     };
 
-    entry(1, TaskEvent::Pend)
+    entry(1, TaskEvent::Yield)
         .emit(&mut db)
         .await
         .expect("write first");

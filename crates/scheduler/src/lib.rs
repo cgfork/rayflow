@@ -8,8 +8,8 @@ pub mod scheduler;
 
 pub use actuator::{Actuator, Job, JobRead, JobWrite, Step, models};
 pub use agent::{
-    AgentScheduler, DEFAULT_JOB_LEASE, ResourceCapacity, cancel_job, fail_job, pend_job,
-    poll_polled, poll_scheduled, reclaim_expired_in, succeed_job, terminate_job,
+    AgentRef, AgentScheduler, JobPoll, ResourceCapacity, fail_job, reclaim_expired_in, succeed_job,
+    terminate_job, yield_job,
 };
 pub use event::task_event::{TaskEvent, TaskEventEntry};
 pub use scheduler::Scheduler;
@@ -26,6 +26,10 @@ pub enum Error {
     JobNotFound(uuid::Uuid),
     #[error("job not found: {0}")]
     AgentJobNotFound(uuid::Uuid),
+    #[error("job lease must be positive milliseconds that fit timestamp arithmetic: {0}")]
+    InvalidJobLease(u64),
+    #[error("job lease not found for node configuration: {0}")]
+    JobLeaseNotFound(u64),
     #[error("job claim expired, changed owner, or no longer accepts this status: {0}")]
     JobConflict(uuid::Uuid),
 }

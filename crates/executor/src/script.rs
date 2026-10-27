@@ -111,18 +111,21 @@ impl Runnable for Script {
 
 #[cfg(test)]
 mod tests {
-    use crate::JobContext;
+    use crate::{Agent, JobContext};
+    use event::task::Task;
+    use scheduler::{Job, ResourceCapacity};
     use uuid::Uuid;
 
     use super::*;
 
     fn context() -> JobContext {
+        let task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 1);
         JobContext {
-            run_id: Uuid::new_v4(),
-            graph_id: Uuid::new_v4(),
-            version: 1,
-            node_id: Uuid::new_v4(),
-            revision: 0,
+            job: Job::new(&task, Uuid::new_v4(), 1, 1),
+            agent: Agent {
+                id: Uuid::new_v4(),
+                resources: ResourceCapacity::default(),
+            },
         }
     }
 

@@ -27,10 +27,6 @@ fn default_leader_lease_ms() -> u64 {
     10_000
 }
 
-fn default_job_lease_ms() -> u64 {
-    scheduler::DEFAULT_JOB_LEASE.as_millis() as u64
-}
-
 fn default_gap_timeout_ms() -> u64 {
     event::poll::Config::default().gap_timeout.as_millis() as u64
 }
@@ -53,9 +49,6 @@ pub struct Config {
     /// Leader lease duration in milliseconds.
     #[serde(default = "default_leader_lease_ms")]
     pub leader_lease_ms: u64,
-    /// Duration of an agent job claim without polling. Match the server.
-    #[serde(default = "default_job_lease_ms")]
-    pub job_lease_ms: u64,
     /// How long a missing log offset must remain absent before it is skipped.
     #[serde(default = "default_gap_timeout_ms")]
     pub gap_timeout_ms: u64,
@@ -69,7 +62,6 @@ impl Default for Config {
             poll_interval_ms: default_poll_interval_ms(),
             leader_name: default_leader_name(),
             leader_lease_ms: default_leader_lease_ms(),
-            job_lease_ms: default_job_lease_ms(),
             gap_timeout_ms: default_gap_timeout_ms(),
         }
     }
@@ -138,11 +130,6 @@ impl Config {
                 "poll_interval_ms must be less than leader_lease_ms".to_string(),
             ));
         }
-        if self.job_lease_ms == 0 || self.job_lease_ms > (i64::MAX / 1000) as u64 {
-            return Err(ConfigError::Message(
-                "job_lease_ms must fit in a positive signed microsecond count".into(),
-            ));
-        }
         if self.gap_timeout_ms == 0 {
             return Err(ConfigError::Message(
                 "gap_timeout_ms must be positive".into(),
@@ -159,11 +146,6 @@ impl Config {
     /// Returns the leader lease duration.
     pub fn leader_lease(&self) -> Duration {
         Duration::from_millis(self.leader_lease_ms)
-    }
-
-    /// Returns the agent job claim duration.
-    pub fn job_lease(&self) -> Duration {
-        Duration::from_millis(self.job_lease_ms)
     }
 
     /// Returns the timeout for missing event-log offsets.
@@ -204,18 +186,11 @@ mod tests {
     fn configurable_timeouts_are_validated() {
         let mut config = Config {
             database_url: "mysql://localhost/rayflow".into(),
-            job_lease_ms: 1250,
             gap_timeout_ms: 2000,
             ..Config::default()
         };
         assert!(config.validate().is_ok());
-        assert_eq!(config.job_lease(), Duration::from_millis(1250));
         assert_eq!(config.gap_timeout(), Duration::from_secs(2));
-        for timeout in [0, u64::MAX] {
-            config.job_lease_ms = timeout;
-            assert!(config.validate().is_err());
-        }
-        config.job_lease_ms = 1250;
         config.gap_timeout_ms = 0;
         assert!(config.validate().is_err());
     }

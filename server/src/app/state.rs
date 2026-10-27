@@ -247,7 +247,6 @@ mod tests {
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
             database_url: String::new(),
-            ..Config::default()
         };
         let app = App::new(db, config, TestGraphStore(graph));
         let run_app = app.run_with(data_id, graph_id);
@@ -327,7 +326,6 @@ mod tests {
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
             database_url: String::new(),
-            ..Config::default()
         };
         let app = App::new(db, config, TestGraphStore(graph));
         let run_app = app.run_with(data_id, graph_id);
@@ -360,7 +358,6 @@ mod tests {
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
             database_url: String::new(),
-            ..Config::default()
         };
         let app = App::new(db, config, TestGraphStore::default());
         let run_app = app.run_with(Uuid::from_u128(1), Uuid::from_u128(2));

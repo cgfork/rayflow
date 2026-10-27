@@ -45,6 +45,14 @@ impl<S> RunApp<S> {
         self.emit_and_wait(Command::Rerun { node }).await
     }
 
+    pub async fn resume(&mut self, node: Uuid) -> Result<CommandEntry, AppError> {
+        self.emit(Command::Resume { node }).await
+    }
+
+    pub async fn resume_wait(&mut self, node: Uuid) -> Result<(), AppError> {
+        self.emit_and_wait(Command::Resume { node }).await
+    }
+
     /// Dry-runs `nodes`, mock-succeeding their predecessors (empty starts the roots).
     ///
     /// Returns the emitted command entry.
@@ -92,13 +100,18 @@ mod tests {
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
             database_url: String::new(),
-            ..Config::default()
         };
         App::new(db, config, TestGraphStore::default())
     }
 
     #[tokio::test]
-    async fn start_rerun_and_dryrun_emit_commands() {
+    async fn start_rerun_resume_and_dryrun_emit_commands() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+
         let Some(mut db) = setup().await else {
             eprintln!("skipping: set DATABASE_URL to run the MySQL app test");
             return;
@@ -112,6 +125,21 @@ mod tests {
 
         run.start(vec![]).await.expect("start");
         run.rerun(node).await.expect("rerun");
+        let response = crate::api::router(app.clone())
+            .oneshot(
+                Request::post("/runs/resume")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "data_id": data_id, "graph_id": graph_id, "node": node,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         run.dryrun(vec![node]).await.expect("dryrun");
 
         let mut entries: Vec<_> = CommandEntryModel::all()
@@ -131,6 +159,7 @@ mod tests {
             vec![
                 Command::Start { nodes: vec![] },
                 Command::Rerun { node },
+                Command::Resume { node },
                 Command::Dryrun { nodes: vec![node] },
             ]
         );

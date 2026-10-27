@@ -62,12 +62,6 @@ impl<E> Pilot<E, AgentScheduler> {
             scheduler: AgentScheduler::new(),
         }
     }
-
-    /// Sets how long an agent claim can go without a poll. Match the API server.
-    pub fn with_job_lease(mut self, lease: Duration) -> Self {
-        self.scheduler = self.scheduler.with_lease(lease);
-        self
-    }
 }
 
 impl<E, S> Pilot<E, S> {

@@ -46,7 +46,6 @@ mod tests {
         Config {
             addr: "0.0.0.0:0".parse().unwrap(),
             database_url: String::new(),
-            ..Config::default()
         }
     }
 
@@ -70,7 +69,7 @@ mod tests {
 
         let app = App::new(db.clone(), config(), TestGraphStore::default());
         let entry = app
-            .emit_task_event(task.id, TaskEvent::Pend)
+            .emit_task_event(task.id, TaskEvent::Yield)
             .await
             .expect("emit task event");
 
@@ -79,7 +78,7 @@ mod tests {
         assert_eq!(entry.graph_id, task.graph_id);
         assert_eq!(entry.node_id, task.node_id);
         assert_eq!(entry.node_run_id, task.node_run_id);
-        assert_eq!(entry.event, TaskEvent::Pend);
+        assert_eq!(entry.event, TaskEvent::Yield);
         let row = TaskEventModel::filter_by_id(entry.id)
             .first()
             .exec(&mut db)
@@ -87,7 +86,7 @@ mod tests {
             .expect("read task event")
             .expect("task event written");
         assert!(row.event_offset > 0);
-        assert_eq!(row.event, TaskEvent::Pend);
+        assert_eq!(row.event, TaskEvent::Yield);
 
         let error = app
             .emit_task_event(Uuid::new_v4(), TaskEvent::Succeed)

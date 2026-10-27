@@ -8,7 +8,6 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use config::{Config as Builder, Environment, File};
 use serde::Deserialize;
@@ -23,13 +22,6 @@ pub struct Config {
     pub addr: SocketAddr,
     /// MySQL connection URL. Required.
     pub database_url: String,
-    /// Duration of an agent job claim without polling. Match the pilot's timeout.
-    #[serde(default = "default_job_lease_ms")]
-    pub job_lease_ms: u64,
-}
-
-fn default_job_lease_ms() -> u64 {
-    scheduler::DEFAULT_JOB_LEASE.as_millis() as u64
 }
 
 impl Default for Config {
@@ -37,7 +29,6 @@ impl Default for Config {
         Self {
             addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             database_url: String::new(),
-            job_lease_ms: default_job_lease_ms(),
         }
     }
 }
@@ -71,23 +62,7 @@ impl Config {
             .build()?
             .try_deserialize()?;
 
-        config.validate()?;
         Ok(config)
-    }
-
-    /// Validates the job lease duration used by the database queries.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.job_lease_ms == 0 || self.job_lease_ms > (i64::MAX / 1000) as u64 {
-            return Err(ConfigError::Message(
-                "job_lease_ms must fit in a positive signed microsecond count".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Returns the agent job claim duration.
-    pub fn job_lease(&self) -> Duration {
-        Duration::from_millis(self.job_lease_ms)
     }
 }
 
@@ -96,8 +71,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_lease_defaults_and_overrides_are_validated() {
-        let mut config: Config = Builder::builder()
+    fn server_config_deserializes_address_and_database() {
+        let config: Config = Builder::builder()
             .set_override("addr", "127.0.0.1:8080")
             .unwrap()
             .set_override("database_url", "mysql://localhost/rayflow")
@@ -106,13 +81,7 @@ mod tests {
             .unwrap()
             .try_deserialize()
             .unwrap();
-        assert_eq!(config.job_lease(), Duration::from_secs(30));
-        config.job_lease_ms = 1250;
-        assert!(config.validate().is_ok());
-        assert_eq!(config.job_lease(), Duration::from_millis(1250));
-        for timeout in [0, u64::MAX] {
-            config.job_lease_ms = timeout;
-            assert!(config.validate().is_err());
-        }
+        assert_eq!(config.addr.to_string(), "127.0.0.1:8080");
+        assert_eq!(config.database_url, "mysql://localhost/rayflow");
     }
 }

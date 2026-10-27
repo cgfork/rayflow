@@ -25,7 +25,7 @@ pub fn models() -> toasty::ModelSet {
 #[column(rename_all = "PascalCase", type = varchar(16))]
 pub enum TaskEvent {
     /// Defers the task, driving `Ready`/`Running -> Pending`.
-    Pend,
+    Yield,
     /// Marks the node `Succeeded`.
     Succeed,
     /// Marks the node `Failed`.
@@ -40,7 +40,7 @@ impl TaskEvent {
     /// The command that drives `node` to the status this event names.
     pub fn command(self, node: Uuid) -> Command {
         match self {
-            TaskEvent::Pend => Command::Pend { node },
+            TaskEvent::Yield => Command::Pend { node },
             TaskEvent::Succeed => Command::Succeed { node },
             TaskEvent::Fail => Command::Fail { node },
             TaskEvent::Terminate => Command::Terminate { node },
@@ -52,7 +52,7 @@ impl TaskEvent {
 impl std::fmt::Display for TaskEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            TaskEvent::Pend => "Pend",
+            TaskEvent::Yield => "Yield",
             TaskEvent::Succeed => "Succeed",
             TaskEvent::Fail => "Fail",
             TaskEvent::Terminate => "Terminate",
@@ -66,7 +66,7 @@ impl std::str::FromStr for TaskEvent {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "Pend" => Ok(TaskEvent::Pend),
+            "Yield" => Ok(TaskEvent::Yield),
             "Succeed" => Ok(TaskEvent::Succeed),
             "Fail" => Ok(TaskEvent::Fail),
             "Terminate" => Ok(TaskEvent::Terminate),
@@ -228,5 +228,19 @@ impl<B: Executor> crate::Read<uuid::Uuid, B> for TaskEventEntry {
             .exec(backend)
             .await?
             .ok_or(Error::TaskEventNotFound(id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yield_round_trips_and_pends_the_node() {
+        let node = Uuid::new_v4();
+        assert_eq!(TaskEvent::Yield.command(node), Command::Pend { node });
+        assert_eq!(TaskEvent::Yield.to_string(), "Yield");
+        assert_eq!("Yield".parse::<TaskEvent>().unwrap(), TaskEvent::Yield);
+        assert!("Pend".parse::<TaskEvent>().is_err());
     }
 }

@@ -1,136 +1,123 @@
 //! Execute a claim while reporting status and checking that it remains owned.
 
 use crate::{
-    client::{Client, PolledJob},
+    client::{Client, JobAction},
     config::Config,
 };
-use executor::{Runnable, TaskState, script::Script};
-use scheduler::actuator::Status;
+use executor::{JobContext, Runnable, TaskState, script::Script};
 use std::time::Duration;
 use tokio::{
     sync::watch,
-    time::{Instant, sleep, timeout_at},
+    time::{Instant, sleep, sleep_until},
 };
 use uuid::Uuid;
 
 pub async fn execute(
     client: Client,
     config: Config,
-    job: PolledJob,
-    polled_at: Instant,
+    context: JobContext,
+    deadline: watch::Receiver<Option<Instant>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let id = job.job.uuid;
-    let lease = Duration::from_millis(job.lease_ms);
-    let retry = Duration::from_millis(config.poll_interval_ms)
-        .min((lease / 3).max(Duration::from_millis(1)));
-    let mut deadline = polled_at + lease;
-    let pending = tokio::select! {
-        accepted = report(&client, id, config.agent_id, Status::Pending, lease, retry, &mut deadline) => accepted,
-        _ = shutdown.changed() => {
-            report(&client, id, config.agent_id, Status::Terminated, lease, retry, &mut deadline).await;
+    let id = context.job.uuid;
+    let agent_id = context.agent.id;
+    let lease = match context.job.job_lease() {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("agent: invalid lease for job {id}: {error}");
             return;
         }
     };
-    if !pending {
+    let retry = Duration::from_millis(config.poll_interval_ms)
+        .min((lease / 3).max(Duration::from_millis(1)));
+    if deadline
+        .borrow()
+        .is_none_or(|deadline| deadline <= Instant::now())
+    {
         return;
     }
-    println!("executing job {id} (task {})", job.job.task_id);
-    let status = {
+    println!("executing job {id} (task {})", context.job.task_id);
+    let action = {
         let work = async {
-            let script: Script = match serde_json::from_value(job.config) {
+            let job = &context.job;
+            if job.run.is_unloaded() || job.node_run.is_unloaded() {
+                eprintln!("agent: missing execution context for job {id}");
+                return JobAction::Fail;
+            }
+            let config = &job.node_config.get().as_ref().unwrap().config;
+            let script: Script = match serde_json::from_value(config.clone()) {
                 Ok(script) => script,
                 Err(error) => {
                     eprintln!("agent: invalid config for job {id}: {error}");
-                    return Status::Failed;
+                    return JobAction::Fail;
                 }
             };
-            match script.run(job.context).await {
-                Ok(state) if state.exit_code() == Some(0) => Status::Succeeded,
-                Ok(_) => Status::Failed,
+            match script.run(context).await {
+                Ok(state) => match state.event() {
+                    Some(scheduler::TaskEvent::Yield) => JobAction::Yield,
+                    _ if state.exit_code() == Some(0) => JobAction::Succeed,
+                    _ => JobAction::Fail,
+                },
                 Err(error) => {
                     eprintln!("agent: job {id} failed: {error}");
-                    Status::Failed
+                    JobAction::Fail
                 }
             }
         };
-        let keep_alive = async {
-            loop {
-                sleep(retry).await;
-                if !report(
-                    &client,
-                    id,
-                    config.agent_id,
-                    Status::Pending,
-                    lease,
-                    retry,
-                    &mut deadline,
-                )
-                .await
-                {
-                    break;
-                }
+        let stopped = async {
+            if !*shutdown.borrow_and_update() {
+                let _ = shutdown.changed().await;
             }
         };
         tokio::select! {
-            status = work => Some(status),
-            _ = keep_alive => None,
-            _ = shutdown.changed() => Some(Status::Terminated),
+            biased;
+            _ = lease_expired(deadline.clone()) => None,
+            _ = stopped => Some(JobAction::Terminate),
+            action = work => Some(action),
         }
         // Dropping work cancels the interpreter before reporting termination.
     };
-    if let Some(status) = status {
-        report(
-            &client,
-            id,
-            config.agent_id,
-            status,
-            lease,
-            retry,
-            &mut deadline,
-        )
-        .await;
+    if let Some(action) = action {
+        tokio::select! {
+            biased;
+            _ = lease_expired(deadline) => {},
+            _ = report(&client, id, agent_id, action, retry) => {},
+        }
     }
 }
 
-/// Retry transient failures only while this execution still has a confirmed lease.
-async fn report(
-    client: &Client,
-    job_id: Uuid,
-    agent_id: Uuid,
-    status: Status,
-    lease: Duration,
-    retry: Duration,
-    deadline: &mut Instant,
-) -> bool {
+async fn lease_expired(mut deadline: watch::Receiver<Option<Instant>>) {
     loop {
-        let started = Instant::now();
-        if started >= *deadline {
-            return false;
-        }
-        match timeout_at(*deadline, client.report_status(job_id, agent_id, status)).await {
-            Ok(Ok(())) => {
-                *deadline = started + lease;
-                return true;
+        let Some(expires) = *deadline.borrow_and_update() else {
+            return;
+        };
+        tokio::select! {
+            biased;
+            _ = sleep_until(expires) => return,
+            changed = deadline.changed() => {
+                if changed.is_err() {
+                    return;
+                }
             }
-            Ok(Err(error))
+        }
+    }
+}
+
+async fn report(client: &Client, job_id: Uuid, agent_id: Uuid, action: JobAction, retry: Duration) {
+    loop {
+        match client.finish_job(job_id, agent_id, action).await {
+            Ok(()) => return,
+            Err(error)
                 if error.status().is_some_and(|status| {
                     status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                 }) =>
             {
-                eprintln!("agent: status {status:?} for job {job_id} rejected: {error}");
-                return false;
+                eprintln!("agent: action {action:?} for job {job_id} rejected: {error}");
+                return;
             }
-            Ok(Err(error)) => {
-                eprintln!("agent: status {status:?} for job {job_id} failed: {error}");
-                tokio::select! {
-                    _ = sleep(retry) => {},
-                    _ = tokio::time::sleep_until(*deadline) => return false,
-                }
-            }
-            Err(_) => {
-                eprintln!("agent: lease expired for job {job_id}");
-                return false;
+            Err(error) => {
+                eprintln!("agent: action {action:?} for job {job_id} failed: {error}");
+                sleep(retry).await;
             }
         }
     }
@@ -139,15 +126,21 @@ async fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+    use axum::{
+        Json, Router,
+        extract::{Path, State},
+        http::StatusCode,
+        routing::post,
+    };
+    use executor::Agent;
+    use scheduler::{Job, ResourceCapacity, actuator::Status};
     use std::sync::{Arc, Mutex};
     use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 
     #[derive(Default)]
     struct Reports {
         statuses: Vec<Status>,
-        reject_pending: bool,
-        lose_claim: bool,
+        agent_ids: Vec<Uuid>,
         fail_terminal_once: bool,
     }
 
@@ -166,16 +159,22 @@ mod tests {
     async fn api(reports: Reports) -> Api {
         async fn report(
             State(reports): State<Arc<Mutex<Reports>>>,
-            Json(request): Json<server::api::ReportJobStatusRequest>,
+            Path(action): Path<String>,
+            Json(request): Json<server::api::JobActionRequest>,
         ) -> StatusCode {
             let mut reports = reports.lock().unwrap();
-            reports.statuses.push(request.status);
-            if request.status == Status::Pending
-                && (reports.reject_pending || (reports.lose_claim && reports.statuses.len() > 1))
-            {
-                return StatusCode::CONFLICT;
-            }
-            if request.status.is_terminal() && reports.fail_terminal_once {
+            assert!(!request.job_id.is_nil());
+            assert!(!request.agent_id.is_nil());
+            let status = match action.as_str() {
+                "yield" => Status::Yielded,
+                "succeed" => Status::Succeeded,
+                "fail" => Status::Failed,
+                "terminate" => Status::Terminated,
+                _ => return StatusCode::NOT_FOUND,
+            };
+            reports.statuses.push(status);
+            reports.agent_ids.push(request.agent_id);
+            if reports.fail_terminal_once {
                 reports.fail_terminal_once = false;
                 return StatusCode::SERVICE_UNAVAILABLE;
             }
@@ -185,7 +184,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = Router::new()
-            .route("/jobs/{job_id}/status", post(report))
+            .route("/job/{action}", post(report))
             .with_state(reports.clone());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         Api {
@@ -200,37 +199,69 @@ mod tests {
         }
     }
 
-    fn job(config: serde_json::Value) -> PolledJob {
+    fn job(config: serde_json::Value) -> Job {
         let task = event::task::Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 1);
-        let job = scheduler::Job::new(&task, Uuid::new_v4(), 1, 1);
-        // Verify that the agent can decode the actual server response type.
-        serde_json::from_value(
-            serde_json::to_value(server::app::PolledJob {
-                context: executor::JobContext {
-                    run_id: job.run_id,
-                    graph_id: task.graph_id,
-                    version: 1,
-                    node_id: task.node_id,
-                    revision: 2,
-                },
-                job,
-                config,
-                lease_ms: 2000,
-            })
-            .unwrap(),
-        )
-        .unwrap()
+        let mut job = Job::new(&task, Uuid::new_v4(), 1, 1);
+        job.run = serde_json::from_value(serde_json::json!({
+            "id": 1, "uuid": job.run_id, "data_id": task.data_id,
+            "graph_id": task.graph_id, "version": 1, "revision": 7,
+            "created_at": job.created_at, "updated_at": job.updated_at,
+        }))
+        .unwrap();
+        job.node_run = serde_json::from_value(serde_json::json!({
+            "id": task.node_run_id, "run_id": job.run_id, "data_id": task.data_id,
+            "graph_id": task.graph_id, "node_id": task.node_id,
+            "revision": 2, "status": "Running",
+            "created_at": job.created_at, "updated_at": job.updated_at,
+        }))
+        .unwrap();
+        job.node_config = Some(scheduler::actuator::NodeConfig {
+            id: job.node_config_id,
+            node_id: task.node_id,
+            version: 1,
+            annotation_match: String::new(),
+            config,
+            lease: Some(2000),
+            required_cpu_cores: 1,
+            required_memory_bytes: 512,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            created_by: String::new(),
+            updated_by: String::new(),
+        })
+        .into();
+        let response = server::api::PollJobsResponse {
+            jobs: vec![job],
+            renewed_jobs: vec![],
+        };
+        let mut decoded: crate::client::PollJobsResponse =
+            serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+        decoded.jobs.pop().unwrap()
     }
 
-    async fn run(api: &Api, job: PolledJob) {
+    fn context(api: &Api, job: Job) -> JobContext {
+        JobContext {
+            job,
+            agent: Agent {
+                id: api.config.agent_id,
+                resources: ResourceCapacity {
+                    cpu_cores: 2,
+                    memory_bytes: 2048,
+                },
+            },
+        }
+    }
+
+    async fn run(api: &Api, job: Job) {
         let (_shutdown, receiver) = watch::channel(false);
+        let (_deadline, deadline) = watch::channel(Some(Instant::now() + job.job_lease().unwrap()));
         timeout(
             Duration::from_secs(3),
             execute(
                 Client::new(&api.config).unwrap(),
                 api.config.clone(),
-                job,
-                Instant::now(),
+                context(api, job),
+                deadline,
                 receiver,
             ),
         )
@@ -251,16 +282,7 @@ mod tests {
         )
         .await;
         let statuses = api.reports.lock().unwrap().statuses.clone();
-        assert_eq!(statuses.first(), Some(&Status::Pending));
-        assert_eq!(
-            &statuses[statuses.len() - 2..],
-            &[Status::Succeeded, Status::Succeeded]
-        );
-        assert!(
-            statuses[..statuses.len() - 2]
-                .iter()
-                .all(|status| *status == Status::Pending)
-        );
+        assert_eq!(statuses, vec![Status::Succeeded, Status::Succeeded]);
         for payload in [
             serde_json::json!({"interpreter": "sh", "source": "exit 7"}),
             serde_json::json!({"interpreter": "/no-such-rayflow-interpreter", "source": "exit 0"}),
@@ -269,26 +291,77 @@ mod tests {
             api.reports.lock().unwrap().statuses.clear();
             run(&api, job(payload)).await;
             let reports = api.reports.lock().unwrap();
-            assert_eq!(reports.statuses, vec![Status::Pending, Status::Failed]);
+            assert_eq!(reports.statuses, vec![Status::Failed]);
         }
     }
 
     #[tokio::test]
-    async fn rejected_claim_does_not_start_a_script() {
-        let api = api(Reports {
-            reject_pending: true,
-            ..Reports::default()
-        })
-        .await;
+    async fn execution_reports_the_agent_from_the_job_context() {
+        let api = api(Reports::default()).await;
+        let mut context = context(
+            &api,
+            job(serde_json::json!({"interpreter": "sh", "source": "exit 0"})),
+        );
+        let agent_id = Uuid::new_v4();
+        context.agent.id = agent_id;
+        let (_shutdown, shutdown) = watch::channel(false);
+        let (_deadline, deadline) =
+            watch::channel(Some(Instant::now() + context.job.job_lease().unwrap()));
+        timeout(
+            Duration::from_secs(3),
+            execute(
+                Client::new(&api.config).unwrap(),
+                api.config.clone(),
+                context,
+                deadline,
+                shutdown,
+            ),
+        )
+        .await
+        .unwrap();
+        let reports = api.reports.lock().unwrap();
+        assert_eq!(reports.statuses, vec![Status::Succeeded]);
+        assert_eq!(reports.agent_ids, vec![agent_id]);
+    }
+
+    #[tokio::test]
+    async fn missing_job_relations_fail_without_executing_work() {
+        let api = api(Reports::default()).await;
+        for missing_run in [true, false] {
+            let mut job = job(serde_json::json!({"interpreter": "sh", "source": "exec sleep 30"}));
+            if missing_run {
+                job.run.unload();
+            } else {
+                job.node_run.unload();
+            }
+            run(&api, job).await;
+        }
+        assert_eq!(
+            api.reports.lock().unwrap().statuses,
+            vec![Status::Failed, Status::Failed]
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_claim_does_not_start_a_script() {
+        let api = api(Reports::default()).await;
         let marker = std::env::temp_dir().join(format!("rayflow-job-{}", Uuid::new_v4()));
         let source = format!("touch {}", marker.display());
-        run(
-            &api,
-            job(serde_json::json!({"interpreter": "sh", "source": source})),
+        let (_shutdown, shutdown) = watch::channel(false);
+        let (_deadline, deadline) = watch::channel(Some(Instant::now() - Duration::from_millis(1)));
+        execute(
+            Client::new(&api.config).unwrap(),
+            api.config.clone(),
+            context(
+                &api,
+                job(serde_json::json!({"interpreter": "sh", "source": source})),
+            ),
+            deadline,
+            shutdown,
         )
         .await;
         assert!(!marker.exists());
-        assert_eq!(api.reports.lock().unwrap().statuses, vec![Status::Pending]);
+        assert!(api.reports.lock().unwrap().statuses.is_empty());
     }
 
     #[tokio::test]
@@ -296,20 +369,15 @@ mod tests {
         let api = api(Reports::default()).await;
         let job = job(serde_json::json!({"interpreter": "sh", "source": "exec sleep 30"}));
         let (shutdown, receiver) = watch::channel(false);
+        let (_deadline, deadline) = watch::channel(Some(Instant::now() + Duration::from_secs(2)));
         let execution = tokio::spawn(execute(
             Client::new(&api.config).unwrap(),
             api.config.clone(),
-            job,
-            Instant::now(),
+            context(&api, job),
+            deadline,
             receiver,
         ));
-        timeout(Duration::from_secs(2), async {
-            while api.reports.lock().unwrap().statuses.len() < 2 {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        sleep(Duration::from_millis(50)).await;
         shutdown.send_replace(true);
         timeout(Duration::from_secs(2), execution)
             .await
@@ -322,19 +390,101 @@ mod tests {
 
     #[tokio::test]
     async fn lost_claim_stops_execution_without_a_terminal_report() {
-        let api = api(Reports {
-            lose_claim: true,
-            ..Reports::default()
-        })
-        .await;
-        run(
-            &api,
-            job(serde_json::json!({"interpreter": "sh", "source": "exec sleep 30"})),
-        )
-        .await;
+        let api = api(Reports::default()).await;
+        let (_shutdown, shutdown) = watch::channel(false);
+        let (sender, deadline) = watch::channel(Some(Instant::now() + Duration::from_secs(2)));
+        let execution = tokio::spawn(execute(
+            Client::new(&api.config).unwrap(),
+            api.config.clone(),
+            context(
+                &api,
+                job(serde_json::json!({"interpreter": "sh", "source": "exec sleep 30"})),
+            ),
+            deadline,
+            shutdown,
+        ));
+        sleep(Duration::from_millis(50)).await;
+        sender.send_replace(None);
+        timeout(Duration::from_secs(2), execution)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(api.reports.lock().unwrap().statuses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn polling_renewals_extend_the_execution_deadline() {
+        let api = api(Reports::default()).await;
+        let (_shutdown, shutdown) = watch::channel(false);
+        let (sender, deadline) = watch::channel(Some(Instant::now() + Duration::from_secs(1)));
+        let execution = tokio::spawn(execute(
+            Client::new(&api.config).unwrap(),
+            api.config.clone(),
+            context(
+                &api,
+                job(serde_json::json!({"interpreter": "sh", "source": "sleep 1.2"})),
+            ),
+            deadline,
+            shutdown,
+        ));
+        sleep(Duration::from_millis(100)).await;
+        sender.send_replace(Some(Instant::now() + Duration::from_secs(2)));
+        timeout(Duration::from_secs(3), execution)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             api.reports.lock().unwrap().statuses,
-            vec![Status::Pending, Status::Pending]
+            vec![Status::Succeeded]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_poll_renewals_stop_execution_at_the_deadline() {
+        let api = api(Reports::default()).await;
+        let (_shutdown, shutdown) = watch::channel(false);
+        let (_sender, deadline) = watch::channel(Some(Instant::now() + Duration::from_millis(100)));
+        timeout(
+            Duration::from_secs(2),
+            execute(
+                Client::new(&api.config).unwrap(),
+                api.config.clone(),
+                context(
+                    &api,
+                    job(serde_json::json!({"interpreter": "sh", "source": "exec sleep 30"})),
+                ),
+                deadline,
+                shutdown,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(api.reports.lock().unwrap().statuses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_posts_each_terminal_action() {
+        let api = api(Reports::default()).await;
+        let client = Client::new(&api.config).unwrap();
+        for action in [
+            JobAction::Yield,
+            JobAction::Succeed,
+            JobAction::Fail,
+            JobAction::Terminate,
+        ] {
+            client
+                .finish_job(Uuid::new_v4(), api.config.agent_id, action)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            api.reports.lock().unwrap().statuses,
+            vec![
+                Status::Yielded,
+                Status::Succeeded,
+                Status::Failed,
+                Status::Terminated
+            ]
         );
     }
 }

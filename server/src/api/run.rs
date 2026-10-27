@@ -21,6 +21,7 @@ where
     Router::new()
         .route("/runs/start", post(start_run::<S>))
         .route("/runs/rerun", post(rerun_run::<S>))
+        .route("/runs/resume", post(resume_run::<S>))
         .route("/runs/dryrun", post(dryrun_run::<S>))
         .route("/runs/graph_state", get(get_graph_state::<S>))
 }
@@ -93,6 +94,34 @@ where
     Ok((
         StatusCode::ACCEPTED,
         Json(RerunRunResponse { id: entry.id }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResumeRunRequest {
+    pub data_id: Uuid,
+    pub graph_id: Uuid,
+    pub node: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResumeRunResponse {
+    pub id: Uuid,
+}
+
+async fn resume_run<S>(
+    State(state): State<App<S>>,
+    Json(request): Json<ResumeRunRequest>,
+) -> Result<impl IntoResponse, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
+{
+    let mut run = state.run_with(request.data_id, request.graph_id);
+    let entry = run.resume(request.node).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ResumeRunResponse { id: entry.id }),
     ))
 }
 

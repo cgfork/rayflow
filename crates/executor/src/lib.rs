@@ -10,15 +10,19 @@
 pub mod script;
 
 use event::task_event::TaskEvent;
+use scheduler::{Job, ResourceCapacity};
 use uuid::Uuid;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Agent {
+    pub id: Uuid,
+    pub resources: ResourceCapacity,
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct JobContext {
-    pub run_id: Uuid,
-    pub graph_id: Uuid,
-    pub version: u64,
-    pub node_id: Uuid,
-    pub revision: u64,
+    pub job: Job,
+    pub agent: Agent,
 }
 
 pub trait ErrorCode: std::error::Error {
@@ -62,5 +66,29 @@ mod tests {
     fn boxed_runnable_is_runnable() {
         fn assert_runnable<R: Runnable>() {}
         assert_runnable::<Box<script::Script>>();
+    }
+
+    #[test]
+    fn job_context_round_trips_the_job_and_agent() {
+        let task = event::task::Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 7);
+        let context = JobContext {
+            job: Job::new(&task, Uuid::new_v4(), 11, 13),
+            agent: Agent {
+                id: Uuid::new_v4(),
+                resources: ResourceCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 1024,
+                },
+            },
+        };
+        let encoded = serde_json::to_value(&context).unwrap();
+        assert_eq!(encoded.as_object().unwrap().len(), 2);
+        assert_eq!(encoded["job"]["uuid"], context.job.uuid.to_string());
+        assert_eq!(encoded["agent"]["id"], context.agent.id.to_string());
+        let decoded: JobContext = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.job.uuid, context.job.uuid);
+        assert_eq!(decoded.job.task_id, task.id);
+        assert_eq!(decoded.job.node_run_id, task.node_run_id);
+        assert_eq!(decoded.agent, context.agent);
     }
 }

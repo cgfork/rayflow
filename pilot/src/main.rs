@@ -24,7 +24,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         config.leader_lease(),
     );
     let mut pilot = Pilot::new(election, backend, config.batch, config.poll_interval())
-        .with_job_lease(config.job_lease())
         .with_gap_timeout(config.gap_timeout());
 
     println!(

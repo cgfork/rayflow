@@ -17,7 +17,7 @@ use event::{
 use graph::GraphStore;
 
 /// A run of a graph version for a `(data_id, graph_id)`.
-#[derive(Debug, Clone, toasty::Model)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, toasty::Model)]
 #[table = "run"]
 #[unique(data_id, graph_id, version)]
 pub struct Run {
@@ -35,7 +35,7 @@ pub struct Run {
 }
 
 /// A node's status within a run, one row per revision.
-#[derive(Debug, Clone, toasty::Model)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, toasty::Model)]
 #[table = "node_run"]
 #[unique(run_id, node_id, revision)]
 #[index(data_id, graph_id)]
@@ -53,6 +53,7 @@ pub struct NodeRun {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     #[belongs_to(key = run_id, references = uuid)]
+    #[serde(skip)]
     pub run: toasty::Deferred<Run>,
 }
 
@@ -124,6 +125,10 @@ impl<S> Backend<S> {
                 self.pend(&mut *tx, entry.data_id, entry.graph_id, *node)
                     .await?;
             }
+            Command::Resume { node } => {
+                self.resume(&mut *tx, entry.data_id, entry.graph_id, *node)
+                    .await?;
+            }
             Command::Succeed { node } => {
                 self.succeed(&mut *tx, entry.data_id, entry.graph_id, *node)
                     .await?;
@@ -145,12 +150,12 @@ impl<S> Backend<S> {
         Ok(())
     }
 
-    /// Starts `nodes`, marking them `Ready`.
+    /// Starts `nodes`, marking them `Ready` and adding a task for each.
     ///
     /// The graph is loaded from the backend's graph store. When `nodes` is empty
     /// every root node of the graph is started; otherwise the listed nodes are
-    /// started. A fresh `run` and a `node_run` per started node are created, and a
-    /// task is enqueued for each so the run can be driven forward.
+    /// started. A fresh `run` and a `Ready` node run per started node are created,
+    /// and a task is enqueued for each.
     ///
     /// Starting is a one-time operation per `(data_id, graph_id, version)`; an
     /// existing run of the same graph version must be rerun instead. A newer graph
@@ -210,7 +215,7 @@ impl<S> Backend<S> {
         let run_id = run.uuid;
 
         for node_id in &targets {
-            let node_run_id = NodeRun::create()
+            let node_run = NodeRun::create()
                 .run_id(run_id)
                 .data_id(data_id)
                 .graph_id(graph_id)
@@ -220,25 +225,16 @@ impl<S> Backend<S> {
                 .created_at(now)
                 .updated_at(now)
                 .exec(&mut *tx)
-                .await?
-                .id;
-
-            let task = Task {
-                task_offset: 0,
-                id: Uuid::new_v4(),
-                data_id,
-                graph_id,
-                node_id: *node_id,
-                node_run_id,
-                created_at: Timestamp::now(),
-            };
-            task.emit(&mut *tx).await?;
+                .await?;
+            Task::new(data_id, graph_id, *node_id, node_run.id)
+                .emit(&mut *tx)
+                .await?;
         }
 
         Ok(run_id)
     }
 
-    /// Re-runs `node`, marking it `Ready` and advancing the revision.
+    /// Re-runs `node`, advancing the revision and marking it `Ready`.
     ///
     /// The run must exist and the node must have a node run in the current
     /// revision. The node run must be in a status that can be rerun (`Ready`,
@@ -247,8 +243,8 @@ impl<S> Backend<S> {
     ///
     /// The run's revision is advanced and a fresh node run is written `Ready` at
     /// the new revision; the node run of the prior revision is kept, so a rerun
-    /// preserves history rather than overwriting it. A fresh task is enqueued so
-    /// the node can be driven forward again. Returns the run id.
+    /// preserves history rather than overwriting it. A fresh task is enqueued
+    /// for the new `Ready` node run. Returns the run id.
     async fn rerun<E>(
         &mut self,
         tx: &mut E,
@@ -305,7 +301,7 @@ impl<S> Backend<S> {
             .exec(&mut *tx)
             .await?;
 
-        let node_run_id = NodeRun::create()
+        let node_run = NodeRun::create()
             .run_id(run.uuid)
             .data_id(data_id)
             .graph_id(graph_id)
@@ -315,32 +311,24 @@ impl<S> Backend<S> {
             .created_at(now)
             .updated_at(now)
             .exec(&mut *tx)
-            .await?
-            .id;
+            .await?;
 
-        let task = Task {
-            task_offset: 0,
-            id: Uuid::new_v4(),
-            data_id,
-            graph_id,
-            node_id: node,
-            node_run_id,
-            created_at: Timestamp::now(),
-        };
-        task.emit(&mut *tx).await?;
+        Task::new(data_id, graph_id, node, node_run.id)
+            .emit(&mut *tx)
+            .await?;
 
         Ok(run.uuid)
     }
 
     /// Dry-runs `nodes`, mock-succeeding their predecessors and marking the
-    /// nodes themselves `Ready`.
+    /// selected nodes `Ready`.
     ///
     /// The run must exist; its revision is advanced and every node run below is
     /// written at the new revision. Each target's direct predecessors are mocked
     /// as `Succeeded` so the target is runnable without executing its upstream,
-    /// then the target itself is reset to `Ready` and a fresh task is enqueued so
-    /// it can be driven forward. An empty node list dry-runs the graph, which
-    /// begins at its roots. Returns the run id.
+    /// then the target itself is marked `Ready` and its task is enqueued. An empty
+    /// node list dry-runs the graph, which begins at its roots. Returns the run
+    /// id.
     async fn dryrun<E>(
         &mut self,
         tx: &mut E,
@@ -413,9 +401,8 @@ impl<S> Backend<S> {
             }
         }
 
-        // Mark each target `Ready` and enqueue a task so it can be driven forward.
         for node in &targets {
-            let node_run_id = NodeRun::create()
+            let node_run = NodeRun::create()
                 .run_id(run.uuid)
                 .data_id(data_id)
                 .graph_id(graph_id)
@@ -425,19 +412,10 @@ impl<S> Backend<S> {
                 .created_at(now)
                 .updated_at(now)
                 .exec(&mut *tx)
-                .await?
-                .id;
-
-            let task = Task {
-                task_offset: 0,
-                id: Uuid::new_v4(),
-                data_id,
-                graph_id,
-                node_id: *node,
-                node_run_id,
-                created_at: Timestamp::now(),
-            };
-            task.emit(&mut *tx).await?;
+                .await?;
+            Task::new(data_id, graph_id, *node, node_run.id)
+                .emit(&mut *tx)
+                .await?;
         }
 
         Ok(run.uuid)
@@ -511,7 +489,8 @@ impl<S> Backend<S> {
     /// Marks `node` `Running`.
     ///
     /// The node run must currently be `Ready`; any other status is rejected with
-    /// [`Error::InvalidTransition`]. Returns the node run's revision.
+    /// [`Error::InvalidTransition`]. Returns the node run's revision without
+    /// adding another task.
     async fn run<E>(
         &mut self,
         tx: &mut E,
@@ -562,12 +541,43 @@ impl<S> Backend<S> {
         Ok(run.revision)
     }
 
+    /// Resumes `node` by returning it to `Ready` and adding a fresh task.
+    async fn resume<E>(
+        &mut self,
+        tx: &mut E,
+        data_id: Uuid,
+        graph_id: Uuid,
+        node: Uuid,
+    ) -> Result<u64, Error>
+    where
+        E: Executor,
+    {
+        let run = self
+            .transition(
+                &mut *tx,
+                data_id,
+                graph_id,
+                node,
+                &[Status::Pending],
+                Status::Ready,
+            )
+            .await?;
+        let node_run =
+            NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, run.revision)
+                .get(&mut *tx)
+                .await?;
+        Task::new(data_id, graph_id, node, node_run.id)
+            .emit(&mut *tx)
+            .await?;
+        Ok(run.revision)
+    }
+
     /// Marks `node` `Succeeded`.
     ///
     /// The node run must currently be `Pending` or `Running`; any other status is
     /// rejected with [`Error::InvalidTransition`]. Once the node is succeeded, every
-    /// successor whose predecessors have all succeeded is marked `Ready` and given a
-    /// task. Returns the node run's revision.
+    /// successor whose predecessors have all succeeded is marked `Ready` and
+    /// given a task, unless already `Ready`. Returns the node run's revision.
     async fn succeed<E>(
         &mut self,
         tx: &mut E,
@@ -623,9 +633,9 @@ impl<S> Backend<S> {
                 continue;
             }
 
-            // The successor may already have a node run at this revision (a node
-            // mocked by a dry run that is itself a target, say), so update it in
-            // place when it exists and insert it otherwise.
+            // The successor may already have a node run at this revision (for
+            // example, a target prepared by a dry run), so update it in place
+            // when it exists and insert it otherwise.
             let now = Timestamp::now();
             let successor_run_id = match NodeRun::filter_by_run_id_and_node_id_and_revision(
                 run.uuid,
@@ -636,6 +646,7 @@ impl<S> Backend<S> {
             .exec(&mut *tx)
             .await?
             {
+                Some(row) if row.status == Status::Ready.to_string() => continue,
                 Some(row) => {
                     NodeRun::filter_by_id(row.id)
                         .update()
@@ -660,17 +671,9 @@ impl<S> Backend<S> {
                         .id
                 }
             };
-
-            let task = Task {
-                task_offset: 0,
-                id: Uuid::new_v4(),
-                data_id,
-                graph_id,
-                node_id: successor,
-                node_run_id: successor_run_id,
-                created_at: Timestamp::now(),
-            };
-            task.emit(&mut *tx).await?;
+            Task::new(data_id, graph_id, successor, successor_run_id)
+                .emit(&mut *tx)
+                .await?;
         }
 
         Ok(run.revision)
