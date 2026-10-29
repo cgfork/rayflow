@@ -41,6 +41,11 @@ pub struct Pilot<E = coordinator::mysql::MySqlLeaderElection, S = AgentScheduler
 }
 
 impl<E> Pilot<E, AgentScheduler> {
+    /// Waits this long after job expiry before failing unreported timeouts.
+    pub fn with_job_timeout_gap(mut self, gap: Duration) -> Self {
+        self.scheduler = self.scheduler.with_timeout_gap(gap);
+        self
+    }
     /// Creates a pilot from a leader election and MySQL backend.
     /// Register `scheduler::models()` and any models required by a custom scheduler.
     pub fn new(
@@ -61,12 +66,6 @@ impl<E> Pilot<E, AgentScheduler> {
             poll_interval,
             scheduler: AgentScheduler::new(),
         }
-    }
-
-    /// Sets how long an agent claim can go without a poll. Match the API server.
-    pub fn with_job_lease(mut self, lease: Duration) -> Self {
-        self.scheduler = self.scheduler.with_lease(lease);
-        self
     }
 }
 
@@ -108,7 +107,7 @@ where
             .map_err(|e| Error::Leader(Box::new(e)))
     }
 
-    /// Runs one pass: renew the lease, apply commands, create jobs, and reclaim expired claims.
+    /// Runs one pass: renew leadership, apply commands, create jobs, and fail timed-out jobs.
     ///
     /// A standby returns [`Step::default`] without touching the logs. The lease
     /// row is locked for the entire pass, so takeover waits even

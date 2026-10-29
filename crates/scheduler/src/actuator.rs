@@ -1,11 +1,6 @@
 //! Consumes runtime logs and materializes jobs from logical tasks.
 use crate::Error;
-use event::{
-    Emit,
-    command::{Command, CommandEntry},
-    task::Task,
-    task_event::TaskEventEntry,
-};
+use event::{Emit, command::CommandEntry, task::Task, task_event::TaskEventEntry};
 use graph::{Graph, GraphStore};
 use jiff::Timestamp;
 use runtime::{
@@ -56,17 +51,17 @@ impl<S> Actuator<S> {
     ) -> Result<(), Error> {
         use event::task_event::TaskEvent;
         let status = match event.event {
-            TaskEvent::Pend => return Ok(()),
+            TaskEvent::Yield => Status::Yielded,
             TaskEvent::Succeed => Status::Succeeded,
             TaskEvent::Fail => Status::Failed,
             TaskEvent::Terminate | TaskEvent::Cancel => Status::Terminated,
         };
         Job::filter_by_task_id(event.task_id)
-            .filter(Job::fields().status().in_list(vec![
-                Status::Scheduled,
-                Status::Polled,
-                Status::Pending,
-            ]))
+            .filter(
+                Job::fields()
+                    .status()
+                    .in_list(vec![Status::Scheduled, Status::Polled]),
+            )
             .update()
             .status(status)
             .agent_id(None)
@@ -104,13 +99,18 @@ where
             .await?
             .collect();
         for task in &tasks {
-            CommandEntry::new(
-                task.data_id,
-                task.graph_id,
-                Command::Run { node: task.node_id },
-            )
-            .emit(&mut *tx)
-            .await?;
+            let node_run = NodeRun::filter_by_id(task.node_run_id)
+                .get(&mut *tx)
+                .await?;
+            if node_run.status == runtime::backend::Status::Ready.to_string() {
+                NodeRun::filter_by_id(node_run.id)
+                    .filter(NodeRun::fields().status().eq(node_run.status))
+                    .update()
+                    .status(runtime::backend::Status::Running.to_string())
+                    .updated_at(Timestamp::now())
+                    .exec(&mut *tx)
+                    .await?;
+            }
             Job::create_for_task(task, &mut *tx).await?;
             task.ack_with_config(&mut *tx, self.poll_config).await?;
         }
@@ -155,8 +155,7 @@ where
 pub enum Status {
     Scheduled,
     Polled,
-    /// The agent accepted the claim and is executing it.
-    Pending,
+    Yielded,
     Succeeded,
     Failed,
     Terminated,
@@ -165,7 +164,10 @@ pub enum Status {
 impl Status {
     /// Whether this job has reached a final outcome.
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Terminated)
+        matches!(
+            self,
+            Self::Yielded | Self::Succeeded | Self::Failed | Self::Terminated
+        )
     }
 }
 
@@ -224,6 +226,9 @@ pub struct NodeConfig {
     pub annotation_match: String,
     #[column(type = json)]
     pub config: serde_json::Value,
+    /// Required job lifetime in milliseconds, reset when delivered to an agent.
+    #[serde(default)]
+    pub lease: Option<u64>,
     /// Minimum available CPU cores required by jobs created from this config.
     pub required_cpu_cores: u32,
     /// Minimum available memory required by jobs created from this config.
@@ -234,6 +239,25 @@ pub struct NodeConfig {
     pub created_by: String,
     #[column(type = varchar(64))]
     pub updated_by: String,
+}
+
+impl NodeConfig {
+    /// Resolves the claim lease, rejecting values that cannot be used in timestamp arithmetic.
+    pub fn job_lease(&self) -> Result<Duration, Error> {
+        match self.lease {
+            None => Err(Error::JobLeaseNotFound(self.id)),
+            Some(ms)
+                if ms > 0
+                    && ms <= (i64::MAX / 1000) as u64
+                    && Timestamp::now()
+                        .checked_sub(Duration::from_millis(ms))
+                        .is_ok() =>
+            {
+                Ok(Duration::from_millis(ms))
+            }
+            Some(ms) => Err(Error::InvalidJobLease(ms)),
+        }
+    }
 }
 
 /// An execution instance created from a logical task and its effective configuration.
@@ -265,29 +289,43 @@ pub struct Job {
     #[index]
     #[column(type = "CHAR(36)")]
     pub agent_id: Option<Uuid>,
-    /// Last poll that renewed the agent's lease.
+    /// Most recent delivery to the agent, including redelivery.
     #[index]
     pub polled_at: Option<Timestamp>,
+    /// Runtime expiry set on delivery and preserved after completion.
+    #[index]
+    pub expired_at: Option<Timestamp>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     #[belongs_to(key = task_id, references = id)]
     #[serde(skip)]
     pub task: toasty::Deferred<Task>,
     #[belongs_to(key = run_id, references = uuid)]
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "toasty::Deferred::is_unloaded")]
     pub run: toasty::Deferred<Run>,
     #[belongs_to(key = node_run_id, references = id)]
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "toasty::Deferred::is_unloaded")]
     pub node_run: toasty::Deferred<NodeRun>,
     #[belongs_to(key = node_config_id, references = id)]
-    #[serde(skip)]
-    pub node_config: toasty::Deferred<NodeConfig>,
+    #[serde(default, skip_serializing_if = "toasty::Deferred::is_unloaded")]
+    pub node_config: toasty::Deferred<Option<NodeConfig>>,
     #[belongs_to(key = run_config_id, references = id)]
     #[serde(skip)]
-    pub run_config: toasty::Deferred<RunConfig>,
+    pub run_config: toasty::Deferred<Option<RunConfig>>,
 }
 
 impl Job {
+    pub fn job_lease(&self) -> Result<Duration, Error> {
+        if self.node_config.is_unloaded() {
+            return Err(Error::JobLeaseNotFound(self.node_config_id));
+        }
+        self.node_config
+            .get()
+            .as_ref()
+            .ok_or(Error::JobLeaseNotFound(self.node_config_id))?
+            .job_lease()
+    }
+
     /// Creates a job for a logical task under `run_id`.
     pub fn new(task: &Task, run_id: Uuid, node_config_id: u64, run_config_id: u64) -> Self {
         let now = Timestamp::now();
@@ -304,6 +342,7 @@ impl Job {
             required_memory_bytes: 0,
             agent_id: None,
             polled_at: None,
+            expired_at: None,
             created_at: now,
             updated_at: now,
             task: toasty::Deferred::default(),
@@ -326,8 +365,10 @@ impl Job {
             .order_by(NodeConfig::fields().version().desc())
             .first()
             .exec(&mut *backend)
-            .await?;
-        let node_config_id = node_config.as_ref().map(|row| row.id).unwrap_or(0);
+            .await?
+            .ok_or(Error::JobLeaseNotFound(0))?;
+        node_config.job_lease()?;
+        let node_config_id = node_config.id;
         let run_config_id = RunConfig::filter_by_run_id(run.uuid)
             .filter(RunConfig::fields().revision().le(run.revision))
             .order_by(RunConfig::fields().revision().desc())
@@ -337,10 +378,8 @@ impl Job {
             .map(|row| row.id)
             .unwrap_or(0);
         let mut entry = Self::new(task, run.uuid, node_config_id, run_config_id);
-        if let Some(node_config) = node_config {
-            entry.required_cpu_cores = node_config.required_cpu_cores;
-            entry.required_memory_bytes = node_config.required_memory_bytes;
-        }
+        entry.required_cpu_cores = node_config.required_cpu_cores;
+        entry.required_memory_bytes = node_config.required_memory_bytes;
         entry.write(backend).await?;
         Ok(Self::filter_by_uuid(entry.uuid).get(backend).await?)
     }
@@ -385,6 +424,7 @@ where
             .required_memory_bytes(self.required_memory_bytes)
             .agent_id(self.agent_id)
             .polled_at(self.polled_at)
+            .expired_at(self.expired_at)
             .created_at(self.created_at)
             .updated_at(self.updated_at)
             .exec(&mut *backend)
@@ -406,5 +446,146 @@ where
             .await?
             .ok_or(Error::JobNotFound(task_id))?;
         Ok(job)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node_config() -> NodeConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "node_id": Uuid::new_v4(),
+            "version": 1,
+            "annotation_match": "",
+            "config": {},
+            "required_cpu_cores": 0,
+            "required_memory_bytes": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "created_by": "",
+            "updated_by": ""
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn yielded_is_a_terminal_job_with_a_yield_event() {
+        assert!(Status::Yielded.is_terminal());
+        assert!(!Status::Polled.is_terminal());
+        let encoded = serde_json::to_string(&Status::Yielded).unwrap();
+        assert_eq!(encoded, "\"Yielded\"");
+        assert_eq!(
+            serde_json::from_str::<Status>(&encoded).unwrap(),
+            Status::Yielded
+        );
+        let event = event::task_event::TaskEvent::Yield;
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert_eq!(encoded, "\"Yield\"");
+        assert_eq!(
+            serde_json::from_str::<event::task_event::TaskEvent>(&encoded).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn node_config_requires_lease_and_round_trips_in_milliseconds() {
+        let mut config = node_config();
+        assert_eq!(config.lease, None);
+        assert!(matches!(
+            config.job_lease(),
+            Err(Error::JobLeaseNotFound(1))
+        ));
+        config.lease = Some(1250);
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["lease"], 1250);
+        let decoded: NodeConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.job_lease().unwrap(), Duration::from_millis(1250));
+    }
+
+    #[test]
+    fn node_config_rejects_zero_and_overflowing_leases() {
+        let mut config = node_config();
+        for lease in [
+            0,
+            (i64::MAX / 1000) as u64,
+            (i64::MAX / 1000) as u64 + 1,
+            u64::MAX,
+        ] {
+            config.lease = Some(lease);
+            assert!(matches!(
+                config.job_lease(),
+                Err(Error::InvalidJobLease(ms)) if ms == lease
+            ));
+        }
+    }
+
+    #[test]
+    fn job_lifetime_requires_an_included_configuration_and_lease() {
+        let task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 0);
+        let mut config = node_config();
+        let mut job = Job::new(&task, Uuid::new_v4(), config.id, 0);
+        assert!(matches!(job.job_lease(), Err(Error::JobLeaseNotFound(1))));
+        job.node_config = None.into();
+        assert!(matches!(job.job_lease(), Err(Error::JobLeaseNotFound(1))));
+        job.node_config = Some(config.clone()).into();
+        assert!(matches!(job.job_lease(), Err(Error::JobLeaseNotFound(1))));
+
+        config.lease = Some(1250);
+        job.node_config = Some(config.clone()).into();
+        assert_eq!(job.job_lease().unwrap(), Duration::from_millis(1250));
+        assert_eq!(job.expired_at, None);
+        config.lease = Some(0);
+        job.node_config = Some(config).into();
+        assert!(matches!(job.job_lease(), Err(Error::InvalidJobLease(0))));
+    }
+
+    #[test]
+    fn unloaded_job_relations_round_trip_without_becoming_loaded() {
+        let task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 0);
+        let mut job = Job::new(&task, Uuid::new_v4(), 1, 0);
+        let encoded = serde_json::to_value(&job).unwrap();
+        for field in ["run", "node_run", "node_config"] {
+            assert!(encoded.get(field).is_none());
+        }
+        let decoded: Job = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.run.is_unloaded());
+        assert!(decoded.node_run.is_unloaded());
+        assert!(decoded.node_config.is_unloaded());
+        job.node_config = None.into();
+        let encoded = serde_json::to_value(job).unwrap();
+        assert_eq!(encoded.get("node_config"), Some(&serde_json::Value::Null));
+        let decoded: Job = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.node_config.is_unloaded());
+        assert!(decoded.node_config.get().is_none());
+    }
+
+    #[test]
+    fn job_expiry_round_trips_independently_of_poll_time_and_config() {
+        let task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 0);
+        let mut config = node_config();
+        config.lease = Some(1250);
+        let mut job = Job::new(&task, Uuid::new_v4(), config.id, 0);
+        job.node_config = Some(config.clone()).into();
+        assert!(job.expired_at.is_none());
+        let polled_at: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        job.polled_at = Some(polled_at);
+        let expired_at = polled_at + Duration::from_millis(1250);
+        job.expired_at = Some(expired_at);
+        let encoded = serde_json::to_value(&job).unwrap();
+        assert_eq!(
+            encoded["expired_at"],
+            serde_json::to_value(expired_at).unwrap()
+        );
+        let decoded: Job = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.expired_at, Some(expired_at));
+        assert_eq!(decoded.node_config.get().as_ref(), Some(&config));
+        assert_eq!(decoded.job_lease().unwrap(), Duration::from_millis(1250));
+        job.polled_at = Some(polled_at - Duration::from_secs(60));
+        job.node_config = None.into();
+        assert_eq!(job.expired_at, Some(expired_at));
+        job.expired_at = None;
+        assert_eq!(job.expired_at, None);
     }
 }

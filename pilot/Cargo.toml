@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 event = { workspace = true }
 config = { workspace = true }
+jiff = { workspace = true }
 coordinator = { workspace = true, features = ["mysql"] }
 runtime = { workspace = true }
 scheduler = { workspace = true }
@@ -16,3 +17,6 @@ thiserror = { workspace = true }
 toasty = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

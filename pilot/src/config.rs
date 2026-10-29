@@ -27,12 +27,12 @@ fn default_leader_lease_ms() -> u64 {
     10_000
 }
 
-fn default_job_lease_ms() -> u64 {
-    scheduler::DEFAULT_JOB_LEASE.as_millis() as u64
-}
-
 fn default_gap_timeout_ms() -> u64 {
     event::poll::Config::default().gap_timeout.as_millis() as u64
+}
+
+fn default_job_timeout_gap() -> Duration {
+    Duration::from_secs(10)
 }
 
 /// Runtime configuration for the pilot binary.
@@ -53,12 +53,15 @@ pub struct Config {
     /// Leader lease duration in milliseconds.
     #[serde(default = "default_leader_lease_ms")]
     pub leader_lease_ms: u64,
-    /// Duration of an agent job claim without polling. Match the server.
-    #[serde(default = "default_job_lease_ms")]
-    pub job_lease_ms: u64,
     /// How long a missing log offset must remain absent before it is skipped.
     #[serde(default = "default_gap_timeout_ms")]
     pub gap_timeout_ms: u64,
+    /// Grace period before the pilot fails a job whose runtime has expired.
+    #[serde(
+        default = "default_job_timeout_gap",
+        with = "jiff::fmt::serde::unsigned_duration::required"
+    )]
+    pub job_timeout_gap: Duration,
 }
 
 impl Default for Config {
@@ -69,8 +72,8 @@ impl Default for Config {
             poll_interval_ms: default_poll_interval_ms(),
             leader_name: default_leader_name(),
             leader_lease_ms: default_leader_lease_ms(),
-            job_lease_ms: default_job_lease_ms(),
             gap_timeout_ms: default_gap_timeout_ms(),
+            job_timeout_gap: default_job_timeout_gap(),
         }
     }
 }
@@ -138,14 +141,17 @@ impl Config {
                 "poll_interval_ms must be less than leader_lease_ms".to_string(),
             ));
         }
-        if self.job_lease_ms == 0 || self.job_lease_ms > (i64::MAX / 1000) as u64 {
-            return Err(ConfigError::Message(
-                "job_lease_ms must fit in a positive signed microsecond count".into(),
-            ));
-        }
         if self.gap_timeout_ms == 0 {
             return Err(ConfigError::Message(
                 "gap_timeout_ms must be positive".into(),
+            ));
+        }
+        if jiff::Timestamp::now()
+            .checked_sub(self.job_timeout_gap)
+            .is_err()
+        {
+            return Err(ConfigError::Message(
+                "job_timeout_gap is outside timestamp range".into(),
             ));
         }
         Ok(())
@@ -159,11 +165,6 @@ impl Config {
     /// Returns the leader lease duration.
     pub fn leader_lease(&self) -> Duration {
         Duration::from_millis(self.leader_lease_ms)
-    }
-
-    /// Returns the agent job claim duration.
-    pub fn job_lease(&self) -> Duration {
-        Duration::from_millis(self.job_lease_ms)
     }
 
     /// Returns the timeout for missing event-log offsets.
@@ -204,19 +205,35 @@ mod tests {
     fn configurable_timeouts_are_validated() {
         let mut config = Config {
             database_url: "mysql://localhost/rayflow".into(),
-            job_lease_ms: 1250,
             gap_timeout_ms: 2000,
             ..Config::default()
         };
         assert!(config.validate().is_ok());
-        assert_eq!(config.job_lease(), Duration::from_millis(1250));
         assert_eq!(config.gap_timeout(), Duration::from_secs(2));
-        for timeout in [0, u64::MAX] {
-            config.job_lease_ms = timeout;
-            assert!(config.validate().is_err());
-        }
-        config.job_lease_ms = 1250;
         config.gap_timeout_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn job_timeout_gap_accepts_duration_strings_and_zero() {
+        assert_eq!(Config::default().job_timeout_gap, Duration::from_secs(10));
+        for (value, expected) in [
+            ("1.5s", Duration::from_millis(1500)),
+            ("0s", Duration::ZERO),
+        ] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "database_url": "mysql://localhost/rayflow",
+                "job_timeout_gap": value,
+            }))
+            .unwrap();
+            assert_eq!(config.job_timeout_gap, expected);
+            assert!(config.validate().is_ok());
+        }
+        let config = Config {
+            database_url: "mysql://localhost/rayflow".into(),
+            job_timeout_gap: Duration::MAX,
+            ..Config::default()
+        };
         assert!(config.validate().is_err());
     }
 }

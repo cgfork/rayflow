@@ -24,8 +24,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         config.leader_lease(),
     );
     let mut pilot = Pilot::new(election, backend, config.batch, config.poll_interval())
-        .with_job_lease(config.job_lease())
-        .with_gap_timeout(config.gap_timeout());
+        .with_gap_timeout(config.gap_timeout())
+        .with_job_timeout_gap(config.job_timeout_gap);
 
     println!(
         "rayflow pilot {node_id} competing for coordinator role '{}'",

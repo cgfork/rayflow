@@ -25,8 +25,7 @@ use runtime::backend::Backend;
 use runtime::backend::Status;
 use runtime::command::{NodeRun, Run};
 use scheduler::{
-    Actuator, DEFAULT_JOB_LEASE, ResourceCapacity, TaskEvent, TaskEventEntry, poll_polled,
-    poll_scheduled,
+    Actuator, AgentRef, JobPoll, ResourceCapacity, TaskEvent, TaskEventEntry, actuator::NodeConfig,
 };
 use toasty::Db;
 use uuid::Uuid;
@@ -74,7 +73,7 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
 
     let mut builder = Db::builder();
     builder.models(scheduler::models());
-    let db = builder
+    let mut db = builder
         .connect(&url)
         .await
         .expect("connect to DATABASE_URL");
@@ -100,7 +99,178 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
             (d.id, e.id),
         ],
     };
+    for node in &dag.nodes {
+        let now = jiff::Timestamp::now();
+        NodeConfig::create()
+            .node_id(node.id)
+            .version(1)
+            .annotation_match(String::new())
+            .config(serde_json::json!({}))
+            .lease(Some(30_000))
+            .required_cpu_cores(0)
+            .required_memory_bytes(0)
+            .created_at(now)
+            .updated_at(now)
+            .created_by(String::new())
+            .updated_by(String::new())
+            .exec(&mut db)
+            .await
+            .unwrap();
+    }
     Some((db, dag, Uuid::new_v4()))
+}
+
+#[tokio::test]
+async fn yielded_jobs_end_and_resume_creates_new_tasks_in_the_same_node_run() {
+    use scheduler::{Job, actuator::Status as JobStatus, fail_expired_in, yield_job};
+
+    let Some((mut db, dag, data_id)) = setup().await else {
+        return;
+    };
+    let graph_id = dag.id;
+    let node = dag.nodes[0].id;
+    let backend = Backend::new(db.clone(), TestGraphStore(dag));
+    let mut actuator = Actuator::new(backend.clone(), 64);
+    CommandEntry::new(data_id, graph_id, Command::Start { nodes: vec![node] })
+        .emit(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(actuator.tick().await.unwrap().tasks, 1);
+    let agent_id = Uuid::new_v4();
+    let capacity = ResourceCapacity {
+        cpu_cores: 1,
+        memory_bytes: 1,
+    };
+    let mut job = AgentRef::new(agent_id, capacity, Vec::new())
+        .poll(&mut db, 1)
+        .await
+        .unwrap()
+        .next()
+        .unwrap();
+    let node_run_id = job.node_run_id;
+    let revision = job.node_run.get().revision;
+    for use_status_report in [true, false] {
+        let mut active = AgentRef::new(agent_id, capacity, vec![job.uuid]);
+        assert!(active.poll(&mut db, 0).await.unwrap().next().is_none());
+        assert_eq!(
+            Job::filter_by_id(job.id)
+                .get(&mut db)
+                .await
+                .unwrap()
+                .expired_at
+                .unwrap()
+                .as_microsecond(),
+            job.expired_at.unwrap().as_microsecond()
+        );
+        assert_eq!(
+            node_run(&mut db, node).await,
+            (revision, "Running".to_owned())
+        );
+        if use_status_report {
+            yield_job(&mut db, job.uuid, agent_id).await.unwrap();
+            yield_job(&mut db, job.uuid, agent_id).await.unwrap();
+        } else {
+            TaskEventEntry::new(job.task.get(), TaskEvent::Yield)
+                .emit(&mut db)
+                .await
+                .unwrap();
+        }
+        assert_eq!(actuator.tick().await.unwrap().events, 1);
+        assert_eq!(
+            node_run(&mut db, node).await,
+            (revision, "Pending".to_owned())
+        );
+        let yielded = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
+        assert_eq!(yielded.status, JobStatus::Yielded);
+        assert!(yielded.status.is_terminal());
+        assert!(yielded.agent_id.is_none() && yielded.polled_at.is_none());
+        assert_eq!(
+            yielded.expired_at.unwrap().as_microsecond(),
+            job.expired_at.unwrap().as_microsecond()
+        );
+        assert_eq!(
+            fail_expired_in(&mut db, std::time::Duration::ZERO)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            AgentRef::new(agent_id, capacity, vec![job.uuid])
+                .poll(&mut db, 1)
+                .await
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(active.poll(&mut db, 0).await.unwrap().next().is_none());
+        assert!(
+            scheduler::succeed_job(&mut db, job.uuid, agent_id)
+                .await
+                .is_err()
+        );
+        let task_count = Task::all().exec(&mut db).await.unwrap().len();
+        let job_count = Job::all().exec(&mut db).await.unwrap().len();
+        CommandEntry::new(data_id, graph_id, Command::Resume { node })
+            .emit(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(consume_commands(&mut db, &backend).await, 1);
+        assert_eq!(
+            node_run(&mut db, node).await,
+            (revision, "Ready".to_owned())
+        );
+        assert_eq!(
+            Task::all().exec(&mut db).await.unwrap().len(),
+            task_count + 1
+        );
+        let mut tx = db.transaction().await.unwrap();
+        let step = actuator.tick_in(&mut tx).await.unwrap();
+        assert_eq!(step.tasks, 1);
+        assert_eq!(step.commands, 0);
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            node_run(&mut db, node).await,
+            (revision, "Ready".to_owned())
+        );
+        assert_eq!(Job::all().exec(&mut db).await.unwrap().len(), job_count);
+        let step = actuator.tick().await.unwrap();
+        assert_eq!(step.tasks, 1);
+        assert_eq!(step.commands, 0);
+        assert_eq!(
+            Task::all().exec(&mut db).await.unwrap().len(),
+            task_count + 1
+        );
+        assert_eq!(Job::all().exec(&mut db).await.unwrap().len(), job_count + 1);
+        assert!(Task::poll(&mut db, 1).await.unwrap().next().is_none());
+        assert_eq!(
+            node_run(&mut db, node).await,
+            (revision, "Running".to_owned())
+        );
+        let resumed = AgentRef::new(agent_id, capacity, Vec::new())
+            .poll(&mut db, 1)
+            .await
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_ne!(resumed.uuid, job.uuid);
+        assert_ne!(resumed.task_id, job.task_id);
+        assert_eq!(resumed.node_run_id, node_run_id);
+        yield_job(&mut db, job.uuid, agent_id).await.unwrap();
+        assert_eq!(actuator.tick().await.unwrap().events, 0);
+        assert_eq!(
+            Job::filter_by_id(job.id).get(&mut db).await.unwrap().status,
+            JobStatus::Yielded
+        );
+        job = resumed;
+    }
+    scheduler::succeed_job(&mut db, job.uuid, agent_id)
+        .await
+        .unwrap();
+    actuator.tick().await.unwrap();
+    assert_eq!(
+        node_run(&mut db, node).await,
+        (revision, "Succeeded".to_owned())
+    );
 }
 
 /// Writes `Start` to the command log, then consumes and applies it.
@@ -136,25 +306,18 @@ async fn run_to_quiescence(
     let mut total = 0;
     loop {
         let step = actuator.tick().await.expect("actuate");
-        let mut tx = db.transaction().await.expect("begin job poll");
-        let (mut tasks, reserved) =
-            poll_polled(&mut tx, Uuid::from_u128(1), &[], 16, DEFAULT_JOB_LEASE)
-                .await
-                .expect("poll previously claimed jobs");
-        let remaining = ResourceCapacity {
-            cpu_cores: ResourceCapacity::default()
-                .cpu_cores
-                .saturating_sub(reserved.cpu_cores),
-            memory_bytes: ResourceCapacity::default()
-                .memory_bytes
-                .saturating_sub(reserved.memory_bytes),
-        };
-        tasks.extend(
-            poll_scheduled(&mut tx, Uuid::from_u128(1), remaining, 16 - tasks.len())
-                .await
-                .expect("claim scheduled jobs"),
-        );
-        tx.commit().await.expect("commit job poll");
+        let tasks: Vec<_> = AgentRef::new(
+            Uuid::from_u128(1),
+            ResourceCapacity {
+                cpu_cores: 1,
+                memory_bytes: 1,
+            },
+            Vec::new(),
+        )
+        .poll(db, 16)
+        .await
+        .expect("poll jobs")
+        .collect();
         total += tasks.len();
         for record in &tasks {
             let task = Task::filter_by_id(record.task_id).get(db).await.unwrap();
@@ -261,6 +424,7 @@ async fn actuator_rollback_preserves_tasks_and_graph_state() {
     let mut actuator = Actuator::new(backend, 16);
     let mut tx = db.transaction().await.unwrap();
     let step = actuator.tick_in(&mut tx).await.unwrap();
+    assert_eq!(step.commands, 0);
     assert_eq!(step.tasks, pending.len());
     assert_eq!(step.events, 0);
     assert_eq!(

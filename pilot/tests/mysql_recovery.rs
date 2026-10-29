@@ -10,9 +10,11 @@ use event::task::Task;
 use event::task_event::TaskEventEntry;
 use pilot::Pilot;
 use runtime::{backend::Backend, command::Run};
-use scheduler::{DEFAULT_JOB_LEASE, JobRead, ResourceCapacity, poll_polled, poll_scheduled};
+use scheduler::{AgentRef, JobPoll, JobRead, ResourceCapacity};
 use server::StaticGraphStore;
 use uuid::Uuid;
+
+mod support;
 
 const AGENT: Uuid = Uuid::from_u128(1);
 
@@ -30,6 +32,7 @@ async fn interrupted_command_application_can_be_retried() {
     db.push_schema().await.unwrap();
     let data_id = Uuid::new_v4();
     let graph_id = Uuid::parse_str("00000001-0000-0000-0000-000000000000").unwrap();
+    support::configure_graph(&mut db, graph_id).await;
     CommandEntry::new(data_id, graph_id, Command::Start { nodes: vec![] })
         .emit(&mut db)
         .await
@@ -81,8 +84,6 @@ async fn interrupted_command_application_can_be_retried() {
     })
     .await
     .expect("task becomes visible after the rolled-back offset gap");
-    // A replacement pilot consumes the pending task and commits its success
-    // together with the task and command acknowledgements.
     let election = MySqlLeaderElection::new(
         db.clone(),
         "recovery",
@@ -92,7 +93,7 @@ async fn interrupted_command_application_can_be_retried() {
     let mut pilot = Pilot::new(election, backend, 64, Duration::from_millis(10));
     let step = pilot.step().await.unwrap();
     assert!(step.tasks > 0);
-    assert!(step.commands > 0);
+    assert_eq!(step.commands, 0);
 
     // Actuation commits an available job, without fabricating completion.
     let scheduled = scheduler::Job::read(&mut db, task.id).await.unwrap();
@@ -105,24 +106,18 @@ async fn interrupted_command_application_can_be_retried() {
             .unwrap()
             .is_empty()
     );
-    let mut tx = db.transaction().await.unwrap();
-    let (mut claimed, reserved) = poll_polled(&mut tx, AGENT, &[], 64, DEFAULT_JOB_LEASE)
-        .await
-        .unwrap();
-    let remaining = ResourceCapacity {
-        cpu_cores: ResourceCapacity::default()
-            .cpu_cores
-            .saturating_sub(reserved.cpu_cores),
-        memory_bytes: ResourceCapacity::default()
-            .memory_bytes
-            .saturating_sub(reserved.memory_bytes),
-    };
-    claimed.extend(
-        poll_scheduled(&mut tx, AGENT, remaining, 64 - claimed.len())
-            .await
-            .unwrap(),
-    );
-    tx.commit().await.unwrap();
+    let claimed: Vec<_> = AgentRef::new(
+        AGENT,
+        ResourceCapacity {
+            cpu_cores: 1,
+            memory_bytes: 1,
+        },
+        Vec::new(),
+    )
+    .poll(&mut db, 64)
+    .await
+    .unwrap()
+    .collect();
     assert!(claimed.iter().any(|row| row.task_id == task.id));
     let event = TaskEventEntry::new(&task, event::task_event::TaskEvent::Succeed);
     event.emit(&mut db).await.unwrap();

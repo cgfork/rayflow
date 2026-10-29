@@ -14,9 +14,8 @@ use graph::types::DAG;
 use jiff::Timestamp;
 use runtime::command::{NodeRun, Run};
 use scheduler::{
-    Actuator, AgentScheduler, DEFAULT_JOB_LEASE, Job, JobWrite, ResourceCapacity, Scheduler,
+    Actuator, AgentRef, AgentScheduler, Job, JobPoll, JobWrite, ResourceCapacity, Scheduler,
     actuator::{NodeConfig, Status},
-    poll_polled, poll_scheduled,
 };
 use toasty::Db;
 use uuid::Uuid;
@@ -61,6 +60,7 @@ async fn configured_job(
         .version(1)
         .annotation_match(String::new())
         .config(serde_json::json!({}))
+        .lease(Some(30_000))
         .required_cpu_cores(cpu_cores)
         .required_memory_bytes(memory_bytes)
         .created_at(now)
@@ -78,42 +78,20 @@ async fn configured_job(
     (task, job)
 }
 
-async fn poll_jobs_with_lease(
-    db: &mut Db,
-    agent_id: Uuid,
-    capacity: ResourceCapacity,
-    maximum: usize,
-    lease: Duration,
-) -> Result<Vec<Job>, scheduler::Error> {
-    let mut tx = db.transaction().await?;
-    let (mut polled, reserved) = poll_polled(&mut tx, agent_id, &[], maximum, lease).await?;
-    let remaining = ResourceCapacity {
-        cpu_cores: capacity.cpu_cores.saturating_sub(reserved.cpu_cores),
-        memory_bytes: capacity.memory_bytes.saturating_sub(reserved.memory_bytes),
-    };
-    let scheduled = poll_scheduled(
-        &mut tx,
-        agent_id,
-        remaining,
-        maximum.saturating_sub(polled.len()),
-    )
-    .await?;
-    polled.extend(scheduled);
-    tx.commit().await?;
-    Ok(polled)
-}
-
-async fn poll_jobs(
+async fn poll(
     db: &mut Db,
     agent_id: Uuid,
     capacity: ResourceCapacity,
     maximum: usize,
 ) -> Result<Vec<Job>, scheduler::Error> {
-    poll_jobs_with_lease(db, agent_id, capacity, maximum, DEFAULT_JOB_LEASE).await
+    Ok(AgentRef::new(agent_id, capacity, Vec::new())
+        .poll(db, maximum)
+        .await?
+        .collect())
 }
 
 #[tokio::test]
-async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs() {
+async fn direct_poll_matches_resources_reserves_claims_and_fails_expired_jobs() {
     let Some(mut db) = setup().await else {
         eprintln!("skipping: set DATABASE_URL to run MySQL agent polling tests");
         return;
@@ -154,7 +132,7 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
         cpu_cores: 4,
         memory_bytes: 1024,
     };
-    let claimed = poll_jobs(&mut db, agent_a, capacity_a, 10)
+    let claimed = poll(&mut db, agent_a, capacity_a, 10)
         .await
         .expect("poll jobs");
     assert_eq!(
@@ -162,7 +140,7 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
         vec![job_a.id, job_b.id]
     );
     assert!(claimed.iter().all(|job| job.agent_id == Some(agent_a)));
-    let redelivered = poll_jobs(&mut db, agent_a, capacity_a, 10).await.unwrap();
+    let redelivered = poll(&mut db, agent_a, capacity_a, 10).await.unwrap();
     assert_eq!(
         redelivered.iter().map(|job| job.id).collect::<Vec<_>>(),
         vec![job_a.id, job_b.id]
@@ -170,24 +148,32 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
     for job in &claimed {
         Job::filter_by_id(job.id)
             .update()
-            .status(Status::Pending)
+            .status(Status::Polled)
             .exec(&mut db)
             .await
             .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(2)).await;
+    let before_active = Job::filter_by_id(job_a.id).get(&mut db).await.unwrap();
     assert!(
-        poll_jobs(&mut db, agent_a, capacity_a, 10)
-            .await
-            .unwrap()
-            .is_empty(),
+        AgentRef::new(
+            agent_a,
+            capacity_a,
+            claimed.iter().map(|job| job.uuid).collect()
+        )
+        .poll(&mut db, 10)
+        .await
+        .unwrap()
+        .next()
+        .is_none(),
         "the active claims consume all of the agent's resource budget"
     );
     let renewed = Job::filter_by_id(job_a.id).get(&mut db).await.unwrap();
-    assert!(renewed.polled_at.unwrap() >= claimed[0].polled_at.unwrap());
+    assert_eq!(renewed.polled_at, before_active.polled_at);
+    assert_eq!(renewed.expired_at, before_active.expired_at);
 
     let agent_b = Uuid::new_v4();
-    let claimed_c = poll_jobs(
+    let claimed_c = poll(
         &mut db,
         agent_b,
         ResourceCapacity {
@@ -201,32 +187,37 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
     assert_eq!(claimed_c.len(), 1);
     assert_eq!(claimed_c[0].id, job_c.id);
 
-    let expired_at = Timestamp::now() - Duration::from_secs(2);
+    let expired_at = Timestamp::now() - Duration::from_secs(60);
     Job::filter_by_id(job_a.id)
         .update()
         .polled_at(Some(expired_at))
+        .expired_at(Some(expired_at + Duration::from_secs(30)))
         .exec(&mut db)
         .await
         .expect("expire one claim");
-    assert_eq!(
-        AgentScheduler::new()
-            .with_lease(Duration::from_secs(1))
-            .schedule(&mut db)
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(AgentScheduler::new().schedule(&mut db).await.unwrap(), 1);
     let expired = Job::filter_by_id(job_a.id).get(&mut db).await.unwrap();
-    assert_eq!(expired.status, Status::Scheduled);
+    assert_eq!(expired.status, Status::Failed);
     assert!(expired.agent_id.is_none());
     assert!(expired.polled_at.is_none());
+    assert_eq!(
+        expired.expired_at.unwrap().as_microsecond(),
+        (expired_at + Duration::from_secs(30)).as_microsecond()
+    );
+
+    let replacement = Job::new(&task_a, run.uuid, job_a.node_config_id, job_a.run_config_id);
+    replacement.write(&mut db).await.unwrap();
+    let job_a = Job::filter_by_uuid(replacement.uuid)
+        .get(&mut db)
+        .await
+        .unwrap();
 
     let agent_c = Uuid::new_v4();
     let agent_d = Uuid::new_v4();
     let mut db_c = db.clone();
     let mut db_d = db.clone();
     let (left, right) = tokio::join!(
-        poll_jobs(
+        poll(
             &mut db_c,
             agent_c,
             ResourceCapacity {
@@ -235,7 +226,7 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
             },
             10,
         ),
-        poll_jobs(
+        poll(
             &mut db_d,
             agent_d,
             ResourceCapacity {
@@ -249,7 +240,7 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
     let right = right.unwrap();
     assert_eq!(left.len() + right.len(), 1);
     let owner = if left.is_empty() { agent_d } else { agent_c };
-    Actuator::<DAG>::settle(&mut db, &TaskEventEntry::new(&task_a, TaskEvent::Pend))
+    Actuator::<DAG>::settle(&mut db, &TaskEventEntry::new(&task_a, TaskEvent::Yield))
         .await
         .unwrap();
     assert_eq!(
@@ -258,16 +249,17 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
             .await
             .unwrap()
             .status,
-        Status::Polled
+        Status::Yielded
     );
     let settled_event = TaskEventEntry::new(&task_a, TaskEvent::Succeed);
     Actuator::<DAG>::settle(&mut db, &settled_event)
         .await
         .expect("settle job");
     let settled = Job::filter_by_id(job_a.id).get(&mut db).await.unwrap();
-    assert_eq!(settled.status, Status::Succeeded);
+    assert_eq!(settled.status, Status::Yielded);
     assert!(settled.agent_id.is_none());
     assert!(settled.polled_at.is_none());
+    assert!(settled.expired_at.is_some());
     if owner == agent_c {
         assert_eq!(left[0].id, job_a.id);
     } else {
@@ -278,11 +270,11 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
     // external scheduler that does not use agent polling leases.
     let mut protected = Vec::new();
     for status in [
+        Status::Yielded,
         Status::Succeeded,
         Status::Failed,
         Status::Terminated,
         Status::Polled,
-        Status::Pending,
     ] {
         let mut job = Job::new(
             &Task::new(data_id, graph_id, Uuid::new_v4(), 0),
@@ -306,26 +298,34 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
         );
     }
 
-    // The polling endpoint also recovers abandoned claims using its lease.
+    // Polling leaves timeout handling to the pilot.
     Job::filter_by_id(job_b.id)
         .update()
-        .status(Status::Pending)
+        .status(Status::Polled)
         .polled_at(Some(expired_at))
+        .expired_at(Some(expired_at + Duration::from_secs(30)))
         .exec(&mut db)
         .await
         .unwrap();
-    let recovered = poll_jobs_with_lease(
-        &mut db,
-        Uuid::new_v4(),
-        capacity_a,
-        1,
-        Duration::from_secs(1),
-    )
-    .await
-    .unwrap();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].id, job_b.id);
-    assert_ne!(recovered[0].agent_id, Some(agent_a));
+    let recovered = poll(&mut db, Uuid::new_v4(), capacity_a, 1).await.unwrap();
+    assert!(recovered.is_empty());
+    assert_eq!(
+        Job::filter_by_id(job_b.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .status,
+        Status::Polled
+    );
+    assert_eq!(AgentScheduler::new().schedule(&mut db).await.unwrap(), 1);
+    assert_eq!(
+        Job::filter_by_id(job_b.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .status,
+        Status::Failed
+    );
 }
 
 #[tokio::test]
@@ -333,7 +333,50 @@ async fn poll_checks_both_resources_and_scans_past_unfitting_candidates() {
     let Some(mut db) = setup().await else {
         return;
     };
-    let task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 0);
+    let now = Timestamp::now();
+    let data_id = Uuid::new_v4();
+    let graph_id = Uuid::new_v4();
+    let run = Run::create()
+        .uuid(Uuid::new_v4())
+        .data_id(data_id)
+        .graph_id(graph_id)
+        .version(1)
+        .revision(1)
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let node_id = Uuid::new_v4();
+    let node_run = NodeRun::create()
+        .run_id(run.uuid)
+        .data_id(data_id)
+        .graph_id(graph_id)
+        .node_id(node_id)
+        .revision(1)
+        .status("Running".to_owned())
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let task = Task::new(data_id, graph_id, node_id, node_run.id);
+    task.emit(&mut db).await.unwrap();
+    let config = NodeConfig::create()
+        .node_id(task.node_id)
+        .version(1)
+        .annotation_match(String::new())
+        .config(serde_json::json!({}))
+        .lease(Some(30_000))
+        .required_cpu_cores(0)
+        .required_memory_bytes(0)
+        .created_at(now)
+        .updated_at(now)
+        .created_by(String::new())
+        .updated_by(String::new())
+        .exec(&mut db)
+        .await
+        .unwrap();
     let mut expected = Vec::new();
     // After the first fit, a full page of candidates exceeds the remaining
     // budget. The tiny job after that page must still be considered.
@@ -342,7 +385,7 @@ async fn poll_checks_both_resources_and_scans_past_unfitting_candidates() {
         .chain(std::iter::repeat_n((2, 2), 128))
         .chain([(1, 1)]);
     for (cpu, memory) in requirements {
-        let mut job = Job::new(&task, Uuid::new_v4(), 0, 0);
+        let mut job = Job::new(&task, run.uuid, config.id, 0);
         job.required_cpu_cores = cpu;
         job.required_memory_bytes = memory;
         if cpu == 3 || cpu == 1 {
@@ -355,13 +398,8 @@ async fn poll_checks_both_resources_and_scans_past_unfitting_candidates() {
         cpu_cores: 4,
         memory_bytes: 4,
     };
-    assert!(
-        poll_jobs(&mut db, agent, capacity, 0)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let claimed = poll_jobs(&mut db, agent, capacity, 1000).await.unwrap();
+    assert!(poll(&mut db, agent, capacity, 0).await.unwrap().is_empty());
+    let claimed = poll(&mut db, agent, capacity, 1000).await.unwrap();
     assert_eq!(
         claimed.iter().map(|job| job.uuid).collect::<Vec<_>>(),
         expected
@@ -376,7 +414,7 @@ async fn poll_checks_both_resources_and_scans_past_unfitting_candidates() {
     for job in &claimed {
         Job::filter_by_id(job.id)
             .update()
-            .status(Status::Pending)
+            .status(Status::Polled)
             .exec(&mut db)
             .await
             .unwrap();
@@ -389,18 +427,325 @@ async fn poll_checks_both_resources_and_scans_past_unfitting_candidates() {
         4
     );
     assert!(
-        poll_jobs(&mut db, agent, capacity, 1)
+        AgentRef::new(
+            agent,
+            capacity,
+            claimed.iter().map(|job| job.uuid).collect()
+        )
+        .poll(&mut db, 1)
+        .await
+        .unwrap()
+        .next()
+        .is_none()
+    );
+
+    // Exhausted capacity stops polling, even for a job with no resource requirements.
+    let free = Job::new(&task, run.uuid, config.id, 0);
+    free.write(&mut db).await.unwrap();
+    assert!(
+        poll(&mut db, Uuid::new_v4(), ResourceCapacity::default(), 1)
             .await
             .unwrap()
             .is_empty()
     );
-
-    // Zero capacity permits only a job with no resource requirements.
-    let free = Job::new(&task, Uuid::new_v4(), 0, 0);
-    free.write(&mut db).await.unwrap();
-    let claimed = poll_jobs(&mut db, Uuid::new_v4(), ResourceCapacity::default(), 1)
-        .await
-        .unwrap();
+    let claimed = poll(
+        &mut db,
+        Uuid::new_v4(),
+        ResourceCapacity {
+            cpu_cores: 1,
+            memory_bytes: 1,
+        },
+        1,
+    )
+    .await
+    .unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].uuid, free.uuid);
+}
+
+async fn lease_config(db: &mut Db, node_id: Uuid, lease: Option<u64>) -> NodeConfig {
+    let now = Timestamp::now();
+    NodeConfig::create()
+        .node_id(node_id)
+        .version(1)
+        .annotation_match(String::new())
+        .config(serde_json::json!({}))
+        .lease(lease)
+        .required_cpu_cores(0)
+        .required_memory_bytes(0)
+        .created_at(now)
+        .updated_at(now)
+        .created_by(String::new())
+        .updated_by(String::new())
+        .exec(db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn job_creation_requires_a_valid_node_config_lease() {
+    let Some(mut db) = setup().await else {
+        return;
+    };
+    let now = Timestamp::now();
+    let data_id = Uuid::new_v4();
+    let graph_id = Uuid::new_v4();
+    let node_id = Uuid::new_v4();
+    let run = Run::create()
+        .uuid(Uuid::new_v4())
+        .data_id(data_id)
+        .graph_id(graph_id)
+        .version(1)
+        .revision(1)
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let node_run = NodeRun::create()
+        .run_id(run.uuid)
+        .data_id(data_id)
+        .graph_id(graph_id)
+        .node_id(node_id)
+        .revision(1)
+        .status("Running".to_owned())
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let task = Task::new(data_id, graph_id, node_id, node_run.id);
+    task.emit(&mut db).await.unwrap();
+    assert!(matches!(
+        Job::create_for_task(&task, &mut db).await,
+        Err(scheduler::Error::JobLeaseNotFound(0))
+    ));
+    let config = lease_config(&mut db, node_id, None).await;
+    assert!(matches!(
+        Job::create_for_task(&task, &mut db).await,
+        Err(scheduler::Error::JobLeaseNotFound(id)) if id == config.id
+    ));
+    for lease in [0, u64::MAX] {
+        NodeConfig::filter_by_id(config.id)
+            .update()
+            .lease(Some(lease))
+            .exec(&mut db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            Job::create_for_task(&task, &mut db).await,
+            Err(scheduler::Error::InvalidJobLease(ms)) if ms == lease
+        ));
+    }
+    assert!(Job::all().exec(&mut db).await.unwrap().is_empty());
+    NodeConfig::filter_by_id(config.id)
+        .update()
+        .lease(Some(1250))
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let job = Job::create_for_task(&task, &mut db).await.unwrap();
+    assert_eq!(job.node_config_id, config.id);
+}
+
+#[tokio::test]
+async fn missing_leases_return_errors_and_roll_back_polling() {
+    let Some(mut db) = setup().await else {
+        return;
+    };
+    let now = Timestamp::now();
+    let data_id = Uuid::new_v4();
+    let graph_id = Uuid::new_v4();
+    let run = Run::create()
+        .uuid(Uuid::new_v4())
+        .data_id(data_id)
+        .graph_id(graph_id)
+        .version(1)
+        .revision(1)
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let node_id = Uuid::new_v4();
+    let node_run = NodeRun::create()
+        .run_id(run.uuid)
+        .data_id(data_id)
+        .graph_id(graph_id)
+        .node_id(node_id)
+        .revision(1)
+        .status("Running".to_owned())
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let task = Task::new(data_id, graph_id, node_id, node_run.id);
+    task.emit(&mut db).await.unwrap();
+    let config = lease_config(&mut db, task.node_id, Some(30_000)).await;
+    let missing = lease_config(&mut db, Uuid::new_v4(), None).await;
+    let valid = Job::new(&task, run.uuid, config.id, 0);
+    valid.write(&mut db).await.unwrap();
+    let valid = Job::filter_by_uuid(valid.uuid).get(&mut db).await.unwrap();
+    let agent_id = Uuid::new_v4();
+    let mut agent = AgentRef::new(
+        agent_id,
+        ResourceCapacity {
+            cpu_cores: 1,
+            memory_bytes: 1,
+        },
+        Vec::new(),
+    );
+    for config_id in [0, missing.id, missing.id + 1000] {
+        let invalid = Job::new(&task, run.uuid, config_id, 0);
+        invalid.write(&mut db).await.unwrap();
+        assert!(matches!(agent.poll(&mut db, 2).await,
+            Err(scheduler::Error::JobLeaseNotFound(id)) if id == config_id));
+        let unchanged = Job::filter_by_id(valid.id).get(&mut db).await.unwrap();
+        assert_eq!(unchanged.status, Status::Scheduled);
+        assert!(unchanged.agent_id.is_none() && unchanged.polled_at.is_none());
+
+        for status in [Status::Polled] {
+            let now = Timestamp::now();
+            Job::filter_by_uuid(invalid.uuid)
+                .update()
+                .status(status)
+                .agent_id(Some(agent_id))
+                .polled_at(Some(now))
+                .exec(&mut db)
+                .await
+                .unwrap();
+            let before = Job::filter_by_uuid(invalid.uuid)
+                .get(&mut db)
+                .await
+                .unwrap();
+            let mut active =
+                AgentRef::new(agent_id, ResourceCapacity::default(), vec![invalid.uuid]);
+            assert_eq!(active.poll(&mut db, 0).await.unwrap().count(), 0);
+            assert_eq!(AgentScheduler::new().schedule(&mut db).await.unwrap(), 0);
+            for result in [
+                scheduler::yield_job(&mut db, invalid.uuid, agent_id).await,
+                scheduler::succeed_job(&mut db, invalid.uuid, agent_id).await,
+                scheduler::terminate_job(&mut db, invalid.uuid, agent_id).await,
+            ] {
+                assert!(matches!(result, Err(scheduler::Error::JobConflict(_))));
+            }
+            let unchanged = Job::filter_by_uuid(invalid.uuid)
+                .get(&mut db)
+                .await
+                .unwrap();
+            assert_eq!(unchanged.status, status);
+            assert_eq!(unchanged.polled_at, before.polled_at);
+        }
+        assert!(
+            TaskEventEntry::all()
+                .exec(&mut db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        Job::filter_by_uuid(invalid.uuid)
+            .update()
+            .status(Status::Terminated)
+            .agent_id(None)
+            .polled_at(None)
+            .expired_at(None)
+            .exec(&mut db)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn polling_limits_redelivery_and_reserves_all_owned_claims() {
+    let Some(mut db) = setup().await else {
+        return;
+    };
+    let now = Timestamp::now();
+    let run = Run::create()
+        .uuid(Uuid::new_v4())
+        .data_id(Uuid::new_v4())
+        .graph_id(Uuid::new_v4())
+        .version(1)
+        .revision(1)
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let mut jobs = Vec::new();
+    for _ in 0..3 {
+        let (_, job) = configured_job(&mut db, run.uuid, run.data_id, run.graph_id, 1, 1).await;
+        jobs.push(job);
+    }
+    let id = Uuid::new_v4();
+    let capacity = ResourceCapacity {
+        cpu_cores: 2,
+        memory_bytes: 2,
+    };
+    let mut agent = AgentRef::new(id, capacity, Vec::new());
+    let first: Vec<_> = agent.poll(&mut db, 2).await.unwrap().collect();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].task.get().id, first[0].task_id);
+    assert_eq!(first[0].run.get().uuid, run.uuid);
+    assert_eq!(first[0].node_run.get().id, first[0].node_run_id);
+    assert_eq!(
+        first[0].node_config.get().as_ref().unwrap().id,
+        first[0].node_config_id
+    );
+    assert!(first[0].run_config.get().is_none());
+    let mut agent = AgentRef::new(id, capacity, Vec::new());
+    let redelivered: Vec<_> = agent.poll(&mut db, 1).await.unwrap().collect();
+    assert_eq!(redelivered.len(), 1);
+    assert_eq!(redelivered[0].uuid, first[0].uuid);
+    assert_eq!(redelivered[0].task.get().id, first[0].task_id);
+    assert_eq!(redelivered[0].run.get().uuid, run.uuid);
+    assert_eq!(redelivered[0].node_run.get().id, first[0].node_run_id);
+    assert_eq!(
+        redelivered[0].node_config.get().as_ref().unwrap().id,
+        first[0].node_config_id
+    );
+    assert!(redelivered[0].run_config.get().is_none());
+    let before = Timestamp::now() - Duration::from_secs(5);
+    for job in &first {
+        Job::filter_by_id(job.id)
+            .update()
+            .status(Status::Polled)
+            .polled_at(Some(before))
+            .expired_at(Some(before + Duration::from_secs(30)))
+            .exec(&mut db)
+            .await
+            .unwrap();
+    }
+    let inactive = Job::filter_by_id(first[1].id).get(&mut db).await.unwrap();
+    let active_before = Job::filter_by_id(first[0].id).get(&mut db).await.unwrap();
+    let mut active = AgentRef::new(id, capacity, vec![first[0].uuid]);
+    assert_eq!(active.poll(&mut db, 0).await.unwrap().count(), 0);
+    assert_eq!(
+        Job::filter_by_id(first[0].id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .polled_at,
+        active_before.polled_at
+    );
+    assert_eq!(
+        Job::filter_by_id(first[1].id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .polled_at,
+        inactive.polled_at
+    );
+    let redelivered: Vec<_> = active.poll(&mut db, 3).await.unwrap().collect();
+    assert_eq!(redelivered.len(), 1);
+    assert_eq!(redelivered[0].uuid, inactive.uuid);
+    assert_eq!(
+        Job::filter_by_uuid(jobs[2].uuid)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .status,
+        Status::Scheduled
+    );
 }

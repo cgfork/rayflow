@@ -4,7 +4,7 @@
 //! [`crate::Read`], and [`crate::Poll`] with [`CommandEntry`]. Acknowledgements
 //! update only the shared `poll_offset` table. Entries remain append-only.
 //! Consumers must serialize polling and acknowledgements for the global cursor.
-//! The table layout matches `runtime.sql`; do not register another model for
+//! The table layout matches `rayflow.sql`; do not register another model for
 //! these same tables on the same database handle.
 
 use jiff::Timestamp;
@@ -25,6 +25,7 @@ pub enum Command {
     Dryrun { nodes: Vec<Uuid> },
     Run { node: Uuid },
     Pend { node: Uuid },
+    Resume { node: Uuid },
     Succeed { node: Uuid },
     Fail { node: Uuid },
     Cancel { node: Uuid },

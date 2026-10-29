@@ -4,8 +4,10 @@ use crate::{Error, models};
 use toasty::Db;
 
 /// The node status.
+/// Creating a node run or transitioning it to Ready creates its task.
+/// Moving to Running does not create another task.
 /// 1. Ready -> Running -> Succeeded/Failed/Terminated
-/// 2. Ready -> Running -> Pending -> Succeeded/Failed/Terminated
+/// 2. Ready -> Running -> Pending -> Ready -> Running (Resume creates a new task)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     Ready,

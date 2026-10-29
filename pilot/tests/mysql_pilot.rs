@@ -18,6 +18,101 @@ use server::StaticGraphStore;
 use toasty::Db;
 use uuid::Uuid;
 
+mod support;
+
+#[tokio::test]
+async fn leader_fails_expired_jobs_after_the_configured_gap_and_updates_nodes() {
+    use jiff::Timestamp;
+    use runtime::command::NodeRun;
+    use scheduler::{AgentRef, Job, JobPoll, ResourceCapacity, TaskEvent, actuator::Status};
+
+    let Some((mut db, backend)) = setup().await else {
+        return;
+    };
+    let role = format!("pilot-timeout-{}", Uuid::new_v4());
+    let election =
+        MySqlLeaderElection::new(db.clone(), role.clone(), "leader", Duration::from_secs(30));
+    let standby_election =
+        MySqlLeaderElection::new(db.clone(), role, "standby", Duration::from_secs(30));
+    let mut leader = Pilot::new(election, backend.clone(), 64, Duration::from_millis(10))
+        .with_job_timeout_gap(Duration::from_secs(10));
+    let mut standby = Pilot::new(standby_election, backend, 64, Duration::from_millis(10));
+    let graph_id = Uuid::parse_str("00000001-0000-0000-0000-000000000000").unwrap();
+    support::configure_graph(&mut db, graph_id).await;
+    CommandEntry::new(
+        Uuid::new_v4(),
+        graph_id,
+        Command::Start { nodes: Vec::new() },
+    )
+    .emit(&mut db)
+    .await
+    .unwrap();
+    leader.step().await.unwrap();
+    let job = AgentRef::new(
+        Uuid::new_v4(),
+        ResourceCapacity {
+            cpu_cores: 1,
+            memory_bytes: 1,
+        },
+        vec![],
+    )
+    .poll(&mut db, 1)
+    .await
+    .unwrap()
+    .next()
+    .unwrap();
+    Job::filter_by_id(job.id)
+        .update()
+        .expired_at(Some(Timestamp::now() - Duration::from_secs(1)))
+        .exec(&mut db)
+        .await
+        .unwrap();
+    leader.step().await.unwrap();
+    assert_eq!(
+        Job::filter_by_id(job.id).get(&mut db).await.unwrap().status,
+        Status::Polled
+    );
+    Job::filter_by_id(job.id)
+        .update()
+        .expired_at(Some(Timestamp::now() - Duration::from_secs(20)))
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(standby.step().await.unwrap(), Step::default());
+    assert_eq!(
+        Job::filter_by_id(job.id).get(&mut db).await.unwrap().status,
+        Status::Polled
+    );
+    leader.step().await.unwrap();
+    assert_eq!(
+        Job::filter_by_id(job.id).get(&mut db).await.unwrap().status,
+        Status::Failed
+    );
+    let events = TaskEventEntry::filter_by_task_id(job.task_id)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, TaskEvent::Fail);
+    leader.step().await.unwrap();
+    assert_eq!(
+        NodeRun::filter_by_id(job.node_run_id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .status,
+        "Failed"
+    );
+    assert_eq!(
+        TaskEventEntry::filter_by_task_id(job.task_id)
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 async fn setup() -> Option<(Db, Backend<StaticGraphStore>)> {
     let url = env::var("DATABASE_URL").ok()?;
     let mut builder = toasty::Db::builder();
@@ -45,6 +140,7 @@ async fn only_the_leader_consumes_commands_tasks_and_events() {
     let mut standby = Pilot::new(second, backend, 64, Duration::from_millis(10));
 
     let graph_id = Uuid::parse_str("00000001-0000-0000-0000-000000000000").unwrap();
+    support::configure_graph(&mut db, graph_id).await;
     CommandEntry::new(
         Uuid::new_v4(),
         graph_id,
