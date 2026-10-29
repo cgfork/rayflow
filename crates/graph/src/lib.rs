@@ -1,4 +1,9 @@
+pub mod diff;
+pub mod store;
 pub mod types;
+pub mod validator;
+
+pub use store::models;
 
 use std::{
     borrow::{Borrow, BorrowMut},
@@ -138,4 +143,10 @@ pub trait GraphStore<I: Id> {
         graph_id: I,
         version: Option<u64>,
     ) -> impl std::future::Future<Output = Result<Self::G, Self::Err>> + Send;
+}
+
+/// Compares values, returning `None` when there are no differences.
+pub trait Diff {
+    type Item;
+    fn diff(&self, other: &Self) -> Option<Self::Item>;
 }

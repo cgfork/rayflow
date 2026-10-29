@@ -1,5 +1,20 @@
 -- Rayflow runtime backend schema.
 
+CREATE TABLE IF NOT EXISTS graph (
+    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    uuid       CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph identifier shared by its versions',
+    name       VARCHAR(255)    NOT NULL DEFAULT '' COMMENT 'graph name',
+    version    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'graph version',
+    graph      JSON            NOT NULL COMMENT 'serialized graph definition including nodes and edges',
+    updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
+    updated_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'last updater of the record',
+    created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
+    created_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'creator of the record',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_graph_uuid_version (uuid, version),
+    KEY idx_graph_uuid (uuid)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'versioned graph definitions with audit metadata';
+
 CREATE TABLE IF NOT EXISTS task (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
     uuid       CHAR(36)        NOT NULL DEFAULT '' COMMENT 'task unique identifier',
@@ -30,6 +45,7 @@ CREATE TABLE IF NOT EXISTS run (
 CREATE TABLE IF NOT EXISTS run_config (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
     run_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
+    version    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'graph version',
     revision   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'run revision this config applies to',
     annotation JSON            NOT NULL COMMENT 'run annotation key/value map',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',

@@ -36,7 +36,7 @@ flowchart LR
 
 ### `graph` — graph model
 
-Pure, I/O-free graph primitives.
+I/O-free graph primitives and validation, with optional use of MySQL persistence.
 
 - `Id` — identifier trait (`Copy + PartialEq + Debug + Display`), implemented for
   `Uuid`.
@@ -47,6 +47,26 @@ Pure, I/O-free graph primitives.
   `out_degree`).
 - `types` — the concrete `DAG` type plus `Node`, `Input`, `Output`, and `Kind`
   (`File`/`Directory`). A node carries a name, type, inputs, and outputs.
+- `validator::validate(&graph)` — rejects directed cycles, missing edge endpoints,
+  and graphs without exactly one root. `validator::unreferenced_outputs(&dag)`
+  reports unused outputs without rejecting the graph. Input sources reference
+  outputs as `node_name.file_name`; reported outputs include their producer's ID.
+- `store::MySqlGraphStore` — implements `GraphStore<Uuid>` over the `graph` table.
+  `load(uuid, Some(version))` loads that exact version; `load(uuid, None)` loads
+  the highest version for that UUID. Missing graphs or versions return
+  `store::Error::GraphNotFound`. `insert(&dag, actor)` adds a version and sets audit
+  fields; duplicate `(uuid, version)` pairs are rejected.
+  The JSON stores the full `DAG`, and loading rejects rows
+  whose UUID, name, or version disagrees with the JSON payload.
+
+Apply the `graph` table definition from `rayflow.sql` before using the persistent
+store. `MySqlGraphStore::connect(url)` registers its model automatically but does
+not create tables. For an existing database handle, register `graph::models()`
+(or include `graph::store::GraphRecord` in the handle's combined model set), then
+use `MySqlGraphStore::new(db)`. Structural validation remains an explicit
+`validator::validate(&dag)` call before insertion.
+The server and pilot continue to use their existing static graph stores until
+a persistent store is injected.
 
 ### `coordinator` — leader election
 

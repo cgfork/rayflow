@@ -197,6 +197,7 @@ pub struct RunConfig {
     pub id: u64,
     #[index]
     pub run_id: Uuid,
+    pub version: u64,
     pub revision: u64,
     #[column(type = json)]
     pub annotation: Json<HashMap<String, String>>,
