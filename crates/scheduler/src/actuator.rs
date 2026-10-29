@@ -66,7 +66,6 @@ impl<S> Actuator<S> {
             .status(status)
             .agent_id(None)
             .polled_at(None)
-            .expired_at(None)
             .updated_at(Timestamp::now())
             .exec(backend)
             .await?;
@@ -227,7 +226,7 @@ pub struct NodeConfig {
     pub annotation_match: String,
     #[column(type = json)]
     pub config: serde_json::Value,
-    /// Required job claim lease in milliseconds; missing values return an error.
+    /// Required job lifetime in milliseconds, reset when delivered to an agent.
     #[serde(default)]
     pub lease: Option<u64>,
     /// Minimum available CPU cores required by jobs created from this config.
@@ -290,9 +289,10 @@ pub struct Job {
     #[index]
     #[column(type = "CHAR(36)")]
     pub agent_id: Option<Uuid>,
-    /// Last poll that renewed the agent's lease.
+    /// Most recent delivery to the agent, including redelivery.
     #[index]
     pub polled_at: Option<Timestamp>,
+    /// Runtime expiry set on delivery and preserved after completion.
     #[index]
     pub expired_at: Option<Timestamp>,
     pub created_at: Timestamp,
@@ -315,30 +315,6 @@ pub struct Job {
 }
 
 impl Job {
-    /// Returns the stored deadline, or derives it for claims predating deadlines.
-    /// An unclaimed job has no expiry; missing configurations or leases are errors.
-    pub fn expired_at(&self) -> Result<Option<Timestamp>, Error> {
-        let lease = self.job_lease()?;
-        self.polled_at
-            .map(|at| {
-                self.expired_at.map_or_else(
-                    || {
-                        at.checked_add(lease)
-                            .map_err(|_| Error::InvalidJobLease(lease.as_millis() as u64))
-                    },
-                    Ok,
-                )
-            })
-            .transpose()
-    }
-
-    pub(crate) fn deadline_at(&self, renewed_at: Timestamp) -> Result<Timestamp, Error> {
-        let lease = self.job_lease()?;
-        renewed_at
-            .checked_add(lease)
-            .map_err(|_| Error::InvalidJobLease(lease.as_millis() as u64))
-    }
-
     pub fn job_lease(&self) -> Result<Duration, Error> {
         if self.node_config.is_unloaded() {
             return Err(Error::JobLeaseNotFound(self.node_config_id));
@@ -546,33 +522,23 @@ mod tests {
     }
 
     #[test]
-    fn job_expiry_requires_an_included_configuration_and_lease() {
+    fn job_lifetime_requires_an_included_configuration_and_lease() {
         let task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 0);
         let mut config = node_config();
         let mut job = Job::new(&task, Uuid::new_v4(), config.id, 0);
-        assert!(matches!(job.expired_at(), Err(Error::JobLeaseNotFound(1))));
+        assert!(matches!(job.job_lease(), Err(Error::JobLeaseNotFound(1))));
         job.node_config = None.into();
-        assert!(matches!(job.expired_at(), Err(Error::JobLeaseNotFound(1))));
+        assert!(matches!(job.job_lease(), Err(Error::JobLeaseNotFound(1))));
         job.node_config = Some(config.clone()).into();
-        assert!(matches!(job.expired_at(), Err(Error::JobLeaseNotFound(1))));
+        assert!(matches!(job.job_lease(), Err(Error::JobLeaseNotFound(1))));
 
         config.lease = Some(1250);
         job.node_config = Some(config.clone()).into();
-        assert_eq!(job.expired_at().unwrap(), None);
-        let polled_at: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
-        job.polled_at = Some(polled_at);
-        assert_eq!(
-            job.expired_at().unwrap(),
-            Some(polled_at + Duration::from_millis(1250))
-        );
-        job.polled_at = Some(Timestamp::MAX);
-        assert!(matches!(
-            job.expired_at(),
-            Err(Error::InvalidJobLease(1250))
-        ));
+        assert_eq!(job.job_lease().unwrap(), Duration::from_millis(1250));
+        assert_eq!(job.expired_at, None);
         config.lease = Some(0);
         job.node_config = Some(config).into();
-        assert!(matches!(job.expired_at(), Err(Error::InvalidJobLease(0))));
+        assert!(matches!(job.job_lease(), Err(Error::InvalidJobLease(0))));
     }
 
     #[test]
@@ -596,17 +562,16 @@ mod tests {
     }
 
     #[test]
-    fn job_deadline_round_trips_and_takes_precedence_over_legacy_expiry() {
+    fn job_expiry_round_trips_independently_of_poll_time_and_config() {
         let task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 0);
         let mut config = node_config();
         config.lease = Some(1250);
         let mut job = Job::new(&task, Uuid::new_v4(), config.id, 0);
         job.node_config = Some(config.clone()).into();
         assert!(job.expired_at.is_none());
-        let renewed_at: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
-        job.polled_at = Some(renewed_at);
-        let expired_at = job.deadline_at(renewed_at).unwrap();
-        assert_eq!(expired_at, renewed_at + Duration::from_millis(1250));
+        let polled_at: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        job.polled_at = Some(polled_at);
+        let expired_at = polled_at + Duration::from_millis(1250);
         job.expired_at = Some(expired_at);
         let encoded = serde_json::to_value(&job).unwrap();
         assert_eq!(
@@ -617,18 +582,10 @@ mod tests {
         assert_eq!(decoded.expired_at, Some(expired_at));
         assert_eq!(decoded.node_config.get().as_ref(), Some(&config));
         assert_eq!(decoded.job_lease().unwrap(), Duration::from_millis(1250));
-        job.polled_at = Some(renewed_at - Duration::from_secs(60));
-        assert_eq!(job.expired_at().unwrap(), Some(expired_at));
+        job.polled_at = Some(polled_at - Duration::from_secs(60));
+        job.node_config = None.into();
+        assert_eq!(job.expired_at, Some(expired_at));
         job.expired_at = None;
-        assert_eq!(
-            job.expired_at().unwrap(),
-            Some(expired_at - Duration::from_secs(60))
-        );
-        assert!(matches!(
-            job.deadline_at(Timestamp::MAX),
-            Err(Error::InvalidJobLease(1250))
-        ));
-        job.polled_at = None;
-        assert_eq!(job.expired_at().unwrap(), None);
+        assert_eq!(job.expired_at, None);
     }
 }

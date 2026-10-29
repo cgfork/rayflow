@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 event = { workspace = true }
 config = { workspace = true }
+jiff = { workspace = true }
 coordinator = { workspace = true, features = ["mysql"] }
 runtime = { workspace = true }
 scheduler = { workspace = true }
@@ -18,5 +19,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "tim
 uuid = { workspace = true }
 
 [dev-dependencies]
-jiff = { workspace = true }
 serde_json = { workspace = true }

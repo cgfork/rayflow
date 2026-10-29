@@ -31,6 +31,10 @@ fn default_gap_timeout_ms() -> u64 {
     event::poll::Config::default().gap_timeout.as_millis() as u64
 }
 
+fn default_job_timeout_gap() -> Duration {
+    Duration::from_secs(10)
+}
+
 /// Runtime configuration for the pilot binary.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Config {
@@ -52,6 +56,12 @@ pub struct Config {
     /// How long a missing log offset must remain absent before it is skipped.
     #[serde(default = "default_gap_timeout_ms")]
     pub gap_timeout_ms: u64,
+    /// Grace period before the pilot fails a job whose runtime has expired.
+    #[serde(
+        default = "default_job_timeout_gap",
+        with = "jiff::fmt::serde::unsigned_duration::required"
+    )]
+    pub job_timeout_gap: Duration,
 }
 
 impl Default for Config {
@@ -63,6 +73,7 @@ impl Default for Config {
             leader_name: default_leader_name(),
             leader_lease_ms: default_leader_lease_ms(),
             gap_timeout_ms: default_gap_timeout_ms(),
+            job_timeout_gap: default_job_timeout_gap(),
         }
     }
 }
@@ -135,6 +146,14 @@ impl Config {
                 "gap_timeout_ms must be positive".into(),
             ));
         }
+        if jiff::Timestamp::now()
+            .checked_sub(self.job_timeout_gap)
+            .is_err()
+        {
+            return Err(ConfigError::Message(
+                "job_timeout_gap is outside timestamp range".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -192,6 +211,29 @@ mod tests {
         assert!(config.validate().is_ok());
         assert_eq!(config.gap_timeout(), Duration::from_secs(2));
         config.gap_timeout_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn job_timeout_gap_accepts_duration_strings_and_zero() {
+        assert_eq!(Config::default().job_timeout_gap, Duration::from_secs(10));
+        for (value, expected) in [
+            ("1.5s", Duration::from_millis(1500)),
+            ("0s", Duration::ZERO),
+        ] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "database_url": "mysql://localhost/rayflow",
+                "job_timeout_gap": value,
+            }))
+            .unwrap();
+            assert_eq!(config.job_timeout_gap, expected);
+            assert!(config.validate().is_ok());
+        }
+        let config = Config {
+            database_url: "mysql://localhost/rayflow".into(),
+            job_timeout_gap: Duration::MAX,
+            ..Config::default()
+        };
         assert!(config.validate().is_err());
     }
 }

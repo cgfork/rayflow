@@ -24,6 +24,7 @@ use crate::Config;
 #[derive(Clone)]
 pub struct App<S> {
     db: Db,
+    pub(crate) config: Config,
     offsets: Offsets,
     graph_store: S,
 }
@@ -40,10 +41,11 @@ pub struct RunApp<S> {
 impl<S> App<S> {
     /// Creates an app over `db`, tracking the consumed command offset and
     /// serving graphs from `graph_store`.
-    pub fn new(db: Db, _config: Config, graph_store: S) -> Self {
+    pub fn new(db: Db, config: Config, graph_store: S) -> Self {
         let offsets = Offsets::new();
         Self {
             db,
+            config,
             offsets,
             graph_store,
         }

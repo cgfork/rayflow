@@ -7,6 +7,7 @@ use event::{
     task_event::{TaskEvent, TaskEventEntry},
 };
 use jiff::Timestamp;
+use std::time::Duration;
 use toasty::{Executor, stmt::IntoStatement};
 use uuid::Uuid;
 
@@ -50,7 +51,6 @@ pub trait Report<B> {
 pub struct AgentRef {
     id: Uuid,
     active_jobs: Vec<Uuid>,
-    renewed_jobs: Vec<Uuid>,
     resource: ResourceCapacity,
 }
 
@@ -59,16 +59,11 @@ impl AgentRef {
         Self {
             id,
             active_jobs,
-            renewed_jobs: Vec::new(),
             resource,
         }
     }
 
-    pub fn renewed_jobs(&self) -> &[Uuid] {
-        &self.renewed_jobs
-    }
-
-    /// Redelivers fitting Polled jobs that the agent has not reported as active.
+    /// Redelivers inactive Polled jobs and resets their lifetime on delivery.
     async fn polled<B: Executor>(
         &mut self,
         backend: &mut B,
@@ -82,6 +77,7 @@ impl AgentRef {
             let candidates = Job::all()
                 .filter(Job::fields().agent_id().eq(Some(self.id)))
                 .filter(Job::fields().status().eq(Status::Polled))
+                .filter(Job::fields().expired_at().gt(Some(now)))
                 .filter(Job::fields().uuid().in_list(self.active_jobs.clone()).not())
                 .filter(
                     Job::fields()
@@ -111,13 +107,11 @@ impl AgentRef {
                 {
                     continue;
                 }
-                if job.expired_at()?.is_none_or(|at| at <= now) {
-                    continue;
-                }
-                let expired_at = job.deadline_at(now)?;
-                // Renew by primary key: a bulk update for a new agent would lock
-                // the empty secondary-index range and conflict with other claimers.
-                if update_if(
+                let lifetime = job.job_lease()?;
+                let expired_at = now
+                    .checked_add(lifetime)
+                    .map_err(|_| Error::InvalidJobLease(lifetime.as_millis() as u64))?;
+                let updated = update_if(
                     &mut *backend,
                     Job::filter_by_id(job.id)
                         .update()
@@ -128,29 +122,20 @@ impl AgentRef {
                         .status()
                         .eq(Status::Polled)
                         .and(Job::fields().agent_id().eq(Some(self.id)))
-                        .and(Job::fields().polled_at().ge(job.polled_at))
-                        .and(
-                            Job::fields()
-                                .required_cpu_cores()
-                                .le(self.resource.cpu_cores),
-                        )
-                        .and(
-                            Job::fields()
-                                .required_memory_bytes()
-                                .le(self.resource.memory_bytes),
-                        ),
+                        .and(Job::fields().expired_at().eq(job.expired_at)),
                 )
-                .await?
-                {
-                    job.polled_at = Some(now);
-                    job.expired_at = Some(expired_at);
-                    job.updated_at = now;
-                    self.resource.cpu_cores -= job.required_cpu_cores;
-                    self.resource.memory_bytes -= job.required_memory_bytes;
-                    claimed.push(job);
-                    if claimed.len() == maximum || self.resource.exhausted() {
-                        break;
-                    }
+                .await?;
+                if !updated {
+                    continue;
+                }
+                job.polled_at = Some(now);
+                job.expired_at = Some(expired_at);
+                job.updated_at = now;
+                self.resource.cpu_cores -= job.required_cpu_cores;
+                self.resource.memory_bytes -= job.required_memory_bytes;
+                claimed.push(job);
+                if claimed.len() == maximum || self.resource.exhausted() {
+                    break;
                 }
             }
             if page_ended {
@@ -158,47 +143,6 @@ impl AgentRef {
             }
         }
         Ok(claimed)
-    }
-
-    /// Renews owned Polled claims explicitly reported as active.
-    async fn renew_claims<B: Executor>(&mut self, backend: &mut B) -> Result<(), Error> {
-        self.renewed_jobs.clear();
-        if self.active_jobs.is_empty() {
-            return Ok(());
-        }
-        let now = Timestamp::now();
-        let claimed = Job::all()
-            .filter(Job::fields().agent_id().eq(Some(self.id)))
-            .filter(Job::fields().uuid().in_list(self.active_jobs.clone()))
-            .filter(Job::fields().status().eq(Status::Polled))
-            .include(Job::fields().node_config())
-            .order_by(Job::fields().id().asc())
-            .exec(&mut *backend)
-            .await?;
-        for job in claimed {
-            if job.expired_at()?.is_none_or(|at| at <= now) {
-                continue;
-            }
-            let expired_at = job.deadline_at(now)?;
-            if update_if(
-                &mut *backend,
-                Job::filter_by_id(job.id)
-                    .update()
-                    .polled_at(Some(now))
-                    .expired_at(Some(expired_at))
-                    .updated_at(now),
-                Job::fields()
-                    .status()
-                    .eq(job.status)
-                    .and(Job::fields().agent_id().eq(Some(self.id)))
-                    .and(Job::fields().polled_at().ge(job.polled_at)),
-            )
-            .await?
-            {
-                self.renewed_jobs.push(job.uuid);
-            }
-        }
-        Ok(())
     }
 
     /// Deducts owned claims selected by `condition`, in bounded pages.
@@ -286,8 +230,10 @@ impl AgentRef {
                 {
                     continue;
                 }
-                // Reject invalid node leases before committing a claim.
-                let expired_at = job.deadline_at(now)?;
+                let lifetime = job.job_lease()?;
+                let expired_at = now
+                    .checked_add(lifetime)
+                    .map_err(|_| Error::InvalidJobLease(lifetime.as_millis() as u64))?;
                 let updated = update_if(
                     &mut *backend,
                     Job::filter_by_id(job.id)
@@ -338,7 +284,7 @@ impl AgentRef {
 impl<B: Executor> JobPoll<B> for AgentRef {
     type Err = Error;
 
-    /// Reclaims, renews, and claims atomically, then stores the remaining budget.
+    /// Claims jobs atomically, then stores the remaining resource budget.
     /// Poll sequentially per agent ID with a fresh resource budget per request.
     async fn poll(
         &mut self,
@@ -348,8 +294,6 @@ impl<B: Executor> JobPoll<B> for AgentRef {
         // Stage the budget so an error or cancelled poll leaves the caller unchanged.
         let mut agent = self.clone();
         let mut tx = backend.transaction().await?;
-        reclaim_expired_in(&mut tx).await?;
-        agent.renew_claims(&mut tx).await?;
         if maximum > 0 {
             // Active Polled jobs consume resources without redelivery.
             agent
@@ -385,51 +329,65 @@ impl<B: Executor> JobPoll<B> for AgentRef {
         }
         tx.commit().await?;
         self.resource = agent.resource;
-        self.renewed_jobs = agent.renewed_jobs;
         Ok(claimed.into_iter())
     }
 }
 
-/// Reclaims expired agent claims using their stored expiration timestamps.
-pub struct AgentScheduler;
+/// Fails timed-out jobs after allowing agents time to stop and report them.
+pub struct AgentScheduler {
+    timeout_gap: Duration,
+}
 
 impl AgentScheduler {
     pub fn new() -> Self {
-        Self
+        Self {
+            timeout_gap: Duration::from_secs(10),
+        }
+    }
+
+    pub fn with_timeout_gap(mut self, gap: Duration) -> Self {
+        self.timeout_gap = gap;
+        self
     }
 }
 
-/// Releases claims whose stored expiration timestamp has been reached.
-pub async fn reclaim_expired_in<B: Executor>(backend: &mut B) -> Result<usize, Error> {
+/// Fails expired jobs and emits their task events in the same transaction.
+pub async fn fail_expired_in<B: Executor>(backend: &mut B, gap: Duration) -> Result<usize, Error> {
     let now = Timestamp::now();
+    let cutoff = now.checked_sub(gap).map_err(|_| Error::InvalidTimeoutGap)?;
+    let mut tx = backend.transaction().await?;
     let expired = Job::all()
         .filter(Job::fields().status().eq(Status::Polled))
-        .filter(Job::fields().agent_id().is_some())
-        .filter(Job::fields().expired_at().le(Some(now)))
+        .filter(Job::fields().expired_at().lt(Some(cutoff)))
         .order_by(Job::fields().id().asc())
-        .exec(&mut *backend)
+        .exec(&mut tx)
         .await?;
-    let mut reclaimed = 0;
+    let mut failed = 0;
     for job in expired {
         let updated = update_if(
-            &mut *backend,
+            &mut tx,
             Job::filter_by_id(job.id)
                 .update()
-                .status(Status::Scheduled)
+                .status(Status::Failed)
                 .agent_id(None)
                 .polled_at(None)
-                .expired_at(None)
                 .updated_at(now),
             Job::fields()
                 .status()
                 .eq(Status::Polled)
-                .and(Job::fields().agent_id().eq(job.agent_id))
                 .and(Job::fields().expired_at().eq(job.expired_at)),
         )
         .await?;
-        reclaimed += usize::from(updated);
+        if updated {
+            let task = Task::read(&mut tx, job.task_id).await?;
+            TaskEventEntry::new(&task, TaskEvent::Fail)
+                .emit(&mut tx)
+                .await?;
+            failed += 1;
+        }
     }
-    Ok(reclaimed)
+    tx.commit().await?;
+    Ok(failed)
 }
 
 impl Default for AgentScheduler {
@@ -441,10 +399,26 @@ impl Default for AgentScheduler {
 impl<B: Executor> Scheduler<B> for AgentScheduler {
     type Err = Error;
 
-    /// Releases expired agent claims. Agents claim matching jobs directly by polling.
+    /// Fails expired jobs after the configured grace period.
     async fn schedule(&self, backend: &mut B) -> Result<usize, Self::Err> {
-        reclaim_expired_in(backend).await
+        fail_expired_in(backend, self.timeout_gap).await
     }
+}
+
+/// Records cancellation of an agent's claimed job.
+pub async fn cancel_job<B: Executor>(
+    backend: &mut B,
+    job_id: Uuid,
+    agent_id: Uuid,
+) -> Result<(), Error> {
+    update_agent_job(
+        backend,
+        job_id,
+        agent_id,
+        Status::Terminated,
+        TaskEvent::Cancel,
+    )
+    .await
 }
 
 pub async fn yield_job<B: Executor>(
@@ -505,7 +479,6 @@ async fn update_agent_job<B: Executor>(
 ) -> Result<(), Error> {
     let mut tx = backend.transaction().await?;
     let job = Job::filter_by_uuid(job_id)
-        .include(Job::fields().node_config())
         .first()
         .exec(&mut tx)
         .await?
@@ -518,7 +491,7 @@ async fn update_agent_job<B: Executor>(
         return Err(Error::JobConflict(job_id));
     }
     let now = Timestamp::now();
-    if job.expired_at()?.is_none_or(|at| at <= now) {
+    if status != Status::Failed && job.expired_at.is_none_or(|at| at <= now) {
         return Err(Error::JobConflict(job_id));
     }
     let updated = update_if(
@@ -528,13 +501,11 @@ async fn update_agent_job<B: Executor>(
             .status(status)
             .agent_id(None)
             .polled_at(None)
-            .expired_at(None)
             .updated_at(now),
         Job::fields()
             .status()
             .eq(Status::Polled)
-            .and(Job::fields().agent_id().eq(Some(agent_id)))
-            .and(Job::fields().polled_at().ge(job.polled_at)),
+            .and(Job::fields().agent_id().eq(Some(agent_id))),
     )
     .await?;
     if !updated {
@@ -640,7 +611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_uses_stored_expiration_without_loading_node_configs() {
+    async fn timeout_uses_stored_expiration_and_gap_without_loading_configs() {
         let Some((mut db, run, _, task, config, run_config)) = configured_task().await else {
             return;
         };
@@ -666,10 +637,11 @@ mod tests {
             ),
             (Status::Yielded, owner, Some(now), Some(past), 0, false),
             (Status::Polled, owner, None, Some(past), 0, true),
-            (Status::Polled, owner, Some(now), Some(now), 0, true),
+            (Status::Polled, owner, Some(now), Some(now), 0, false),
             (Status::Polled, owner, Some(past), Some(future), 0, false),
             (Status::Yielded, owner, Some(past), None, config.id, false),
-            (Status::Polled, None, Some(past), Some(past), 0, false),
+            (Status::Polled, None, Some(past), Some(past), 0, true),
+            (Status::Polled, owner, Some(past), None, 0, false),
             (Status::Scheduled, owner, Some(past), Some(past), 0, false),
             (Status::Succeeded, owner, Some(past), Some(past), 0, false),
             (Status::Failed, owner, Some(past), Some(past), 0, false),
@@ -684,14 +656,15 @@ mod tests {
             let stored = Job::filter_by_uuid(job.uuid).get(&mut db).await.unwrap();
             expected.push((stored, reclaimed));
         }
-        assert_eq!(reclaim_expired_in(&mut db).await.unwrap(), 3);
+        let gap = Duration::from_secs(10);
+        assert_eq!(fail_expired_in(&mut db, gap).await.unwrap(), 3);
         for (before, reclaimed) in expected {
             let after = Job::filter_by_id(before.id).get(&mut db).await.unwrap();
             if reclaimed {
-                assert_eq!(after.status, Status::Scheduled);
+                assert_eq!(after.status, Status::Failed);
                 assert!(after.agent_id.is_none());
                 assert!(after.polled_at.is_none());
-                assert!(after.expired_at.is_none());
+                assert_eq!(after.expired_at, before.expired_at);
             } else {
                 assert_eq!(after.status, before.status);
                 assert_eq!(after.agent_id, before.agent_id);
@@ -700,11 +673,40 @@ mod tests {
                 assert_eq!(after.updated_at, before.updated_at);
             }
         }
-        assert_eq!(reclaim_expired_in(&mut db).await.unwrap(), 0);
+        assert_eq!(fail_expired_in(&mut db, gap).await.unwrap(), 0);
+        let events = TaskEventEntry::all().exec(&mut db).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.event == TaskEvent::Fail));
     }
 
     #[tokio::test]
-    async fn renew_claims_only_renews_owned_active_jobs() {
+    async fn timeout_event_failure_rolls_back_the_job_update() {
+        let Some((mut db, run, _, task, config, run_config)) = configured_task().await else {
+            return;
+        };
+        let mut orphan = Job::new(&task, run.uuid, config.id, run_config.id);
+        orphan.task_id = Uuid::new_v4();
+        orphan.status = Status::Polled;
+        orphan.agent_id = Some(Uuid::new_v4());
+        orphan.expired_at = Some(Timestamp::now() - Duration::from_secs(60));
+        orphan.write(&mut db).await.unwrap();
+        let before = Job::filter_by_uuid(orphan.uuid).get(&mut db).await.unwrap();
+        assert!(fail_expired_in(&mut db, Duration::ZERO).await.is_err());
+        let after = Job::filter_by_uuid(orphan.uuid).get(&mut db).await.unwrap();
+        assert_eq!(after.status, Status::Polled);
+        assert_eq!(after.agent_id, before.agent_id);
+        assert_eq!(after.expired_at, before.expired_at);
+        assert!(
+            TaskEventEntry::all()
+                .exec(&mut db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_job_poll_does_not_change_any_lifetimes() {
         let Some((mut db, run, _, task, config, run_config)) = configured_task().await else {
             return;
         };
@@ -726,9 +728,7 @@ mod tests {
             (Status::Failed, Some(id), true),
             (Status::Terminated, Some(id), true),
         ] {
-            let should_renew = active && owner == Some(id) && status == Status::Polled;
-            let config_id = if should_renew { config.id } else { 0 };
-            let mut job = Job::new(&task, run.uuid, config_id, run_config.id);
+            let mut job = Job::new(&task, run.uuid, config.id, run_config.id);
             job.status = status;
             job.agent_id = owner;
             job.polled_at = Some(before);
@@ -739,44 +739,42 @@ mod tests {
                 active_jobs.push(job.uuid);
             }
             let stored = Job::filter_by_uuid(job.uuid).get(&mut db).await.unwrap();
-            expected.push((stored, should_renew));
+            expected.push(stored);
         }
-        AgentRef::new(id, ResourceCapacity::default(), Vec::new())
-            .renew_claims(&mut db)
-            .await
-            .unwrap();
-        for (before, _) in &expected {
+        assert_eq!(
+            AgentRef::new(id, ResourceCapacity::default(), Vec::new())
+                .poll(&mut db, 0)
+                .await
+                .unwrap()
+                .count(),
+            0
+        );
+        for before in &expected {
             let after = Job::filter_by_id(before.id).get(&mut db).await.unwrap();
             assert_eq!(after.polled_at, before.polled_at);
             assert_eq!(after.expired_at, before.expired_at);
             assert_eq!(after.updated_at, before.updated_at);
         }
-        AgentRef::new(id, ResourceCapacity::default(), active_jobs)
-            .renew_claims(&mut db)
-            .await
-            .unwrap();
-        for (before, should_renew) in expected {
+        assert_eq!(
+            AgentRef::new(id, ResourceCapacity::default(), active_jobs)
+                .poll(&mut db, 0)
+                .await
+                .unwrap()
+                .count(),
+            0
+        );
+        for before in expected {
             let after = Job::filter_by_id(before.id).get(&mut db).await.unwrap();
             assert_eq!(after.status, before.status);
             assert_eq!(after.agent_id, before.agent_id);
-            if should_renew {
-                assert!(after.polled_at > before.polled_at);
-                assert!(after.expired_at > before.expired_at);
-                assert!(after.updated_at > before.updated_at);
-                assert_eq!(
-                    after.expired_at,
-                    Some(after.polled_at.unwrap() + Duration::from_secs(30))
-                );
-            } else {
-                assert_eq!(after.polled_at, before.polled_at);
-                assert_eq!(after.expired_at, before.expired_at);
-                assert_eq!(after.updated_at, before.updated_at);
-            }
+            assert_eq!(after.polled_at, before.polled_at);
+            assert_eq!(after.expired_at, before.expired_at);
+            assert_eq!(after.updated_at, before.updated_at);
         }
     }
 
     #[tokio::test]
-    async fn poll_renews_only_active_or_redelivered_polled_claims() {
+    async fn poll_resets_only_redelivered_polled_jobs() {
         let Some((mut db, run, _, task, config, run_config)) = configured_task().await else {
             return;
         };
@@ -840,7 +838,7 @@ mod tests {
                 let renewed = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
                 assert_eq!(renewed.status, Status::Polled);
                 assert_eq!(renewed.agent_id, Some(id));
-                if job.uuid == owned[3].uuid || jobs.iter().any(|entry| entry.uuid == job.uuid) {
+                if jobs.iter().any(|entry| entry.uuid == job.uuid) {
                     assert!(renewed.polled_at.unwrap() > before);
                     assert!(renewed.updated_at > before);
                 } else {
@@ -873,6 +871,7 @@ mod tests {
         polled.status = Status::Polled;
         polled.agent_id = Some(id);
         polled.polled_at = Some(now - Duration::from_secs(5));
+        polled.expired_at = Some(now + Duration::from_secs(25));
         polled.write(&mut db).await.unwrap();
 
         // A Yielded job with no configuration must not be read for lease renewal.
@@ -891,6 +890,7 @@ mod tests {
         excluded.status = Status::Polled;
         excluded.agent_id = Some(id);
         excluded.polled_at = polled.polled_at;
+        excluded.expired_at = polled.expired_at;
         excluded.write(&mut db).await.unwrap();
         let excluded_before = Job::filter_by_uuid(excluded.uuid)
             .get(&mut db)
@@ -920,7 +920,7 @@ mod tests {
         assert_eq!(jobs[0].node_config.get().as_ref().unwrap().id, config.id);
         assert_eq!(jobs[0].run_config.get().as_ref().unwrap().id, run_config.id);
         assert_eq!(
-            jobs[0].expired_at().unwrap(),
+            jobs[0].expired_at,
             Some(jobs[0].polled_at.unwrap() + Duration::from_secs(30))
         );
         let after = Job::filter_by_uuid(yielded.uuid)
@@ -1008,7 +1008,7 @@ mod tests {
         assert_eq!(jobs[0].node_config.get().as_ref().unwrap().id, config.id);
         assert_eq!(jobs[0].run_config.get().as_ref().unwrap().id, run_config.id);
         assert_eq!(
-            jobs[0].expired_at().unwrap(),
+            jobs[0].expired_at,
             Some(jobs[0].polled_at.unwrap() + Duration::from_secs(30))
         );
         let claimed = Job::filter_by_id(scheduled.id).get(&mut db).await.unwrap();
@@ -1100,6 +1100,7 @@ mod tests {
                 if status == Status::Polled {
                     job.agent_id = Some(id);
                     job.polled_at = Some(before);
+                    job.expired_at = Some(before + Duration::from_secs(30));
                 }
                 job.required_cpu_cores = cpu;
                 job.required_memory_bytes = memory;
@@ -1157,6 +1158,7 @@ mod tests {
                 if status == Status::Polled {
                     job.agent_id = Some(id);
                     job.polled_at = Some(Timestamp::now() - Duration::from_secs(5));
+                    job.expired_at = Some(Timestamp::now() + Duration::from_secs(25));
                 }
                 job.required_cpu_cores = required_cpu;
                 job.required_memory_bytes = required_memory;
@@ -1165,6 +1167,7 @@ mod tests {
                 free.status = status;
                 free.agent_id = job.agent_id;
                 free.polled_at = job.polled_at;
+                free.expired_at = job.expired_at;
                 free.write(&mut db).await.unwrap();
                 let free_before = Job::filter_by_uuid(free.uuid).get(&mut db).await.unwrap();
                 let mut agent = AgentRef::new(
@@ -1232,6 +1235,7 @@ mod tests {
             if status != Status::Scheduled {
                 job.agent_id = Some(id);
                 job.polled_at = Some(Timestamp::now() - Duration::from_secs(5));
+                job.expired_at = Some(Timestamp::now() + Duration::from_secs(25));
             }
             if index == 1 {
                 active_jobs.push(job.uuid);

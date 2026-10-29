@@ -2,7 +2,8 @@
 
 use runtime::command::{NodeRun, Run};
 use scheduler::{
-    AgentRef, Job, JobPoll, actuator::NodeConfig, fail_job, succeed_job, terminate_job, yield_job,
+    AgentRef, Job, JobPoll, actuator::NodeConfig, cancel_job, fail_job, succeed_job, terminate_job,
+    yield_job,
 };
 use uuid::Uuid;
 
@@ -16,21 +17,33 @@ impl<S> App<S> {
         let mut polling = agent.clone();
         let mut jobs: Vec<_> = polling.poll(&mut tx, maximum).await?.collect();
         for job in &mut jobs {
-            let run = Run::filter_by_uuid(job.run_id).get(&mut tx).await?;
-            let node_run = NodeRun::filter_by_id(job.node_run_id).get(&mut tx).await?;
-            let config = NodeConfig::filter_by_id(job.node_config_id)
-                .first()
-                .exec(&mut tx)
-                .await?
-                .ok_or(scheduler::Error::JobLeaseNotFound(job.node_config_id))?;
-            config.job_lease()?;
-            job.run = run.into();
-            job.node_run = node_run.into();
-            job.node_config = Some(config).into();
+            if job.run.is_unloaded() {
+                job.run = Run::filter_by_uuid(job.run_id).get(&mut tx).await?.into();
+            }
+            if job.node_run.is_unloaded() {
+                job.node_run = NodeRun::filter_by_id(job.node_run_id)
+                    .get(&mut tx)
+                    .await?
+                    .into();
+            }
+            if job.node_config.is_unloaded() || job.node_config.get().is_none() {
+                job.node_config = NodeConfig::filter_by_id(job.node_config_id)
+                    .first()
+                    .exec(&mut tx)
+                    .await?
+                    .into();
+            }
+            job.job_lease()?;
         }
         tx.commit().await?;
         *agent = polling;
         Ok(jobs)
+    }
+
+    pub async fn cancel_job(&self, job_id: Uuid, agent_id: Uuid) -> Result<(), AppError> {
+        let mut db = self.db.clone();
+        cancel_job(&mut db, job_id, agent_id).await?;
+        Ok(())
     }
 
     pub async fn yield_job(&self, job_id: Uuid, agent_id: Uuid) -> Result<(), AppError> {
@@ -75,6 +88,7 @@ mod tests {
         AgentScheduler, JobWrite, ResourceCapacity, Scheduler, TaskEvent, actuator::Status,
     };
     use std::time::Duration;
+    use tokio::time::{Instant, sleep, timeout};
     use tower::ServiceExt;
 
     async fn configured_job(db: &mut toasty::Db) -> (Task, Job) {
@@ -143,6 +157,15 @@ mod tests {
             Status::Terminated => "terminate",
             _ => panic!("not a terminal action: {status:?}"),
         };
+        job_action(app, job, agent, action).await
+    }
+
+    async fn job_action(
+        app: &App<TestGraphStore>,
+        job: Uuid,
+        agent: Uuid,
+        action: &str,
+    ) -> StatusCode {
         crate::api::router(app.clone())
             .oneshot(
                 Request::post(format!("/job/{action}"))
@@ -190,13 +213,337 @@ mod tests {
         Ok(serde_json::from_slice(&body).unwrap())
     }
 
+    async fn poll_wait(
+        app: &App<TestGraphStore>,
+        agent: Uuid,
+        active_jobs: Vec<Uuid>,
+        wait_ms: Option<u64>,
+    ) -> axum::response::Response {
+        let mut body = serde_json::json!({
+            "agent_id": agent, "batch": 1,
+            "resources": { "cpu_cores": 1, "memory_bytes": 512 },
+            "active_jobs": active_jobs,
+        });
+        if let Some(wait_ms) = wait_ms {
+            body["wait_ms"] = serde_json::json!(wait_ms);
+        }
+        crate::api::router(app.clone())
+            .oneshot(
+                Request::post("/jobs/poll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn poll_body(response: axum::response::Response) -> crate::api::PollJobsResponse {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn long_poll_validates_wait_and_preserves_immediate_requests() {
+        let Some(db) = setup().await else {
+            return;
+        };
+        let config = Config {
+            poll_timeout: Duration::from_millis(600),
+            ..Config::default()
+        };
+        let app = App::new(db, config, TestGraphStore::default());
+        let response = timeout(
+            Duration::from_millis(300),
+            poll_wait(&app, Uuid::new_v4(), vec![], Some(0)),
+        )
+        .await
+        .unwrap();
+        let response = poll_body(response).await;
+        assert!(response.jobs.is_empty());
+        for wait in [601, 30_001, u64::MAX] {
+            let response = poll_wait(&app, Uuid::new_v4(), vec![], Some(wait)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn long_poll_missing_wait_uses_the_configured_timeout() {
+        let Some(db) = setup().await else {
+            return;
+        };
+        let config = Config {
+            poll_timeout: Duration::from_millis(600),
+            ..Config::default()
+        };
+        let app = App::new(db, config, TestGraphStore::default());
+        let started = Instant::now();
+        let response = timeout(
+            Duration::from_secs(2),
+            poll_wait(&app, Uuid::new_v4(), vec![], None),
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let response = poll_body(response).await;
+        assert!(response.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn long_poll_returns_empty_when_the_wait_expires() {
+        let Some(db) = setup().await else {
+            return;
+        };
+        let config = Config {
+            poll_timeout: Duration::from_millis(600),
+            poll_retry_interval: Duration::from_secs(5),
+            ..Config::default()
+        };
+        let app = App::new(db, config, TestGraphStore::default());
+        let started = Instant::now();
+        let response = timeout(
+            Duration::from_secs(2),
+            poll_wait(&app, Uuid::new_v4(), vec![], Some(600)),
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        let response = poll_body(response).await;
+        assert!(response.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn long_poll_returns_available_jobs_and_active_polls_immediately() {
+        let Some(mut db) = setup().await else {
+            return;
+        };
+        let app = App::new(db.clone(), Config::default(), TestGraphStore::default());
+        let agent = Uuid::new_v4();
+        let (_, job) = configured_job(&mut db).await;
+        let response = timeout(Duration::from_secs(2), poll_wait(&app, agent, vec![], None))
+            .await
+            .unwrap();
+        let response = poll_body(response).await;
+        assert_eq!(response.jobs.len(), 1);
+        assert_eq!(response.jobs[0].uuid, job.uuid);
+        let before = response.jobs[0].polled_at.unwrap().as_microsecond();
+        let response = timeout(
+            Duration::from_secs(2),
+            poll_wait(&app, agent, vec![job.uuid], None),
+        )
+        .await
+        .unwrap();
+        let response = poll_body(response).await;
+        assert!(response.jobs.is_empty());
+        assert!(
+            Job::filter_by_id(job.id)
+                .get(&mut db)
+                .await
+                .unwrap()
+                .polled_at
+                .unwrap()
+                .as_microsecond()
+                == before
+        );
+        app.succeed_job(job.uuid, agent).await.unwrap();
+        let response = timeout(
+            Duration::from_secs(2),
+            poll_wait(&app, agent, vec![job.uuid, Uuid::new_v4()], Some(30_000)),
+        )
+        .await
+        .unwrap();
+        let response = poll_body(response).await;
+        assert!(response.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn long_poll_uses_configured_retry_interval_without_blocking_the_writer() {
+        let Some(mut db) = setup().await else {
+            return;
+        };
+        let config = Config {
+            poll_retry_interval: Duration::from_secs(1),
+            ..Config::default()
+        };
+        let app = App::new(db.clone(), config, TestGraphStore::default());
+        let agent = Uuid::new_v4();
+        let started = Instant::now();
+        let mut polling = Box::pin(poll_wait(&app, agent, vec![], Some(30_000)));
+        assert!(
+            timeout(Duration::from_millis(100), &mut polling)
+                .await
+                .is_err()
+        );
+        let (_, job) = timeout(Duration::from_secs(2), configured_job(&mut db))
+            .await
+            .unwrap();
+        let response = timeout(Duration::from_secs(2), polling).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        let response = poll_body(response).await;
+        assert_eq!(response.jobs.len(), 1);
+        let delivered = &response.jobs[0];
+        assert_eq!(delivered.uuid, job.uuid);
+        assert_eq!(delivered.agent_id, Some(agent));
+        assert_eq!(delivered.run.get().uuid, job.run_id);
+        assert_eq!(delivered.node_run.get().id, job.node_run_id);
+        assert_eq!(
+            delivered.node_config.get().as_ref().unwrap().id,
+            job.node_config_id
+        );
+        assert_eq!(
+            Job::filter_by_id(job.id)
+                .get(&mut db)
+                .await
+                .unwrap()
+                .agent_id,
+            Some(agent)
+        );
+    }
+
+    #[tokio::test]
+    async fn long_poll_restarts_with_the_original_resource_budget() {
+        let Some(mut db) = setup().await else {
+            return;
+        };
+        let app = App::new(db.clone(), Config::default(), TestGraphStore::default());
+        let agent = Uuid::new_v4();
+        let (_, owned) = configured_job(&mut db).await;
+        let (_, waiting) = configured_job(&mut db).await;
+        let now = Timestamp::now();
+        Job::filter_by_id(owned.id)
+            .update()
+            .status(Status::Polled)
+            .agent_id(Some(agent))
+            .polled_at(Some(now))
+            .expired_at(Some(now + Duration::from_secs(30)))
+            .required_cpu_cores(2)
+            .exec(&mut db)
+            .await
+            .unwrap();
+        let mut polling = Box::pin(poll_wait(&app, agent, vec![], Some(30_000)));
+        assert!(
+            timeout(Duration::from_millis(100), &mut polling)
+                .await
+                .is_err()
+        );
+        timeout(Duration::from_secs(2), app.succeed_job(owned.uuid, agent))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = timeout(Duration::from_secs(2), polling).await.unwrap();
+        let response = poll_body(response).await;
+        assert_eq!(response.jobs.len(), 1);
+        assert_eq!(response.jobs[0].uuid, waiting.uuid);
+    }
+
+    #[tokio::test]
+    async fn long_poll_competitors_do_not_claim_the_same_job() {
+        let Some(mut db) = setup().await else {
+            return;
+        };
+        let app = App::new(db.clone(), Config::default(), TestGraphStore::default());
+        let first_agent = Uuid::new_v4();
+        let second_agent = Uuid::new_v4();
+        let polls = async {
+            tokio::join!(
+                poll_wait(&app, first_agent, vec![], Some(800)),
+                poll_wait(&app, second_agent, vec![], Some(800)),
+            )
+        };
+        let mut polls = Box::pin(polls);
+        assert!(
+            timeout(Duration::from_millis(100), &mut polls)
+                .await
+                .is_err()
+        );
+        let (_, job) = configured_job(&mut db).await;
+        let (first, second) = timeout(Duration::from_secs(3), polls).await.unwrap();
+        let first = poll_body(first).await;
+        let second = poll_body(second).await;
+        assert_eq!(first.jobs.len() + second.jobs.len(), 1);
+        let owner = if first.jobs.is_empty() {
+            second_agent
+        } else {
+            first_agent
+        };
+        assert_eq!(
+            first
+                .jobs
+                .iter()
+                .chain(second.jobs.iter())
+                .next()
+                .unwrap()
+                .uuid,
+            job.uuid
+        );
+        assert_eq!(
+            Job::filter_by_id(job.id)
+                .get(&mut db)
+                .await
+                .unwrap()
+                .agent_id,
+            Some(owner)
+        );
+    }
+
+    #[tokio::test]
+    async fn long_poll_cancellation_leaves_no_background_claims() {
+        let Some(mut db) = setup().await else {
+            return;
+        };
+        let app = App::new(db.clone(), Config::default(), TestGraphStore::default());
+        let mut polling = Box::pin(poll_wait(&app, Uuid::new_v4(), vec![], Some(30_000)));
+        assert!(
+            timeout(Duration::from_millis(100), &mut polling)
+                .await
+                .is_err()
+        );
+        drop(polling);
+        let (_, job) = configured_job(&mut db).await;
+        sleep(Duration::from_millis(300)).await;
+        let stored = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
+        assert_eq!(stored.status, Status::Scheduled);
+        assert!(stored.agent_id.is_none());
+        let response = poll_wait(&app, Uuid::new_v4(), vec![], Some(0)).await;
+        assert_eq!(poll_body(response).await.jobs[0].uuid, job.uuid);
+    }
+
+    #[tokio::test]
+    async fn long_poll_returns_retry_errors_without_committing_claims() {
+        let Some(mut db) = setup().await else {
+            return;
+        };
+        let app = App::new(db.clone(), Config::default(), TestGraphStore::default());
+        let mut polling = Box::pin(poll_wait(&app, Uuid::new_v4(), vec![], Some(30_000)));
+        assert!(
+            timeout(Duration::from_millis(100), &mut polling)
+                .await
+                .is_err()
+        );
+        let (_, invalid) = configured_job(&mut db).await;
+        NodeConfig::filter_by_id(invalid.node_config_id)
+            .update()
+            .lease(None)
+            .exec(&mut db)
+            .await
+            .unwrap();
+        let response = timeout(Duration::from_secs(2), polling).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let stored = Job::filter_by_id(invalid.id).get(&mut db).await.unwrap();
+        assert_eq!(stored.status, Status::Scheduled);
+        assert!(stored.agent_id.is_none());
+    }
+
     #[tokio::test]
     async fn job_actions_validate_bodies_and_replace_the_status_endpoint() {
         let Some(db) = setup().await else {
             return;
         };
         let app = App::new(db, Config::default(), TestGraphStore::default());
-        for action in ["yield", "succeed", "fail", "terminate"] {
+        for action in ["cancel", "yield", "succeed", "fail", "terminate"] {
             for body in [
                 serde_json::json!({}),
                 serde_json::json!({"job_id": Uuid::new_v4()}),
@@ -227,6 +574,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_the_claim_and_emits_one_cancel_event() {
+        let Some(mut db) = setup().await else {
+            return;
+        };
+        let app = App::new(db.clone(), Config::default(), TestGraphStore::default());
+        let agent = Uuid::new_v4();
+        let capacity = ResourceCapacity {
+            cpu_cores: 1,
+            memory_bytes: 512,
+        };
+        let (task, job) = configured_job(&mut db).await;
+        app.poll(&mut AgentRef::new(agent, capacity, vec![]), 1)
+            .await
+            .unwrap();
+        let before = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
+        assert_eq!(
+            job_action(&app, job.uuid, Uuid::new_v4(), "cancel").await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            job_action(&app, Uuid::new_v4(), agent, "cancel").await,
+            StatusCode::NOT_FOUND
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                job_action(&app, job.uuid, agent, "cancel").await,
+                StatusCode::NO_CONTENT
+            );
+        }
+        let cancelled = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
+        assert_eq!(cancelled.status, Status::Terminated);
+        assert!(cancelled.agent_id.is_none() && cancelled.polled_at.is_none());
+        assert_eq!(cancelled.expired_at, before.expired_at);
+        let events = TaskEventEntry::filter_by_task_id(task.id)
+            .exec(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, TaskEvent::Cancel);
+        assert_eq!(
+            report(&app, job.uuid, agent, Status::Failed).await,
+            StatusCode::CONFLICT
+        );
+
+        let (task, expired) = configured_job(&mut db).await;
+        app.poll(&mut AgentRef::new(agent, capacity, vec![]), 1)
+            .await
+            .unwrap();
+        Job::filter_by_id(expired.id)
+            .update()
+            .expired_at(Some(Timestamp::now() - Duration::from_secs(1)))
+            .exec(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(
+            job_action(&app, expired.uuid, agent, "cancel").await,
+            StatusCode::CONFLICT
+        );
+        assert!(
+            TaskEventEntry::filter_by_task_id(task.id)
+                .exec(&mut db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -265,7 +680,6 @@ mod tests {
             }
             let response: crate::api::PollJobsResponse = serde_json::from_value(json).unwrap();
             assert_eq!(response.jobs.len(), 1);
-            assert!(response.renewed_jobs.is_empty());
             let delivered = &response.jobs[0];
             assert_eq!(delivered.run.get().uuid, job.run_id);
             assert_eq!(delivered.run.get().graph_id, task.graph_id);
@@ -286,7 +700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_acknowledges_only_owned_live_active_claims() {
+    async fn active_poll_does_not_extend_or_reclaim_jobs() {
         let Some(mut db) = setup().await else {
             return;
         };
@@ -296,7 +710,7 @@ mod tests {
         let (_, expired) = configured_job(&mut db).await;
         let (_, foreign) = configured_job(&mut db).await;
         let (_, terminal) = configured_job(&mut db).await;
-        let now = Timestamp::now();
+        let now = Timestamp::from_microsecond(Timestamp::now().as_microsecond()).unwrap();
         for job in [&owned, &expired, &foreign, &terminal] {
             Job::filter_by_id(job.id)
                 .update()
@@ -332,14 +746,21 @@ mod tests {
         .await
         .unwrap();
         assert!(response.jobs.is_empty());
-        assert_eq!(response.renewed_jobs, vec![owned.uuid]);
+        assert_eq!(
+            Job::filter_by_id(owned.id)
+                .get(&mut db)
+                .await
+                .unwrap()
+                .expired_at,
+            Some(now + Duration::from_secs(30))
+        );
         assert_eq!(
             Job::filter_by_id(expired.id)
                 .get(&mut db)
                 .await
                 .unwrap()
                 .status,
-            Status::Scheduled
+            Status::Polled
         );
         assert_eq!(TaskEventEntry::all().exec(&mut db).await.unwrap().len(), 1);
     }
@@ -374,7 +795,7 @@ mod tests {
         assert!(
             yielded.agent_id.is_none()
                 && yielded.polled_at.is_none()
-                && yielded.expired_at.is_none()
+                && yielded.expired_at.is_some()
         );
         let events = TaskEventEntry::filter_by_task_id(task.id)
             .exec(&mut db)
@@ -453,11 +874,12 @@ mod tests {
             .exec(&mut db)
             .await
             .unwrap();
-        assert_eq!(
+        assert!(
             poll_active(&app, agent, vec![invalid.uuid])
                 .await
-                .unwrap_err(),
-            StatusCode::INTERNAL_SERVER_ERROR
+                .unwrap()
+                .jobs
+                .is_empty()
         );
         assert!(
             TaskEventEntry::all()
@@ -496,9 +918,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_leases_control_delivery_renewal_reports_and_recovery() {
+    async fn delivery_resets_expiry_but_active_polls_do_not_and_pilot_fails_timeouts() {
         let Some(mut db) = setup().await else {
-            eprintln!("skipping: set DATABASE_URL to run MySQL node lease tests");
             return;
         };
         let app = App::new(db.clone(), Config::default(), TestGraphStore::default());
@@ -507,12 +928,10 @@ mod tests {
             cpu_cores: 3,
             memory_bytes: 1536,
         };
-        let (_, short) = configured_job_with_lease(&mut db, Some(5_000)).await;
+        let (short_task, short) = configured_job_with_lease(&mut db, Some(5_000)).await;
         let (task, long) = configured_job_with_lease(&mut db, Some(120_000)).await;
         let (_, medium) = configured_job(&mut db).await;
-
-        // A new node version must not change an existing job's pinned lease.
-        let now = Timestamp::now();
+        let now = Timestamp::from_microsecond(Timestamp::now().as_microsecond()).unwrap();
         NodeConfig::create()
             .node_id(task.node_id)
             .version(2)
@@ -528,145 +947,101 @@ mod tests {
             .exec(&mut db)
             .await
             .unwrap();
-
         let polled = app
             .poll(&mut AgentRef::new(agent, capacity, vec![]), 3)
             .await
             .unwrap();
         assert_eq!(polled.len(), 3);
-        for (job, expected) in [(&short, 5_000), (&long, 120_000), (&medium, 30_000)] {
+        for (job, lifetime) in [(&short, 5_000), (&long, 120_000), (&medium, 30_000)] {
             let delivered = polled.iter().find(|entry| entry.uuid == job.uuid).unwrap();
             assert_eq!(
-                delivered.job_lease().unwrap(),
-                Duration::from_millis(expected)
-            );
-            assert_eq!(
                 delivered.expired_at,
-                Some(delivered.polled_at.unwrap() + Duration::from_millis(expected))
+                Some(delivered.polled_at.unwrap() + Duration::from_millis(lifetime))
             );
         }
-        for (job, age, lease) in [(&short, 10, 5), (&long, 60, 120), (&medium, 10, 30)] {
-            let polled_at = Timestamp::now() - Duration::from_secs(age);
+        let before = Timestamp::from_microsecond(Timestamp::now().as_microsecond()).unwrap()
+            - Duration::from_secs(2);
+        for (job, lifetime) in [(&short, 5), (&long, 120), (&medium, 30)] {
             Job::filter_by_id(job.id)
                 .update()
-                .polled_at(Some(polled_at))
-                .expired_at(Some(polled_at + Duration::from_secs(lease)))
+                .polled_at(Some(before))
+                .expired_at(Some(before + Duration::from_secs(lifetime)))
                 .exec(&mut db)
                 .await
                 .unwrap();
         }
-        assert_eq!(
-            report(&app, short.uuid, agent, Status::Succeeded).await,
-            StatusCode::CONFLICT
-        );
-        // A long lease remains valid while shorter leases expire.
-        let redelivered = app
-            .poll(&mut AgentRef::new(agent, capacity, vec![]), 3)
+        let delivered = app
+            .poll(&mut AgentRef::new(agent, capacity, vec![long.uuid]), 3)
             .await
             .unwrap();
-        assert_eq!(redelivered.len(), 3);
-        assert!(redelivered.iter().any(|entry| entry.uuid == long.uuid));
-        assert_eq!(
-            poll_active(&app, agent, vec![short.uuid, long.uuid, medium.uuid])
-                .await
-                .unwrap()
-                .renewed_jobs
-                .len(),
-            3
-        );
-        for (job, age, lease) in [(&short, 10, 5), (&long, 60, 120), (&medium, 10, 30)] {
-            let polled_at = Timestamp::now() - Duration::from_secs(age);
-            Job::filter_by_id(job.id)
-                .update()
-                .polled_at(Some(polled_at))
-                .expired_at(Some(polled_at + Duration::from_secs(lease)))
-                .exec(&mut db)
-                .await
-                .unwrap();
+        assert_eq!(delivered.len(), 2);
+        for job in &delivered {
+            assert!(job.polled_at.unwrap() > before);
+            assert_eq!(
+                job.expired_at,
+                Some(job.polled_at.unwrap() + job.job_lease().unwrap())
+            );
         }
-        assert_eq!(AgentScheduler::new().schedule(&mut db).await.unwrap(), 1);
-        assert_eq!(
-            Job::filter_by_id(short.id)
-                .get(&mut db)
-                .await
-                .unwrap()
-                .status,
-            Status::Scheduled
-        );
         assert_eq!(
             Job::filter_by_id(long.id)
                 .get(&mut db)
                 .await
                 .unwrap()
-                .status,
-            Status::Polled
+                .expired_at,
+            Some(before + Duration::from_secs(120))
         );
-        assert_eq!(
-            Job::filter_by_id(medium.id)
-                .get(&mut db)
-                .await
-                .unwrap()
-                .status,
-            Status::Polled
-        );
-
-        // Active polls renew the long claim without redelivering it.
-        let redelivered: Vec<_> = AgentRef::new(agent, capacity, vec![long.uuid])
-            .poll(&mut db, 0)
-            .await
-            .unwrap()
-            .collect();
-        assert!(redelivered.is_empty());
-        let renewed = Job::filter_by_id(long.id).get(&mut db).await.unwrap();
-        assert!(renewed.polled_at.unwrap() > Timestamp::now() - Duration::from_secs(30));
-        assert_eq!(
-            renewed.expired_at,
-            Some(renewed.polled_at.unwrap() + Duration::from_secs(120))
-        );
-        Job::filter_by_id(long.id)
+        let expired_at = Timestamp::from_microsecond(Timestamp::now().as_microsecond()).unwrap()
+            - Duration::from_secs(1);
+        Job::filter_by_id(short.id)
             .update()
-            .polled_at(Some(Timestamp::now() - Duration::from_secs(60)))
-            .expired_at(Some(Timestamp::now() + Duration::from_secs(60)))
+            .expired_at(Some(expired_at))
             .exec(&mut db)
             .await
             .unwrap();
+        assert!(
+            poll_active(&app, agent, vec![short.uuid, long.uuid, medium.uuid])
+                .await
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+        assert_eq!(
+            report(&app, short.uuid, agent, Status::Succeeded).await,
+            StatusCode::CONFLICT
+        );
+        assert!(
+            app.poll(&mut AgentRef::new(Uuid::new_v4(), capacity, vec![]), 3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            AgentScheduler::new()
+                .with_timeout_gap(Duration::from_secs(10))
+                .schedule(&mut db)
+                .await
+                .unwrap(),
+            0
+        );
+        let scheduler = AgentScheduler::new().with_timeout_gap(Duration::ZERO);
+        assert_eq!(scheduler.schedule(&mut db).await.unwrap(), 1);
+        assert_eq!(scheduler.schedule(&mut db).await.unwrap(), 0);
+        let failed = Job::filter_by_id(short.id).get(&mut db).await.unwrap();
+        assert_eq!(failed.status, Status::Failed);
+        assert_eq!(failed.expired_at, Some(expired_at));
+        let events = TaskEventEntry::filter_by_task_id(short_task.id)
+            .exec(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, TaskEvent::Fail);
+        assert_eq!(
+            report(&app, short.uuid, agent, Status::Failed).await,
+            StatusCode::NO_CONTENT
+        );
         assert_eq!(
             report(&app, long.uuid, agent, Status::Succeeded).await,
             StatusCode::NO_CONTENT
-        );
-
-        // The polling endpoint reclaims short leases independently of other leases.
-        let next_agent = Uuid::new_v4();
-        app.poll(&mut AgentRef::new(next_agent, capacity, vec![]), 3)
-            .await
-            .unwrap();
-        assert_eq!(
-            poll_active(&app, next_agent, vec![short.uuid])
-                .await
-                .unwrap()
-                .renewed_jobs,
-            vec![short.uuid]
-        );
-        Job::filter_by_id(short.id)
-            .update()
-            .polled_at(Some(Timestamp::now() - Duration::from_secs(10)))
-            .expired_at(Some(Timestamp::now() - Duration::from_secs(5)))
-            .exec(&mut db)
-            .await
-            .unwrap();
-        assert_eq!(
-            report(&app, short.uuid, next_agent, Status::Failed).await,
-            StatusCode::CONFLICT
-        );
-        let recovered = app
-            .poll(&mut AgentRef::new(Uuid::new_v4(), capacity, vec![]), 3)
-            .await
-            .unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].uuid, short.uuid);
-        assert_eq!(
-            recovered[0].job_lease().unwrap(),
-            Duration::from_millis(5_000)
         );
     }
 
@@ -776,12 +1151,12 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         for _ in 0..2 {
-            assert_eq!(
+            assert!(
                 poll_active(&app, agent, vec![job.uuid])
                     .await
                     .unwrap()
-                    .renewed_jobs,
-                vec![job.uuid]
+                    .jobs
+                    .is_empty()
             );
         }
         let renewed = Job::filter_by_uuid(job.uuid).get(&mut db).await.unwrap();
@@ -798,55 +1173,39 @@ mod tests {
                 .is_empty()
         );
 
-        // Reclaim a running job; confirming its new claim emits no task event.
-        let expired = Timestamp::now() - Duration::from_secs(60);
+        let expired = Timestamp::from_microsecond(Timestamp::now().as_microsecond()).unwrap()
+            - Duration::from_secs(60);
+        let expired_at = expired + Duration::from_secs(30);
         Job::filter_by_id(job.id)
             .update()
-            .polled_at(Some(expired))
-            .expired_at(Some(expired + Duration::from_secs(30)))
+            .expired_at(Some(expired_at))
             .exec(&mut db)
             .await
             .unwrap();
-        assert_eq!(
-            report(&app, job.uuid, agent, Status::Succeeded).await,
-            StatusCode::CONFLICT
-        );
+        for status in [Status::Succeeded, Status::Yielded, Status::Terminated] {
+            assert_eq!(
+                report(&app, job.uuid, agent, status).await,
+                StatusCode::CONFLICT
+            );
+        }
         let new_agent = Uuid::new_v4();
-        assert_eq!(
+        assert!(
             app.poll(&mut AgentRef::new(new_agent, capacity, vec![]), 1)
                 .await
                 .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            report(&app, job.uuid, agent, Status::Failed).await,
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            poll_active(&app, new_agent, vec![job.uuid])
-                .await
-                .unwrap()
-                .renewed_jobs,
-            vec![job.uuid]
-        );
-        for _ in 0..2 {
-            assert_eq!(
-                report(&app, job.uuid, new_agent, Status::Succeeded).await,
-                StatusCode::NO_CONTENT
-            );
-        }
-        assert!(
-            poll_active(&app, new_agent, vec![job.uuid])
-                .await
-                .unwrap()
-                .renewed_jobs
                 .is_empty()
         );
         assert_eq!(
             report(&app, job.uuid, new_agent, Status::Failed).await,
             StatusCode::CONFLICT
         );
+        for _ in 0..2 {
+            assert_eq!(
+                report(&app, job.uuid, agent, Status::Failed).await,
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(AgentScheduler::new().schedule(&mut db).await.unwrap(), 0);
         let events = TaskEventEntry::filter_by_task_id(task.id)
             .order_by(TaskEventEntry::fields().event_offset().asc())
             .exec(&mut db)
@@ -854,7 +1213,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             events.iter().map(|entry| entry.event).collect::<Vec<_>>(),
-            vec![TaskEvent::Succeed]
+            vec![TaskEvent::Fail]
         );
         assert!(
             events
@@ -863,9 +1222,9 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         let settled = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
-        assert_eq!(settled.status, Status::Succeeded);
+        assert_eq!(settled.status, Status::Failed);
         assert!(settled.agent_id.is_none() && settled.polled_at.is_none());
-        assert!(settled.expired_at.is_none());
+        assert_eq!(settled.expired_at, Some(expired_at));
 
         for (status, event) in [
             (Status::Failed, TaskEvent::Fail),
@@ -902,7 +1261,7 @@ mod tests {
             report(&app, job.uuid, agent, Status::Terminated),
         );
         let renewed = renewed.unwrap();
-        assert!(renewed.renewed_jobs.is_empty() || renewed.renewed_jobs == vec![job.uuid]);
+        assert!(renewed.jobs.is_empty());
         assert_eq!(terminal, StatusCode::NO_CONTENT);
         let events = TaskEventEntry::filter_by_task_id(task.id)
             .order_by(TaskEventEntry::fields().event_offset().asc())
@@ -916,8 +1275,12 @@ mod tests {
         let missing_task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 0);
         let mut orphan = Job::new(&missing_task, Uuid::new_v4(), job.node_config_id, 0);
         orphan.agent_id = Some(agent);
-        orphan.polled_at = Some(Timestamp::now());
-        orphan.expired_at = Some(Timestamp::now() + Duration::from_secs(30));
+        orphan.polled_at =
+            Some(Timestamp::from_microsecond(Timestamp::now().as_microsecond()).unwrap());
+        orphan.expired_at = Some(
+            Timestamp::from_microsecond(Timestamp::now().as_microsecond()).unwrap()
+                + Duration::from_secs(30),
+        );
         orphan.status = Status::Polled;
         orphan.write(&mut db).await.unwrap();
         assert!(app.succeed_job(orphan.uuid, agent).await.is_err());
@@ -950,12 +1313,12 @@ mod tests {
         app.poll(&mut AgentRef::new(agent, capacity, vec![]), 1)
             .await
             .unwrap();
-        assert_eq!(
+        assert!(
             poll_active(&app, agent, vec![job.uuid])
                 .await
                 .unwrap()
-                .renewed_jobs,
-            vec![job.uuid]
+                .jobs
+                .is_empty()
         );
         let before = Job::filter_by_id(job.id)
             .get(&mut db)

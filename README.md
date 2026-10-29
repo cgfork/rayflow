@@ -5,7 +5,7 @@ A run walks the nodes of a graph through a small status state machine, persistin
 every transition so the work can be driven forward, deferred, and resumed across
 processes.
 
-The workspace splits into six core modules plus the `server`, `pilot`, and `agent`
+The workspace splits into five core modules plus the `server`, `pilot`, and `agent`
 binaries:
 
 - **`event`** — backend-independent `Event`, `Emit`, `Read`, and `Poll` contracts.
@@ -14,14 +14,12 @@ binaries:
 - **`runtime`** — command application and execution state, with an always-available MySQL backend.
 - **`scheduler`** — `Actuator` consumes logs and drives graph state; the `Scheduler`
   trait abstracts scheduling to agents or external job schedulers. `AgentRef`
-  implements `JobPoll` to renew and redeliver existing claims and claim new jobs
+  implements `JobPoll` to redeliver inactive jobs and claim new jobs
   that fit the remaining resource capacity in one transaction.
-- **`executor`** — job primitives for executing task work, including the built-in
-  script job.
 - **`server`** — an HTTP API (axum) that serves the runtime.
 - **`pilot`** — a continuously running, leader-elected command, task, and
   task-event consumer.
-- **`agent`** — polls jobs that fit its reported resource capacity through the HTTP API.
+- **`agent`** — recovers and runs container jobs, polls the server, and reports results.
 
 ```mermaid
 flowchart LR
@@ -30,7 +28,7 @@ flowchart LR
     actuator --> jobs[Job]
     jobs --> scheduler[Scheduler trait]
     agent[Agent via HTTP] -->|POST /jobs/poll| jobs
-    scheduler --> leases[Job claim leases]
+    scheduler --> timeouts[Job timeouts]
     scheduler -. external adapter .-> external[Kubernetes / Volcano]
 ```
 
@@ -123,7 +121,7 @@ consumption, as the pilot does through leader election.
 
 `Scheduler<B>` defines `schedule(&self, backend: &mut B)`, returning the number
 of scheduling changes with an implementation-specific error. The default
-`AgentScheduler` reclaims expired claims; agents directly claim fitting jobs
+`AgentScheduler` fails timed-out jobs; agents directly claim fitting jobs
 through `POST /jobs/poll`. Other implementations can submit jobs to an external
 scheduler such as Kubernetes Volcano.
 `Pilot::with_scheduler(implementation)` selects an implementation; the pilot
@@ -154,37 +152,33 @@ another task. The previous job stays `Yielded`.
 `NodeConfig.required_cpu_cores` and `NodeConfig.required_memory_bytes` describe
 minimum job resources. When the actuator creates a `Job`, it copies these values
 from the node's latest configuration. `AgentRef::new(agent_id, resources,
-active_jobs)` implements `JobPoll::poll(backend, maximum)` to reclaim expired
-claims, renew active claims, redeliver unstarted claims, and claim fitting work
-in one transaction. All existing claims reserve resources, including claims
-outside the delivery limit. Both remaining CPU and
-memory limits apply in the database query. Both Polled redelivery and Scheduled
-claims exclude IDs in `active_jobs`, deduct each selected job from the same
-remaining budget, and stop when either CPU or memory reaches zero. `JobPoll::poll`
-takes `&mut self`; create a fresh `AgentRef` with the current total budget for
-each request. Failed polls leave its budget unchanged. Guarded ORM
-updates make claims atomic; concurrent agents cannot claim the same job.
-`renew_claims` renews only owned `Polled` jobs listed in `active_jobs`.
-Unstarted `Polled` claims also renew when redelivered.
+active_jobs)` implements `JobPoll::poll(backend, maximum)` to redeliver inactive
+Polled jobs and claim fitting Scheduled jobs in one transaction. The request
+provides the total CPU/memory budget, including current jobs. Existing claims
+reserve resources, including claims outside the delivery limit. Both pollers
+exclude IDs in `active_jobs`, deduct delivered jobs from the remaining budget,
+and stop when either resource is exhausted. Create a fresh `AgentRef` for each
+request. Failed polls leave its budget unchanged. Guarded ORM updates prevent
+concurrent claims of the same job.
 
-Each node configuration must specify `node_config.lease` as a positive
-millisecond duration that fits timestamp arithmetic. There is no default lease.
-A missing configuration or `NULL` lease returns `JobLeaseNotFound`; an invalid
-duration returns `InvalidJobLease`. Job creation rejects these configurations,
-and a failed poll rolls back its claims. The pilot and polling endpoint reclaim
-owned `Polled` jobs whose stored `expired_at` is at or before the
-current time, without loading node configurations. Renewal, status reports,
-and the agent's execution deadline use the job's pinned
-configuration, even after a newer node version is created.
-`job.expired_at` is the absolute claim deadline (a timestamp, not a duration). Claims
-and renewals set it to the renewal time plus the pinned node lease. It is `NULL`
-before claiming and after expiry recovery, cancellation, or terminal settlement.
-Reclamation skips claims with a `NULL` deadline; existing claims must be renewed
-or have their deadlines backfilled before they can be reclaimed. Renewal and
-status-report checks can still derive a missing deadline from `polled_at` and
-the pinned lease.
-Task events set the job to `Yielded`, `Succeeded`, `Failed`, or `Terminated` and
-clear its claim. A restarted agent can recover old work after the lease expires.
+Each node configuration must specify `node_config.lease` as a positive job
+lifetime in milliseconds. Missing configurations or `NULL` durations return
+`JobLeaseNotFound`; invalid durations return `InvalidJobLease`. Job creation
+rejects these configurations, and failed polls roll back their claims.
+
+`job.expired_at` is the absolute runtime expiry. Claiming a Scheduled job or
+redelivering a live inactive Polled job sets it to the delivery time plus the
+pinned node configuration's lifetime. Active jobs are never renewed. Expired
+jobs are neither redelivered nor returned to Scheduled. The timestamp is `NULL`
+before first delivery and is preserved after completion.
+
+At expiry, the agent kills the container, persists a failed result with exit
+code 124, and reports failure. Reports retry through server outages. The pilot
+fails remaining Polled jobs when `expired_at < now - job_timeout_gap`, appending
+a Fail task event atomically. The gap defaults to `10s` and accepts duration
+strings through `RAYFLOW_PILOT_JOB_TIMEOUT_GAP`. Rows with no expiry are skipped.
+Task events set jobs to Yielded, Succeeded, Failed, or Terminated and clear their
+ownership. Terminal jobs retain their outcome and expiry.
 
 ### Command event log (event sourcing)
 
@@ -196,19 +190,6 @@ through the log with `CommandPoll::poll` (read the first unacknowledged
 contiguous entries in offset order) and `CommandPoll::ack` (persist the global
 consumed offset in `poll_offset`). Because the log is the source of truth, a
 run's status can be driven — or replayed — from the recorded command sequence.
-
-### `executor` — task jobs
-
-- `Runnable` — a job that runs in a `JobContext` and returns a `TaskState`.
-  `Box<T>` is runnable when `T` is, so jobs can be stored behind a pointer.
-- `JobContext` — contains `job: Job` and `agent: Agent`; run, node, and
-  configuration details remain on the job and its loaded relations.
-- `Agent` — carries the executing agent's UUID (`id`) and resource capacity
-  (`resources`) from the poll that delivered the job.
-- `TaskState` / `ErrorCode` — report the event and exit code a run produced, and
-  map execution errors to numeric codes.
-- `Script` (in `src/script.rs`) — runs source through an interpreter, e.g.
-  `sh -c <source>`, and reports success or failure as a task event.
 
 ### `server` — HTTP API
 
@@ -238,7 +219,8 @@ produced once a consumer has applied them.
 | `POST` | `/runs/rerun` | `{ data_id, graph_id, node }` | Emit `Command::Rerun` for one node. |
 | `POST` | `/runs/resume` | `{ data_id, graph_id, node }` | Emit `Command::Resume` for a pending node. |
 | `POST` | `/runs/dryrun` | `{ data_id, graph_id, nodes? }` | Emit `Command::Dryrun`. |
-| `POST` | `/jobs/poll` | `{ agent_id, batch, resources: { cpu_cores, memory_bytes }, active_jobs? }` | Claim resource-matching jobs with execution config and context. |
+| `POST` | `/jobs/poll` | `{ agent_id, batch, resources: { cpu_cores, memory_bytes }, active_jobs?, wait_ms? }` | Claim resource-matching jobs with execution config and context; optionally wait for work. |
+| `POST` | `/job/cancel` | `{ job_id, agent_id }` | End the job as Terminated and append `TaskEvent::Cancel`. |
 | `POST` | `/job/yield` | `{ job_id, agent_id }` | End the job as Yielded and append `TaskEvent::Yield`. |
 | `POST` | `/job/succeed` | `{ job_id, agent_id }` | Complete the job and append `TaskEvent::Succeed`. |
 | `POST` | `/job/fail` | `{ job_id, agent_id }` | Fail the job and append `TaskEvent::Fail`. |
@@ -283,15 +265,15 @@ take over after the lease expires or is released. On every pass the leader:
 3. Delegates task and task-event consumption to `Actuator::tick_in`, including
    application of resulting commands.
 4. Calls the configured `Scheduler::schedule` implementation (by default,
-   `AgentScheduler` releases expired job claims).
-5. Commits log effects, offsets, and claim recovery together.
+   `AgentScheduler` fails jobs expired beyond the grace period).
+5. Commits log effects, offsets, and timeout failures together.
 
 Command, task, and task-event consumption all use a persisted global offset and
 skip an auto-increment gap only after `gap_timeout_ms` (10000 by default).
 
 Configuration is layered like the server's: defaults, then `rayflow.yaml`, then
 the environment. Pilot settings include `batch`, `poll_interval_ms`,
-`leader_name`, `leader_lease_ms`, and `gap_timeout_ms`;
+`leader_name`, `leader_lease_ms`, `gap_timeout_ms`, and `job_timeout_gap`;
 `RAYFLOW_PILOT_*` variables override them.
 Run it with:
 
@@ -299,42 +281,129 @@ Run it with:
 DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow cargo run -p pilot
 ```
 
-### `agent` — job consumer
+### `agent` — execution and polling
 
-The agent samples CPU usage and available memory on every poll, then sends
-`POST /jobs/poll` with its identity, batch size, resource capacity, and active
-job UUIDs. CPU capacity is estimated from current utilization and rounded to
-whole cores. Memory respects host and cgroup limits when available. Optional
-`cpu_cores` and `memory_bytes` settings cap the agent's resource budget.
+`Connector::events()` returns a `futures_util::Stream` of events or connector
+errors. Its `Event<'a>` associated type lets events borrow from the connector.
+`DockerConnector` streams native Docker event messages; `Provider` wraps them
+in `Event::Docker` and converts errors to the shared container error type.
 
-```json
-{"agent_id":"83f17806-0e06-4185-bfd0-f682d47c1111","batch":64,"resources":{"cpu_cores":8,"memory_bytes":17179869184},"active_jobs":[]}
+`Agent` owns the execution provider and job workdir, with no HTTP client or
+polling settings. `client::Client` handles HTTP polling and provides explicit
+`cancel`, `fail`, `succeed`, and `terminate` methods, each taking the agent and job
+UUIDs. `Agentic` receives both plus `Settings`, polls sequentially,
+and starts each job in a separate asynchronous task. Slow container starts,
+execution, and report retries do not block polling. Active job IDs prevent
+duplicate starts and reserve resources; polling does not extend active jobs' lifetimes.
+
+Construct the components with `Client::new(&settings)`,
+`Agent::new(&settings.workdir, provider)`, and
+`Agentic::with_agent(agent, client, settings)?.start().await`.
+`Agentic::new(settings)?` constructs the default Docker provider and HTTP client.
+The binary loads settings, starts `Agentic`, and handles Ctrl-C and SIGTERM.
+
+Run `RAYFLOW_AGENT_ID=12345678-1234-4234-8234-123456789abc cargo run -p agent`
+with Docker available. Give each agent a unique, stable UUID and keep the same
+workdir across restarts so it can recover its claims. Settings load from the
+optional `rayflow.yaml` file; `RAYFLOW_AGENT_CONFIG` or `RAYFLOW_CONFIG` selects
+an explicit file. For example:
+
+```yaml
+id: 12345678-1234-4234-8234-123456789abc
+server_url: http://127.0.0.1:8080
+workdir: .rayflow/jobs
+batch: 64
+poll_interval: 1s
+request_timeout: 60s
+resources:
+  cpu_cores: 4
+  memory_bytes: 4294967296
 ```
 
-The capacity includes active reservations because the server subtracts existing
-claims before selecting more work. The agent adds reservations to live available
-resources, bounded by its limits, to avoid subtracting running jobs' memory twice.
-Each agent process needs its own UUID and sends one poll at a time.
+`id` is required. The other values shown are defaults, except resource capacity,
+which defaults to the host's available CPU count and total memory. Environment
+variables override file values using the `RAYFLOW_AGENT_` prefix, such as
+`RAYFLOW_AGENT_SERVER_URL` and `RAYFLOW_AGENT_POLL_INTERVAL=250ms`. Use double
+underscores for nested resource fields, for example
+`RAYFLOW_AGENT_RESOURCES__CPU_CORES=2`. Docker connection settings use Bollard's
+standard environment, including `DOCKER_HOST`.
 
-The response is `{ jobs, renewed_jobs }`: `jobs` contains `Job` objects directly,
-including their loaded `run`, `node_run`, and `node_config` relations.
-`renewed_jobs` contains the UUIDs of active claims successfully renewed in the
-poll transaction. The agent passes the full job and its own information in
-`JobContext`, and derives its lease from `node_config.lease`. It executes scripts using
-the pinned `node_config.config` payload:
+`Agent::prepare` persists the job and its pinned configuration and pulls a missing
+image. `Agent::run` creates a container named `rayflow-{job UUID}`, applies the
+job's CPU and memory limits, writes its container metadata, and starts it without
+waiting for completion. Repeated calls reuse the existing container. Running
+containers keep their original job files and expiry. `Agent::destroy` removes a
+stopped container and cleans its files while retaining the lock inode.
 
-```json
-{"interpreter":"sh","source":"echo hello"}
+On startup, `Agentic` discovers job directories, reconnects to existing containers,
+and retries unreported results. UUID-based container names allow recovery even if
+the agent crashed before writing `container.json`. Container waits and provider
+events detect completion; event streams reconnect after an interruption. Results
+are persisted before delivery, and acknowledged jobs are marked terminal in
+`job.json`. `shutdown()` stops polling and reporting while leaving isolated
+containers running for a new `Agentic` instance to recover.
+
+The intended job filesystem is:
+
+```text
+{WORKDIR}/{Job UUID}/job.json
+{WORKDIR}/{Job UUID}/result.json
+{WORKDIR}/{Job UUID}/pid
+{WORKDIR}/{Job UUID}/lock
+{WORKDIR}/{Job UUID}/container.json
+{WORKDIR}/{Job UUID}/runtime/started_at
+{WORKDIR}/{Job UUID}/runtime/stdout
 ```
 
-For each unexpired claim returned by polling, the agent executes the script, then
-reports `Succeeded` for exit code zero or `Failed` for nonzero exit, a signal,
-an invalid config, or a spawn error. Jobs run concurrently while polling
-continues. Ctrl-C stops the interpreters and reports `Terminated`, allowing up
-to `shutdown_timeout_ms` for status delivery.
+`JobFs` uses asynchronous Tokio file operations to read and atomically replace
+job and result JSON files. Writes flush and sync a temporary file before renaming
+it into place. Results contain
+an `exit_code`; container metadata contains `type` and `id`. The `started_at`
+file contains a timestamp with a UTC offset (for example,
+`2026-10-28T12:00:00Z`), and `stdout` is opened read-only. Missing files return
+`NotFound`; malformed JSON or timestamps return `InvalidData`.
 
-The server accepts terminal actions at `POST /job/yield`, `POST /job/succeed`,
-`POST /job/fail`, and `POST /job/terminate`. Each takes `{ job_id, agent_id }`,
+The per-job `lock` file holds an exclusive OS lock until `unlock` or
+`JobFs` is dropped. Lock acquisition retries without blocking the async runtime.
+Repeated locking or unlocking on the same instance is
+idempotent. Callers coordinate updates with this lock; file reads and writes do
+not acquire it implicitly. `Agent::jobs` discovers jobs by listing WORKDIR.
+
+### Job API and timeouts
+
+`POST /jobs/poll` accepts optional `wait_ms` in integer milliseconds, from zero
+up to the configured `poll_timeout` (`30s` by default). When `wait_ms` is omitted
+or null, each request chooses a random wait in `[poll_timeout / 2, poll_timeout)`.
+Set `wait_ms: 0` for an immediate poll. Server polling settings use duration
+strings, for example:
+
+```yaml
+poll_timeout: 10s
+poll_retry_interval: 250ms
+```
+
+Configure `poll_timeout` in the server configuration file or with
+`RAYFLOW_POLL_TIMEOUT`; it must be at least `2ms`.
+With no active jobs, an empty poll waits asynchronously and retries every
+`poll_retry_interval` (`250ms` by default) until work is claimed or the wait
+expires. Configure the interval in the server configuration file or with
+`RAYFLOW_POLL_RETRY_INTERVAL`; it must be at least `1ms`. Retry sleeps
+are capped by the request's remaining wait. Each attempt uses a fresh
+resource budget and commits its own short transaction before waiting; no
+database transaction, connection, or lock is held during the sleep. The response
+is `{ jobs }`, with an empty array on idle timeout. Available jobs and database
+errors return immediately. Requests with nonempty `active_jobs` return after
+one attempt.
+
+Keep one outstanding poll per agent ID and set HTTP/client/proxy timeouts above
+`wait_ms` (or `poll_timeout` when omitted) plus database processing time.
+The wait limit does not cancel an
+in-flight claim transaction. Long-polling reduces agent HTTP requests, not
+database queries; it does not use database locks as notifications.
+
+The server accepts terminal actions at `POST /job/cancel`, `POST /job/yield`,
+`POST /job/succeed`, `POST /job/fail`, and `POST /job/terminate`.
+Each takes `{ job_id, agent_id }`,
 validates the claim, and updates the job and appends its task event in one ORM
 transaction, returning `204 No Content`:
 
@@ -343,52 +412,32 @@ transaction, returning `204 No Content`:
 | `Yielded` | `Yield` |
 | `Succeeded` | `Succeed` |
 | `Failed` | `Fail` |
-| `Terminated` | `Terminate` |
+| `Terminated` | `Terminate` or `Cancel` |
 
-Repeated terminal actions append no duplicate event. Expired claims, reports by
-another agent, and terminal regressions return `409 Conflict`. Claim renewal uses
-only sequential polling with `active_jobs`, not a separate status or renewal API.
-The agent waits at most one-third of the shortest active lease between polls,
-bounded by `poll_interval_ms`. Confirmed renewals extend local execution deadlines; missing
-acknowledgements or elapsed deadlines cancel work without a terminal report.
-Renewals emit no task event. Yielding ends
-the job; retries emit no additional `Yield` event. The pilot consumes task events
-to drive graph state.
+Repeated terminal actions append no duplicate event. Reports from another
+agent and terminal regressions return `409 Conflict`. After expiry, the owning
+agent may still report Failed; other terminal actions return `409 Conflict`.
+The pilot consumes task events to drive graph state. Polling emits no task event.
 
-Start the API server and pilot, then run an agent:
+Polling resets expiry only for jobs actually delivered. IDs in `active_jobs`
+are excluded from delivery and keep their existing expiry. Expired Polled jobs
+are failed by the agent, or by the pilot after the configured grace period.
+Delivery remains at least once, so jobs should tolerate repeated delivery.
 
-```sh
-cargo run -p agent
-```
-
-Agent settings come from optional `rayflow.yaml` and `RAYFLOW_AGENT_*` overrides.
-Defaults are a generated UUID, `api_url=http://127.0.0.1:8080`, host CPU/memory
-limits, `batch=64`, `poll_interval_ms=250`, `request_timeout_ms=30000`, and
-`shutdown_timeout_ms=5000`. `RAYFLOW_AGENT_CONFIG` (or `RAYFLOW_CONFIG`) selects
-another file. The agent uses reqwest and accesses only HTTP.
-
-Polling immediately renews owned `Polled` jobs listed in
-`active_jobs`, regardless of delivery limits or available capacity. Fitting
-unstarted `Polled` claims are renewed when redelivered so a lost poll response
-can recover. Other inactive claims keep their existing deadlines. `Polled`
-status reports also renew leases and let executions detect rejected claims.
-Transient HTTP failures retry within the confirmed lease; execution stops if the
-claim is lost. Expired `Polled` jobs become `Scheduled` again.
-Delivery remains at least once, so scripts should tolerate retries after an
-agent failure. Terminal jobs retain their outcome.
-
-Timeouts use milliseconds and can be configured in the file or environment:
+Server polling settings use duration strings such as `10s`, `250ms`, and `1.5s`.
+Pilot settings ending in `_ms` use integer milliseconds. Configure these in the
+file or environment:
 
 | Component | Field | Default | Environment override |
 | --- | --- | --- | --- |
+| Server | `poll_timeout` | `30s` | `RAYFLOW_POLL_TIMEOUT` |
+| Server | `poll_retry_interval` | `250ms` | `RAYFLOW_POLL_RETRY_INTERVAL` |
 | Pilot | `gap_timeout_ms` | 10000 | `RAYFLOW_PILOT_GAP_TIMEOUT_MS` |
-| Agent | `request_timeout_ms` | 30000 | `RAYFLOW_AGENT_REQUEST_TIMEOUT_MS` |
-| Agent | `shutdown_timeout_ms` | 5000 | `RAYFLOW_AGENT_SHUTDOWN_TIMEOUT_MS` |
+| Pilot | `job_timeout_gap` | `10s` | `RAYFLOW_PILOT_JOB_TIMEOUT_GAP` |
 
-Keep the agent's poll interval comfortably below the shortest configured node
-lease. Job leases come exclusively from `node_config.lease`; server and pilot
+Job lifetimes come exclusively from `node_config.lease`; server and pilot
 settings do not supply a fallback. Library callers use `AgentRef` with
-`JobPoll::poll` for polling and `AgentScheduler` for expiry recovery.
+`JobPoll::poll` for polling and `AgentScheduler` for timeout failure handling.
 `Pilot::with_gap_timeout` or `Actuator::with_gap_timeout` configures missing log
 offsets.
 
@@ -418,7 +467,7 @@ To add per-node leases to an existing database:
 ```sql
 ALTER TABLE node_config
     ADD COLUMN lease BIGINT UNSIGNED NULL
-        COMMENT 'required job claim lease in milliseconds; NULL returns a missing lease error';
+        COMMENT 'required job lifetime in milliseconds; NULL returns a missing lease error';
 ```
 
 Before restarting, explicitly backfill the lease for each configuration version
@@ -427,12 +476,12 @@ Choose durations for those jobs; leaving the column `NULL` returns an error.
 The nullable column supports reporting missing leases in legacy rows and does
 not provide a fallback.
 
-To persist claim deadlines in an existing database:
+To persist job expiry timestamps in an existing database:
 
 ```sql
 ALTER TABLE job
     ADD COLUMN expired_at DATETIME(6) NULL
-        COMMENT 'claim deadline; renewed from the pinned node-config lease',
+        COMMENT 'job runtime expiry; reset on delivery from the pinned node-config lifetime',
     ADD KEY idx_job_expired_at (expired_at);
 ```
 
@@ -537,10 +586,9 @@ crates/
   event/       Command/Task/TaskEvent logs, polling, and Reactive consumer
   runtime/     CommandApply + execution backend and state
   scheduler/   Actuator + Job + Scheduler trait + direct agent polling
-  executor/    JobContext/Runnable/TaskState + script.rs Script
 server/        axum HTTP API binary (router + RAYFLOW_ADDR bind)
 pilot/         leader-elected command/task/task-event consumer binary
-agent/         HTTP job polling binary with resource capacity
+agent/         execution, independent HTTP client, async polling loop and binary
 rayflow.sql    MySQL schema (task, run, run_config, node_config, node_run, job, task_event, command_entry, poll offsets)
 ```
 
@@ -554,7 +602,7 @@ they never modify or delete log entries. Pass a transaction as `B` when effects
 and acknowledgements must commit together.
 
 The `event` crate implements these traits directly for `CommandEntry`, `Task`,
-and `TaskEventEntry`. Runtime, scheduler, server, pilot, and executor import
+and `TaskEventEntry`. Runtime, scheduler, server, and pilot import
 these canonical types rather than defining separate event-log models.
 
 The standalone `event::command` module is always available.

@@ -122,7 +122,7 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
 
 #[tokio::test]
 async fn yielded_jobs_end_and_resume_creates_new_tasks_in_the_same_node_run() {
-    use scheduler::{Job, actuator::Status as JobStatus, reclaim_expired_in, yield_job};
+    use scheduler::{Job, actuator::Status as JobStatus, fail_expired_in, yield_job};
 
     let Some((mut db, dag, data_id)) = setup().await else {
         return;
@@ -152,7 +152,16 @@ async fn yielded_jobs_end_and_resume_creates_new_tasks_in_the_same_node_run() {
     for use_status_report in [true, false] {
         let mut active = AgentRef::new(agent_id, capacity, vec![job.uuid]);
         assert!(active.poll(&mut db, 0).await.unwrap().next().is_none());
-        assert_eq!(active.renewed_jobs(), &[job.uuid]);
+        assert_eq!(
+            Job::filter_by_id(job.id)
+                .get(&mut db)
+                .await
+                .unwrap()
+                .expired_at
+                .unwrap()
+                .as_microsecond(),
+            job.expired_at.unwrap().as_microsecond()
+        );
         assert_eq!(
             node_run(&mut db, node).await,
             (revision, "Running".to_owned())
@@ -174,12 +183,17 @@ async fn yielded_jobs_end_and_resume_creates_new_tasks_in_the_same_node_run() {
         let yielded = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
         assert_eq!(yielded.status, JobStatus::Yielded);
         assert!(yielded.status.is_terminal());
-        assert!(
-            yielded.agent_id.is_none()
-                && yielded.polled_at.is_none()
-                && yielded.expired_at.is_none()
+        assert!(yielded.agent_id.is_none() && yielded.polled_at.is_none());
+        assert_eq!(
+            yielded.expired_at.unwrap().as_microsecond(),
+            job.expired_at.unwrap().as_microsecond()
         );
-        assert_eq!(reclaim_expired_in(&mut db).await.unwrap(), 0);
+        assert_eq!(
+            fail_expired_in(&mut db, std::time::Duration::ZERO)
+                .await
+                .unwrap(),
+            0
+        );
         assert!(
             AgentRef::new(agent_id, capacity, vec![job.uuid])
                 .poll(&mut db, 1)
@@ -189,7 +203,6 @@ async fn yielded_jobs_end_and_resume_creates_new_tasks_in_the_same_node_run() {
                 .is_none()
         );
         assert!(active.poll(&mut db, 0).await.unwrap().next().is_none());
-        assert!(active.renewed_jobs().is_empty());
         assert!(
             scheduler::succeed_job(&mut db, job.uuid, agent_id)
                 .await

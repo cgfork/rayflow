@@ -9,7 +9,8 @@
 //! * `POST /runs/resume` — emit `Command::Resume` for a pending node.
 //! * `POST /runs/dryrun` — emit `Command::Dryrun` for the given nodes.
 //! * `POST /task_events` — emit a `TaskEvent` for a task.
-//! * `POST /jobs/poll` — claim jobs matching the agent's CPU and memory capacity.
+//! * `POST /jobs/poll` — claim jobs matching the agent's capacity, optionally long-polling.
+//! * `POST /job/cancel` — cancel a job and emit `TaskEvent::Cancel`.
 //! * `POST /job/yield` — yield a job and emit `TaskEvent::Yield`.
 //! * `POST /job/succeed` — complete a job and emit `TaskEvent::Succeed`.
 //! * `POST /job/fail` — fail a job and emit `TaskEvent::Fail`.

@@ -7,7 +7,6 @@ members = [
     "crates/event",
     "crates/runtime",
     "crates/scheduler",
-    "crates/executor",
     "crates/coordinator",
 ]
 resolver = "2"
@@ -22,9 +21,11 @@ event = {path = "crates/event"}
 graph = {path = "crates/graph"}
 runtime = {path = "crates/runtime"}
 scheduler = {path = "crates/scheduler"}
-executor = {path = "crates/executor"}
 coordinator = {path = "crates/coordinator", default-features = false}
 axum = "0.8"
+fastrand = "2"
+futures-util = "0.3"
+bollard = "0.21"
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sysinfo = { version = "0.37", default-features = false, features = ["system"] }
@@ -32,6 +33,7 @@ toasty = { version = "0.11", features = ["mysql", "serde", "jiff"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 jiff = { version = "0.2", features = ["serde"] }
 tokio = { version = "1.53", features = ["sync"] }

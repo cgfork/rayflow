@@ -100,6 +100,7 @@ mod tests {
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
             database_url: String::new(),
+            ..Config::default()
         };
         App::new(db, config, TestGraphStore::default())
     }

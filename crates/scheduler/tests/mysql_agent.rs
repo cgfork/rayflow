@@ -91,7 +91,7 @@ async fn poll(
 }
 
 #[tokio::test]
-async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs() {
+async fn direct_poll_matches_resources_reserves_claims_and_fails_expired_jobs() {
     let Some(mut db) = setup().await else {
         eprintln!("skipping: set DATABASE_URL to run MySQL agent polling tests");
         return;
@@ -154,6 +154,7 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
             .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(2)).await;
+    let before_active = Job::filter_by_id(job_a.id).get(&mut db).await.unwrap();
     assert!(
         AgentRef::new(
             agent_a,
@@ -168,7 +169,8 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
         "the active claims consume all of the agent's resource budget"
     );
     let renewed = Job::filter_by_id(job_a.id).get(&mut db).await.unwrap();
-    assert!(renewed.polled_at.unwrap() >= claimed[0].polled_at.unwrap());
+    assert_eq!(renewed.polled_at, before_active.polled_at);
+    assert_eq!(renewed.expired_at, before_active.expired_at);
 
     let agent_b = Uuid::new_v4();
     let claimed_c = poll(
@@ -195,10 +197,20 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
         .expect("expire one claim");
     assert_eq!(AgentScheduler::new().schedule(&mut db).await.unwrap(), 1);
     let expired = Job::filter_by_id(job_a.id).get(&mut db).await.unwrap();
-    assert_eq!(expired.status, Status::Scheduled);
+    assert_eq!(expired.status, Status::Failed);
     assert!(expired.agent_id.is_none());
     assert!(expired.polled_at.is_none());
-    assert!(expired.expired_at.is_none());
+    assert_eq!(
+        expired.expired_at.unwrap().as_microsecond(),
+        (expired_at + Duration::from_secs(30)).as_microsecond()
+    );
+
+    let replacement = Job::new(&task_a, run.uuid, job_a.node_config_id, job_a.run_config_id);
+    replacement.write(&mut db).await.unwrap();
+    let job_a = Job::filter_by_uuid(replacement.uuid)
+        .get(&mut db)
+        .await
+        .unwrap();
 
     let agent_c = Uuid::new_v4();
     let agent_d = Uuid::new_v4();
@@ -247,7 +259,7 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
     assert_eq!(settled.status, Status::Yielded);
     assert!(settled.agent_id.is_none());
     assert!(settled.polled_at.is_none());
-    assert!(settled.expired_at.is_none());
+    assert!(settled.expired_at.is_some());
     if owner == agent_c {
         assert_eq!(left[0].id, job_a.id);
     } else {
@@ -286,7 +298,7 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
         );
     }
 
-    // The polling endpoint also recovers abandoned claims using their pinned leases.
+    // Polling leaves timeout handling to the pilot.
     Job::filter_by_id(job_b.id)
         .update()
         .status(Status::Polled)
@@ -296,9 +308,24 @@ async fn direct_poll_matches_resources_reserves_claims_and_recovers_expired_jobs
         .await
         .unwrap();
     let recovered = poll(&mut db, Uuid::new_v4(), capacity_a, 1).await.unwrap();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].id, job_b.id);
-    assert_ne!(recovered[0].agent_id, Some(agent_a));
+    assert!(recovered.is_empty());
+    assert_eq!(
+        Job::filter_by_id(job_b.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .status,
+        Status::Polled
+    );
+    assert_eq!(AgentScheduler::new().schedule(&mut db).await.unwrap(), 1);
+    assert_eq!(
+        Job::filter_by_id(job_b.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .status,
+        Status::Failed
+    );
 }
 
 #[tokio::test]
@@ -594,17 +621,14 @@ async fn missing_leases_return_errors_and_roll_back_polling() {
                 .unwrap();
             let mut active =
                 AgentRef::new(agent_id, ResourceCapacity::default(), vec![invalid.uuid]);
-            assert!(matches!(active.poll(&mut db, 0).await,
-                Err(scheduler::Error::JobLeaseNotFound(id)) if id == config_id));
+            assert_eq!(active.poll(&mut db, 0).await.unwrap().count(), 0);
             assert_eq!(AgentScheduler::new().schedule(&mut db).await.unwrap(), 0);
             for result in [
                 scheduler::yield_job(&mut db, invalid.uuid, agent_id).await,
                 scheduler::succeed_job(&mut db, invalid.uuid, agent_id).await,
-                scheduler::fail_job(&mut db, invalid.uuid, agent_id).await,
                 scheduler::terminate_job(&mut db, invalid.uuid, agent_id).await,
             ] {
-                assert!(matches!(result,
-                    Err(scheduler::Error::JobLeaseNotFound(id)) if id == config_id));
+                assert!(matches!(result, Err(scheduler::Error::JobConflict(_))));
             }
             let unchanged = Job::filter_by_uuid(invalid.uuid)
                 .get(&mut db)
@@ -694,16 +718,16 @@ async fn polling_limits_redelivery_and_reserves_all_owned_claims() {
             .unwrap();
     }
     let inactive = Job::filter_by_id(first[1].id).get(&mut db).await.unwrap();
+    let active_before = Job::filter_by_id(first[0].id).get(&mut db).await.unwrap();
     let mut active = AgentRef::new(id, capacity, vec![first[0].uuid]);
     assert_eq!(active.poll(&mut db, 0).await.unwrap().count(), 0);
-    assert!(
+    assert_eq!(
         Job::filter_by_id(first[0].id)
             .get(&mut db)
             .await
             .unwrap()
-            .polled_at
-            .unwrap()
-            > before
+            .polled_at,
+        active_before.polled_at
     );
     assert_eq!(
         Job::filter_by_id(first[1].id)
