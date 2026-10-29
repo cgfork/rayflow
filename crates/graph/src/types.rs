@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use crate::{Graph, Id, NodeMut, NodeRef};
+use crate::{Diff, Graph, Id, NodeMut, NodeRef};
 
 impl Id for Uuid {}
 
@@ -8,6 +8,14 @@ impl Id for Uuid {}
 pub enum Kind {
     File,
     Directory,
+}
+
+impl Diff for Kind {
+    type Item = (Self, Self);
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self != other).then(|| (self.clone(), other.clone()))
+    }
 }
 
 /// An output produced by a node.
@@ -21,17 +29,33 @@ pub struct Output {
     pub multiple: bool,
 }
 
+impl Diff for Output {
+    type Item = (Self, Self);
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self != other).then(|| (self.clone(), other.clone()))
+    }
+}
+
 /// An input consumed by a node.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Input {
     /// File name of the input.
     pub file_name: String,
-    /// Source (output reference) this input is read from.
+    /// Source output reference in `node_name.file_name` form.
     pub source: String,
     /// Whether the input is mandatory.
     pub required: bool,
     /// Expected format, if any.
     pub format: Option<String>,
+}
+
+impl Diff for Input {
+    type Item = (Self, Self);
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self != other).then(|| (self.clone(), other.clone()))
+    }
 }
 
 /// A single node (task) in a graph.
@@ -47,6 +71,14 @@ pub struct Node {
     pub inputs: Vec<Input>,
     /// Outputs produced by the node.
     pub outputs: Vec<Output>,
+}
+
+impl Diff for Node {
+    type Item = (Self, Self);
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self != other).then(|| (self.clone(), other.clone()))
+    }
 }
 
 impl std::fmt::Display for Node {
