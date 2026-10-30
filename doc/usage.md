@@ -153,6 +153,9 @@ The service endpoints are:
 | `POST` | `/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
 | `POST` | `/runs/dryrun` | Prepare targets while mocking predecessors; body has `data_id`, `graph_id`, and optional `nodes`. |
 | `GET` | `/runs/graph_state` | Read state with `data_id` and `graph_id` query parameters. |
+| `GET` | `/graphs/{graph_id}/draft` | Read the editable graph draft. |
+| `PUT` | `/graphs/{graph_id}/draft` | Create or replace the draft. |
+| `POST` | `/graphs/{graph_id}/publish` | Validate and publish the draft as the next graph version. |
 | `POST` | `/task_events` | Emit an event for an existing task; body has `task_id` and `event`. |
 | `POST` | `/jobs/poll` | Long-poll and claim jobs that fit an agent's resources. |
 | `POST` | `/job/cancel` | Cancel a claimed job. |
@@ -180,6 +183,37 @@ curl -X POST http://127.0.0.1:8080/runs/start \
 
 An empty `nodes` array starts graph roots. `graph_state` returns the run
 revision, graph edges, and each node's current state.
+
+### Graph drafts
+
+Write a complete draft with `PUT /graphs/{graph_id}/draft`:
+
+```sh
+curl -X PUT http://127.0.0.1:8080/graphs/00000001-0000-0000-0000-000000000000/draft \
+  -H 'content-type: application/json' \
+  -d '{
+    "actor": "editor",
+    "graph": {
+      "id": "00000001-0000-0000-0000-000000000000",
+      "name": "example",
+      "version": 0,
+      "nodes": [{
+        "id": "00000000-0000-0000-0000-000000000002",
+        "name": "task",
+        "node_type": "script",
+        "inputs": [],
+        "outputs": []
+      }],
+      "edges": []
+    }
+  }'
+```
+
+`GET` returns the draft JSON together with its audit fields. Drafts may be
+temporarily invalid while they are being edited. `POST /graphs/{graph_id}/publish`
+accepts `{ "actor": "publisher" }`, validates the graph (including the cycle
+and single-root rules), assigns the next version, and returns the immutable
+published graph record. Publishing does not delete the draft.
 
 ## Long polling and claims
 
@@ -223,6 +257,7 @@ Each job has an isolated directory under `workdir`:
 
 ```text
 {WORKDIR}/{job-uuid}/job.json
+{WORKDIR}/{job-uuid}/node.json
 {WORKDIR}/{job-uuid}/result.json
 {WORKDIR}/{job-uuid}/pid
 {WORKDIR}/{job-uuid}/lock
@@ -241,8 +276,9 @@ unreported results. Keep this directory across agent restarts.
 
 For a new database, apply `rayflow.sql` directly. Existing deployments must be
 migrated before restarting binaries when schema changes are introduced. The
-current schema includes versioned graph rows, `run_config.version`, pinned node
-configuration, resource requirements, agent claims, and persisted job expiry.
+current schema includes versioned graph rows, editable graph drafts,
+`run_config.version`, pinned node configuration, resource requirements, agent
+claims, and persisted job expiry.
 
 If a migration is needed, inspect the current `rayflow.sql` and apply an
 equivalent `ALTER TABLE` using a backup and a maintenance window. Do not assume

@@ -33,20 +33,14 @@ async fn setup() -> Option<Db> {
     Some(db)
 }
 
-async fn configured_job(
-    db: &mut Db,
-    run_id: Uuid,
-    data_id: Uuid,
-    graph_id: Uuid,
-    cpu_cores: u32,
-    memory_bytes: u64,
-) -> (Task, Job) {
+async fn configured_job(db: &mut Db, run: &Run, cpu_cores: u32, memory_bytes: u64) -> (Task, Job) {
     let now = Timestamp::now();
     let node_id = Uuid::new_v4();
     let node_run = NodeRun::create()
-        .run_id(run_id)
-        .data_id(data_id)
-        .graph_id(graph_id)
+        .run_id(run.uuid)
+        .data_id(run.data_id)
+        .graph_id(run.graph_id)
+        .version(run.version)
         .node_id(node_id)
         .revision(1)
         .status("Running".to_owned())
@@ -70,7 +64,7 @@ async fn configured_job(
         .exec(&mut *db)
         .await
         .expect("create node config");
-    let task = Task::new(data_id, graph_id, node_id, node_run.id);
+    let task = Task::new(run.data_id, run.graph_id, node_id, node_run.id);
     task.emit(&mut *db).await.expect("emit task");
     let job = Job::create_for_task(&task, db)
         .await
@@ -111,9 +105,9 @@ async fn direct_poll_matches_resources_reserves_claims_and_fails_expired_jobs() 
         .await
         .expect("create run");
 
-    let (task_a, job_a) = configured_job(&mut db, run.uuid, data_id, graph_id, 2, 512).await;
-    let (_, job_b) = configured_job(&mut db, run.uuid, data_id, graph_id, 2, 512).await;
-    let (_, job_c) = configured_job(&mut db, run.uuid, data_id, graph_id, 1, 1).await;
+    let (task_a, job_a) = configured_job(&mut db, &run, 2, 512).await;
+    let (_, job_b) = configured_job(&mut db, &run, 2, 512).await;
+    let (_, job_c) = configured_job(&mut db, &run, 1, 1).await;
     assert_eq!(
         (job_a.required_cpu_cores, job_a.required_memory_bytes),
         (2, 512)
@@ -352,6 +346,7 @@ async fn poll_checks_both_resources_and_scans_past_unfitting_candidates() {
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)
+        .version(run.version)
         .node_id(node_id)
         .revision(1)
         .status("Running".to_owned())
@@ -506,6 +501,7 @@ async fn job_creation_requires_a_valid_node_config_lease() {
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)
+        .version(run.version)
         .node_id(node_id)
         .revision(1)
         .status("Running".to_owned())
@@ -572,6 +568,7 @@ async fn missing_leases_return_errors_and_roll_back_polling() {
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)
+        .version(run.version)
         .node_id(node_id)
         .revision(1)
         .status("Running".to_owned())
@@ -675,7 +672,7 @@ async fn polling_limits_redelivery_and_reserves_all_owned_claims() {
         .unwrap();
     let mut jobs = Vec::new();
     for _ in 0..3 {
-        let (_, job) = configured_job(&mut db, run.uuid, run.data_id, run.graph_id, 1, 1).await;
+        let (_, job) = configured_job(&mut db, &run, 1, 1).await;
         jobs.push(job);
     }
     let id = Uuid::new_v4();

@@ -70,9 +70,9 @@ revision. `Dryrun` mocks upstream success so selected nodes can be prepared.
 
 ## Persistence Boundaries
 
-The database stores graph versions, runs, node runs, configurations, jobs, and
-the three append-only logs. Toasty models are the source of truth; `rayflow.sql`
-mirrors the model schema for direct provisioning.
+The database stores graph versions, editable graph drafts, runs, node runs,
+configurations, jobs, and the three append-only logs. Toasty models are the
+source of truth; `rayflow.sql` mirrors the model schema for direct provisioning.
 
 Transactions cover command effects and acknowledgements, actuator task/job
 materialization, task-event handling, and pilot timeout handling. External

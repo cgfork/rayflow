@@ -73,6 +73,7 @@ async fn resume_returns_to_ready_and_enqueues_one_task() {
     predecessor.id = Uuid::new_v4();
     dag.edges.push((predecessor.id, node));
     dag.nodes.push(predecessor);
+    let version = dag.version;
     let backend = Backend::new(db.clone(), TestGraphStore(dag));
     CommandEntry::new(data_id, graph_id, Command::Start { nodes: vec![node] })
         .apply(backend.clone())
@@ -80,6 +81,7 @@ async fn resume_returns_to_ready_and_enqueues_one_task() {
         .unwrap();
     let initial = NodeRun::all().exec(&mut db).await.unwrap().remove(0);
     assert_eq!(initial.status, Status::Ready.to_string());
+    assert_eq!(initial.version, version);
     assert_eq!(
         event::task::Task::all().exec(&mut db).await.unwrap().len(),
         1
@@ -166,6 +168,7 @@ async fn concurrent_run_transitions_once_without_creating_tasks() {
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)
+        .version(run.version)
         .node_id(node)
         .revision(0)
         .status(Status::Ready.to_string())

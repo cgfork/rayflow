@@ -1,6 +1,7 @@
 //! Rayflow API server.
 
-use server::{App, Config, StaticGraphStore};
+use graph::store::MySqlGraphStore;
+use server::{App, Config};
 
 /// Runs the API server.
 ///
@@ -10,12 +11,8 @@ use server::{App, Config, StaticGraphStore};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
-    let state = App::connect(
-        &config.database_url,
-        config.clone(),
-        StaticGraphStore::new(),
-    )
-    .await?;
+    let graph_store = MySqlGraphStore::connect(&config.database_url).await?;
+    let state = App::connect(&config.database_url, config.clone(), graph_store).await?;
 
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
     println!("rayflow server listening on {}", config.addr);

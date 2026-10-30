@@ -9,6 +9,7 @@ event = { workspace = true }
 config = { workspace = true }
 jiff = { workspace = true }
 coordinator = { workspace = true, features = ["mysql"] }
+graph = { workspace = true }
 runtime = { workspace = true }
 scheduler = { workspace = true }
 serde = { workspace = true }

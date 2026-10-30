@@ -21,6 +21,11 @@ as references when they name an output.
 the highest version. The JSON payload contains the complete DAG, while row
 metadata is checked against its UUID, name, and version when loading.
 
+The same store keeps one editable `graph_draft` row per graph UUID. Draft writes
+replace the JSON payload and update audit metadata without requiring the graph
+to be valid. Publishing validates the draft, assigns the next graph version,
+and inserts an immutable row into `graph`.
+
 ## Diffing
 
 `Diff` returns `None` for equal values and `Some(Item)` for changes. `Kind`,

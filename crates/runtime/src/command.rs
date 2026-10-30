@@ -46,6 +46,7 @@ pub struct NodeRun {
     pub run_id: Uuid,
     pub data_id: Uuid,
     pub graph_id: Uuid,
+    pub version: u64,
     pub node_id: Uuid,
     pub revision: u64,
     #[column(type = varchar(16))]
@@ -219,6 +220,7 @@ impl<S> Backend<S> {
                 .run_id(run_id)
                 .data_id(data_id)
                 .graph_id(graph_id)
+                .version(version)
                 .node_id(*node_id)
                 .revision(0)
                 .status(Status::Ready.to_string())
@@ -305,6 +307,7 @@ impl<S> Backend<S> {
             .run_id(run.uuid)
             .data_id(data_id)
             .graph_id(graph_id)
+            .version(run.version)
             .node_id(node)
             .revision(revision)
             .status(Status::Ready.to_string())
@@ -391,6 +394,7 @@ impl<S> Backend<S> {
                     .run_id(run.uuid)
                     .data_id(data_id)
                     .graph_id(graph_id)
+                    .version(run.version)
                     .node_id(predecessor)
                     .revision(revision)
                     .status(Status::Succeeded.to_string())
@@ -406,6 +410,7 @@ impl<S> Backend<S> {
                 .run_id(run.uuid)
                 .data_id(data_id)
                 .graph_id(graph_id)
+                .version(run.version)
                 .node_id(*node)
                 .revision(revision)
                 .status(Status::Ready.to_string())
@@ -661,6 +666,7 @@ impl<S> Backend<S> {
                         .run_id(run.uuid)
                         .data_id(data_id)
                         .graph_id(graph_id)
+                        .version(run.version)
                         .node_id(successor)
                         .revision(run.revision)
                         .status(Status::Ready.to_string())

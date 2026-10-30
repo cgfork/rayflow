@@ -18,6 +18,15 @@ use axum::Router;
 use axum::routing::get;
 use uuid::Uuid;
 
+/// Registers graph, runtime, and scheduling models together for the API.
+pub fn models() -> toasty::ModelSet {
+    let mut models = scheduler::models();
+    for model in ::graph::models() {
+        models.add(model);
+    }
+    models
+}
+
 /// Builds the application router: service routes plus the REST API.
 pub fn router<S>(state: App<S>) -> Router
 where
@@ -51,6 +60,14 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn models_include_graph_runtime_and_scheduler() {
+        let models = models();
+        for model in scheduler::models().into_iter().chain(::graph::models()) {
+            assert!(models.contains(model.id()));
+        }
+    }
 
     #[tokio::test]
     async fn health_returns_ok() {

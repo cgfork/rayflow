@@ -8,6 +8,10 @@
 //! * `POST /runs/rerun` — emit `Command::Rerun` for one node.
 //! * `POST /runs/resume` — emit `Command::Resume` for a pending node.
 //! * `POST /runs/dryrun` — emit `Command::Dryrun` for the given nodes.
+//! * `GET  /graphs/{graph_id}/draft` — read an editable graph draft.
+//! * `GET  /graphs/{graph_id}` — read a published graph, optionally by version.
+//! * `PUT  /graphs/{graph_id}/draft` — create or replace an editable graph draft.
+//! * `POST /graphs/{graph_id}/publish` — validate and publish the draft.
 //! * `POST /task_events` — emit a `TaskEvent` for a task.
 //! * `POST /jobs/poll` — claim jobs matching the agent's capacity, optionally long-polling.
 //! * `POST /job/cancel` — cancel a job and emit `TaskEvent::Cancel`.
@@ -17,17 +21,20 @@
 //! * `POST /job/terminate` — terminate a job and emit `TaskEvent::Terminate`.
 //! * `GET  /runs/graph_state` — read the current state of a run.
 
+pub mod graph;
+pub mod graph_draft;
 pub mod job;
 pub mod run;
 pub mod task_event;
 
+use ::graph::GraphStore;
+use ::graph::types::DAG;
 use axum::Router;
-use graph::GraphStore;
-use graph::types::DAG;
 use uuid::Uuid;
 
 use crate::app::App;
 
+pub use graph_draft::{PublishGraphDraftRequest, WriteGraphDraftRequest};
 pub use job::{JobActionRequest, PollJobsRequest, PollJobsResponse};
 pub use run::{
     DryrunRunRequest, DryrunRunResponse, GetGraphStateRequest, GetGraphStateResponse,
@@ -42,7 +49,9 @@ where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
     <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
 {
-    run::routes::<S>()
+    graph::routes::<S>()
+        .merge(graph_draft::routes::<S>())
+        .merge(run::routes::<S>())
         .merge(task_event::routes::<S>())
         .merge(job::routes::<S>())
         .with_state(state)

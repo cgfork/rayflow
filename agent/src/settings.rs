@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use config::{Config as Builder, ConfigError, Environment, File};
+use config::{Config as Builder, Environment, File};
 use scheduler::ResourceCapacity;
 use serde::Deserialize;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
@@ -27,7 +27,7 @@ pub struct Settings {
 
 impl Settings {
     /// Loads rayflow configuration and RAYFLOW_AGENT_* overrides. The UUID is required.
-    pub fn load() -> Result<Self, ConfigError> {
+    pub fn load() -> Result<Self, Error> {
         let path = env::var("RAYFLOW_AGENT_CONFIG")
             .ok()
             .filter(|path| !path.is_empty())
@@ -60,9 +60,7 @@ impl Settings {
             .add_source(Self::environment())
             .build()?
             .try_deserialize()?;
-        settings
-            .validate()
-            .map_err(|error| ConfigError::Message(error.to_string()))?;
+        settings.validate()?;
         Ok(settings)
     }
 

@@ -3,7 +3,7 @@
 
 use graph::{
     GraphStore,
-    store::{Error, GraphRecord, MySqlGraphStore},
+    store::{Error, GraphDraftRecord, GraphRecord, MySqlGraphStore},
     types::{DAG, Input, Kind, Node, Output},
 };
 use jiff::Timestamp;
@@ -183,4 +183,91 @@ async fn mysql_store_persists_versioned_graphs_and_metadata() {
         store.load(initial.id, None).await,
         Err(Error::Toasty(_))
     ));
+}
+
+#[tokio::test]
+async fn mysql_store_reads_writes_and_publishes_graph_drafts() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping MySQL graph draft test: DATABASE_URL is not set");
+        return;
+    };
+    let prefix = format!("graph_draft_test_{}_", Uuid::new_v4().simple());
+    let mut builder = toasty::Db::builder();
+    builder.models(graph::models()).table_name_prefix(&prefix);
+    let mut db = builder.connect(&url).await.unwrap();
+
+    for table_name in ["graph", "graph_draft"] {
+        let statement = include_str!("../../../rayflow.sql")
+            .split("\n\n")
+            .find(|statement| {
+                statement.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table_name} ("))
+            })
+            .expect("table is defined in rayflow.sql")
+            .replacen(
+                &format!("CREATE TABLE IF NOT EXISTS {table_name} ("),
+                &format!("CREATE TABLE IF NOT EXISTS `{prefix}{table_name}` ("),
+                1,
+            );
+        toasty::sql::statement(statement)
+            .exec(&mut db)
+            .await
+            .unwrap();
+    }
+
+    let store = MySqlGraphStore::new(db.clone());
+    let initial = graph();
+    assert!(matches!(
+        store.read_draft(initial.id).await,
+        Err(Error::DraftNotFound(graph_id)) if graph_id == initial.id
+    ));
+
+    let draft = store.write_draft(&initial, "author").await.unwrap();
+    assert_eq!(draft.uuid, initial.id);
+    assert_eq!(draft.graph.0, initial);
+    assert_eq!(draft.created_by, "author");
+    assert_eq!(draft.updated_by, "author");
+    assert_eq!(store.load_draft(initial.id).await.unwrap(), initial);
+
+    let mut edited = initial.clone();
+    edited.name = "edited graph".into();
+    edited.nodes[1].inputs[0].required = false;
+    let updated = store.write_draft(&edited, "editor").await.unwrap();
+    assert_eq!(updated.id, draft.id);
+    assert_eq!(updated.name, edited.name);
+    assert_eq!(updated.graph.0, edited);
+    assert_eq!(updated.created_by, "author");
+    assert_eq!(updated.updated_by, "editor");
+    let persisted = GraphDraftRecord::filter_by_id(updated.id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(persisted.graph, updated.graph);
+
+    let published = store.publish_draft(initial.id, "publisher").await.unwrap();
+    assert_eq!(published.uuid, initial.id);
+    assert_eq!(published.version, 0);
+    assert_eq!(published.name, edited.name);
+    assert_eq!(published.graph.0.version, 0);
+    assert_eq!(published.created_by, "publisher");
+
+    let published_again = store.publish_draft(initial.id, "publisher").await.unwrap();
+    assert_eq!(published_again.version, 1);
+    assert_eq!(published_again.graph.0.version, 1);
+
+    let mut invalid = edited;
+    invalid
+        .edges
+        .push((invalid.nodes[1].id, invalid.nodes[0].id));
+    store.write_draft(&invalid, "editor").await.unwrap();
+    assert!(matches!(
+        store.publish_draft(initial.id, "publisher").await,
+        Err(Error::InvalidDraft(_))
+    ));
+
+    for table_name in ["graph", "graph_draft"] {
+        toasty::sql::statement(format!("DROP TABLE `{prefix}{table_name}`"))
+            .exec(&mut db)
+            .await
+            .unwrap();
+    }
 }

@@ -86,9 +86,9 @@ The server is an Axum HTTP API. It appends run commands and task events, polls
 and reports jobs, and reads the current graph state. `App` is also available as
 a library abstraction over a `toasty::Db`, a `Config`, and any `GraphStore`.
 
-The binary currently uses `StaticGraphStore`, which embeds the JSON graphs in
-`graphs/` at compile time. The server library is graph-store agnostic, so a
-database-backed `GraphStore` can be injected by an application.
+The binary uses `MySqlGraphStore`, so published graph versions and editable
+drafts come from the database. The server library remains graph-store agnostic,
+so another `GraphStore` can be injected by an application.
 
 ### `pilot`
 
@@ -120,7 +120,7 @@ crates/
 server/        Axum API binary and reusable application state
 pilot/         leader-elected consumer binary
 agent/         container execution and HTTP polling binary
-graphs/        graphs embedded by the server's static graph store
+graphs/        sample graphs available to tests and library consumers
 doc/           architecture, design, module, and usage documentation
 rayflow.sql    MySQL schema for all persistent models
 ```

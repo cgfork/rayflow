@@ -1,3 +1,6 @@
+mod graph_draft;
+#[path = "graph.rs"]
+mod graph_read;
 mod job;
 mod offset;
 mod operation;
@@ -55,7 +58,7 @@ impl<S> App<S> {
     /// app over `db` (see [`new`](Self::new)).
     pub async fn connect(url: &str, config: Config, graph_store: S) -> Result<Self, toasty::Error> {
         let mut builder = Db::builder();
-        builder.models(scheduler::models());
+        builder.models(crate::models());
         let db = builder.connect(url).await?;
         Ok(Self::new(db, config, graph_store))
     }
@@ -107,6 +110,15 @@ pub enum AppError {
     /// The requested node is not part of the graph.
     #[error("node not found in graph: {0}")]
     NodeNotFound(Uuid),
+    /// The graph identifier in a draft request does not match the graph JSON.
+    #[error("graph id mismatch: expected {expected}, got {actual}")]
+    GraphIdMismatch { expected: Uuid, actual: Uuid },
+    /// The requested graph draft does not exist.
+    #[error("graph draft not found: {0}")]
+    GraphDraftNotFound(Uuid),
+    /// The draft cannot be published because it is not a valid graph.
+    #[error("invalid graph: {0}")]
+    InvalidGraph(String),
     /// The graph store returned an error.
     #[error("graph: {0}")]
     Graph(Box<dyn std::error::Error + Send + Sync>),
@@ -140,6 +152,16 @@ impl From<toasty::Error> for AppError {
     }
 }
 
+impl From<graph::store::Error> for AppError {
+    fn from(error: graph::store::Error) -> Self {
+        match error {
+            graph::store::Error::DraftNotFound(graph_id) => Self::GraphDraftNotFound(graph_id),
+            graph::store::Error::InvalidDraft(message) => Self::InvalidGraph(message),
+            error => Self::Graph(Box::new(error)),
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match self {
@@ -147,7 +169,9 @@ impl IntoResponse for AppError {
             | AppError::NodeRunNotFound(_)
             | AppError::TaskNotFound(_)
             | AppError::JobNotFound(_)
-            | AppError::NodeNotFound(_) => StatusCode::NOT_FOUND,
+            | AppError::NodeNotFound(_)
+            | AppError::GraphDraftNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::GraphIdMismatch { .. } | AppError::InvalidGraph(_) => StatusCode::BAD_REQUEST,
             AppError::JobConflict(_) => StatusCode::CONFLICT,
             AppError::Graph(_) | AppError::Backend(_) | AppError::Scheduled(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -209,7 +233,7 @@ pub(crate) mod test {
         let url = std::env::var("DATABASE_URL").ok()?;
 
         let mut builder = Db::builder();
-        builder.models(scheduler::models());
+        builder.models(crate::models());
         let db = builder
             .connect(&url)
             .await
