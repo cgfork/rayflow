@@ -1,3 +1,5 @@
+use graph::GraphStore;
+use graph::types::DAG;
 use scheduler::{Job, ResourceCapacity};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -48,12 +50,28 @@ impl Client {
             .await?)
     }
 
+    /// Reads a published graph, optionally selecting an exact version.
+    pub async fn graph(&self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Error> {
+        let mut request = self
+            .http
+            .get(format!("{}/graphs/{graph_id}", self.server_url));
+        if let Some(version) = version {
+            request = request.query(&[("version", version)]);
+        }
+        Ok(request.send().await?.error_for_status()?.json().await?)
+    }
+
     pub async fn cancel(&self, agent_id: Uuid, job_id: Uuid) -> Result<(), Error> {
         self.job_action("cancel", agent_id, job_id).await
     }
 
     pub async fn fail(&self, agent_id: Uuid, job_id: Uuid) -> Result<(), Error> {
         self.job_action("fail", agent_id, job_id).await
+    }
+
+    /// Reports a yielded job so its node can be resumed later.
+    pub async fn yield_job(&self, agent_id: Uuid, job_id: Uuid) -> Result<(), Error> {
+        self.job_action("yield", agent_id, job_id).await
     }
 
     pub async fn succeed(&self, agent_id: Uuid, job_id: Uuid) -> Result<(), Error> {
@@ -76,5 +94,14 @@ impl Client {
         }
         response.error_for_status()?;
         Ok(())
+    }
+}
+
+impl GraphStore<Uuid> for Client {
+    type G = DAG;
+    type Err = Error;
+
+    async fn load(&self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Error> {
+        self.graph(graph_id, version).await
     }
 }

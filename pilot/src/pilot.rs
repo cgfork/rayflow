@@ -4,11 +4,13 @@ use std::future::Future;
 use std::time::Duration;
 
 use coordinator::TransactionalLeaderElection;
+use graph::{Graph, GraphStore};
 use runtime::{Error as BackendError, backend::Backend};
 use scheduler::{Actuator, AgentScheduler, Scheduler};
 use server::StaticGraphStore;
 use toasty::Db;
 use tokio::time::{MissedTickBehavior, interval};
+use uuid::Uuid;
 
 /// Error returned by a pilot consumer pass.
 #[derive(Debug, thiserror::Error)]
@@ -31,16 +33,20 @@ pub use scheduler::Step;
 
 /// Consumes commands, tasks, and task events while this pilot holds the leader
 /// lease.
-pub struct Pilot<E = coordinator::mysql::MySqlLeaderElection, S = AgentScheduler> {
+pub struct Pilot<
+    E = coordinator::mysql::MySqlLeaderElection,
+    S = AgentScheduler,
+    G = StaticGraphStore,
+> {
     election: E,
-    actuator: Actuator<StaticGraphStore>,
+    actuator: Actuator<G>,
     db: Db,
     batch: usize,
     poll_interval: Duration,
     scheduler: S,
 }
 
-impl<E> Pilot<E, AgentScheduler> {
+impl<E, G> Pilot<E, AgentScheduler, G> {
     /// Waits this long after job expiry before failing unreported timeouts.
     pub fn with_job_timeout_gap(mut self, gap: Duration) -> Self {
         self.scheduler = self.scheduler.with_timeout_gap(gap);
@@ -48,12 +54,7 @@ impl<E> Pilot<E, AgentScheduler> {
     }
     /// Creates a pilot from a leader election and MySQL backend.
     /// Register `scheduler::models()` and any models required by a custom scheduler.
-    pub fn new(
-        election: E,
-        backend: Backend<StaticGraphStore>,
-        batch: usize,
-        poll_interval: Duration,
-    ) -> Self {
+    pub fn new(election: E, backend: Backend<G>, batch: usize, poll_interval: Duration) -> Self {
         assert!(batch > 0, "batch must be at least 1");
         assert!(!poll_interval.is_zero(), "poll interval must be non-zero");
 
@@ -69,7 +70,7 @@ impl<E> Pilot<E, AgentScheduler> {
     }
 }
 
-impl<E, S> Pilot<E, S> {
+impl<E, S, G> Pilot<E, S, G> {
     /// Sets the missing-offset timeout for command, task, and task-event logs.
     pub fn with_gap_timeout(mut self, gap_timeout: Duration) -> Self {
         self.actuator = self.actuator.with_gap_timeout(gap_timeout);
@@ -77,7 +78,7 @@ impl<E, S> Pilot<E, S> {
     }
 
     /// Uses another scheduling implementation, such as an external job scheduler.
-    pub fn with_scheduler<T>(self, scheduler: T) -> Pilot<E, T> {
+    pub fn with_scheduler<T>(self, scheduler: T) -> Pilot<E, T, G> {
         Pilot {
             election: self.election,
             actuator: self.actuator,
@@ -94,10 +95,13 @@ impl<E, S> Pilot<E, S> {
     }
 }
 
-impl<E, S> Pilot<E, S>
+impl<E, S, G> Pilot<E, S, G>
 where
     E: for<'tx> TransactionalLeaderElection<toasty::Transaction<'tx>>,
     S: for<'tx> Scheduler<toasty::Transaction<'tx>>,
+    G: GraphStore<Uuid>,
+    G::G: Graph<NodeId = Uuid>,
+    G::Err: Send + Sync + 'static,
 {
     /// Returns whether this pilot currently holds the leader lease.
     pub async fn is_leader(&self) -> Result<bool, Error> {

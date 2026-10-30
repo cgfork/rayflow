@@ -3,9 +3,9 @@
 use std::error::Error as StdError;
 
 use coordinator::mysql::MySqlLeaderElection;
+use graph::store::MySqlGraphStore;
 use pilot::{Config, Pilot};
 use runtime::backend::Backend;
-use server::StaticGraphStore;
 use uuid::Uuid;
 
 #[tokio::main]
@@ -15,7 +15,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let mut builder = toasty::Db::builder();
     builder.models(scheduler::models());
     let db = builder.connect(&config.database_url).await?;
-    let backend = Backend::new(db, StaticGraphStore::new());
+    let graph_store = MySqlGraphStore::connect(&config.database_url).await?;
+    let backend = Backend::new(db, graph_store);
     let node_id = Uuid::new_v4().to_string();
     let election = MySqlLeaderElection::new(
         backend.db().clone(),

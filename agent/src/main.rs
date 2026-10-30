@@ -1,14 +1,14 @@
 //! Agent executable entry point.
 
-use std::{error::Error, io};
+use std::error::Error as StdError;
 
-use agent::{Agentic, settings::Settings};
+use agent::{Agentic, errors::Error, settings::Settings};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn StdError>> {
     let settings = Settings::load()?;
     let id = settings.id;
-    let agent = Agentic::new(settings)?;
+    let agent = Agentic::new(settings).await?;
     let running = agent.start();
     tokio::pin!(running);
     println!("rayflow agent {id} started");
@@ -26,16 +26,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn shutdown_signal() -> io::Result<()> {
+async fn shutdown_signal() -> Result<(), Error> {
     #[cfg(unix)]
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
+            result = tokio::signal::ctrl_c() => Ok(result?),
             _ = terminate.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await
+    Ok(tokio::signal::ctrl_c().await?)
 }

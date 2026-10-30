@@ -115,6 +115,7 @@ mod tests {
             .run_id(run.uuid)
             .data_id(data_id)
             .graph_id(graph_id)
+            .version(run.version)
             .node_id(node_id)
             .revision(3)
             .status("Running".to_owned())

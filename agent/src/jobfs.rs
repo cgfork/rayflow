@@ -1,20 +1,23 @@
 use std::{
+    collections::HashMap,
     fs::{File as StdFile, TryLockError},
     io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use graph::types::Node;
 use jiff::Timestamp;
 use scheduler::Job;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::AsyncWriteExt,
     sync::Mutex,
     time::sleep,
 };
 use uuid::Uuid;
+
+use crate::{errors::Error, read_json, write_json};
 
 pub struct JobFs {
     pub job_id: Uuid,
@@ -22,9 +25,15 @@ pub struct JobFs {
     lock_file: Mutex<Option<StdFile>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct JobResult {
     pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,68 +51,78 @@ impl JobFs {
         }
     }
 
+    /// Lists UUID-named job directories in a workdir without reading job files.
+    pub async fn job_ids<P: AsRef<Path>>(dir: P) -> Result<Vec<Uuid>, Error> {
+        let mut entries = fs::read_dir(dir).await?;
+        let mut jobs = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            if let Ok(job_id) = entry.file_name().to_string_lossy().parse() {
+                jobs.push(job_id);
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Discovers persisted container-to-job mappings in a workdir.
+    /// Job directories without readable container metadata are skipped.
+    pub async fn discover<P: AsRef<Path>>(dir: P) -> Result<HashMap<String, Uuid>, Error> {
+        let dir = dir.as_ref();
+        let mut containers = HashMap::new();
+        for job_id in Self::job_ids(dir).await? {
+            let job_fs = Self::new(dir, job_id);
+            if let Ok(container) = job_fs.container().await {
+                containers.insert(container.id, job_id);
+            }
+        }
+        Ok(containers)
+    }
+
     pub fn dir(&self) -> PathBuf {
         self.root_dir.join(self.job_id.to_string())
-    }
-
-    async fn read_json<T: DeserializeOwned>(&self, name: &str) -> io::Result<T> {
-        let contents = fs::read(self.dir().join(name)).await?;
-        serde_json::from_slice(&contents)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-    }
-
-    async fn write_json<T: Serialize>(&self, name: &str, value: &T) -> io::Result<()> {
-        let contents = serde_json::to_vec(value).map_err(io::Error::other)?;
-        let dir = self.dir();
-        fs::create_dir_all(&dir).await?;
-        let temporary = dir.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&temporary).await?;
-        let result = async {
-            file.write_all(&contents).await?;
-            file.flush().await?;
-            file.sync_all().await?;
-            drop(file);
-            fs::rename(&temporary, dir.join(name)).await
-        }
-        .await;
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary).await;
-        }
-        result
     }
 
     /// Read jobs/{job}/job.json.
     ///
     /// The content is json-marshal Job struct.
-    pub async fn job(&self) -> io::Result<Job> {
-        let job: Job = self.read_json("job.json").await?;
+    pub async fn job(&self) -> Result<Job, Error> {
+        let job: Job = read_json(&self.dir().join("job.json")).await?;
         if job.uuid != self.job_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "job UUID does not match its filesystem directory",
-            ));
+            )
+            .into());
         }
         Ok(job)
     }
 
-    pub(crate) async fn set_job(&self, job: Job) -> io::Result<Job> {
+    /// Read `{workdir}/{job}/node.json`.
+    pub async fn node(&self) -> Result<Node, Error> {
+        read_json(&self.dir().join("node.json")).await
+    }
+
+    pub(crate) async fn write_job(&self, job: Job) -> Result<Job, Error> {
         if job.uuid != self.job_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "job UUID does not match its filesystem directory",
-            ));
+            )
+            .into());
         }
-        self.write_json("job.json", &job).await?;
+        write_json(&self.dir().join("job.json"), &job).await?;
         Ok(job)
+    }
+
+    pub(crate) async fn write_node(&self, node: &Node) -> Result<(), Error> {
+        write_json(&self.dir().join("node.json"), node).await
     }
 
     /// Acquire the exclusive job lock, waiting until it is available.
     /// The lock is held until `unlock` is called or this `JobFs` is dropped.
-    pub(crate) async fn lock(&self) -> io::Result<()> {
+    pub(crate) async fn lock(&self) -> Result<(), Error> {
         let mut lock_file = self.lock_file.lock().await;
         if lock_file.is_some() {
             return Ok(());
@@ -123,14 +142,14 @@ impl JobFs {
             match file.try_lock() {
                 Ok(()) => break,
                 Err(TryLockError::WouldBlock) => sleep(Duration::from_millis(10)).await,
-                Err(TryLockError::Error(error)) => return Err(error),
+                Err(TryLockError::Error(error)) => return Err(error.into()),
             }
         }
         *lock_file = Some(file);
         Ok(())
     }
 
-    pub(crate) async fn unlock(&self) -> io::Result<()> {
+    pub(crate) async fn unlock(&self) -> Result<(), Error> {
         let mut lock_file = self.lock_file.lock().await;
         if let Some(file) = lock_file.as_ref() {
             file.unlock()?;
@@ -140,44 +159,46 @@ impl JobFs {
     }
 
     /// Read jobs/{job}/runtime/started_at
-    pub async fn started_at(&self) -> io::Result<Timestamp> {
+    pub async fn started_at(&self) -> Result<Timestamp, Error> {
         let contents = fs::read_to_string(self.dir().join("runtime/started_at")).await?;
         contents
             .trim()
             .parse()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            .map_err(|error| Error::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
     }
 
     /// Read jobs/{job}/runtime/stdout
-    pub async fn stdout(&self) -> io::Result<File> {
-        File::open(self.dir().join("runtime/stdout")).await
+    pub async fn stdout(&self) -> Result<File, Error> {
+        File::open(self.dir().join("runtime/stdout"))
+            .await
+            .map_err(Into::into)
     }
 
     /// Read jobs/{job}/result.json
-    pub async fn job_result(&self) -> io::Result<JobResult> {
-        self.read_json("result.json").await
+    pub async fn job_result(&self) -> Result<JobResult, Error> {
+        read_json(&self.dir().join("result.json")).await
     }
 
-    pub(crate) async fn set_job_result(&self, result: JobResult) -> io::Result<()> {
-        self.write_json("result.json", &result).await
+    pub(crate) async fn write_job_result(&self, result: JobResult) -> Result<(), Error> {
+        write_json(&self.dir().join("result.json"), &result).await
     }
 
     /// Read jobs/{job}/container.json
     ///
     /// 1. Docker container, records the docker container id.
-    pub async fn container(&self) -> io::Result<Container> {
-        self.read_json("container.json").await
+    pub async fn container(&self) -> Result<Container, Error> {
+        read_json(&self.dir().join("container.json")).await
     }
 
-    pub(crate) async fn set_container(&self, container: Container) -> io::Result<()> {
-        self.write_json("container.json", &container).await
+    pub(crate) async fn write_container(&self, container: Container) -> Result<(), Error> {
+        write_json(&self.dir().join("container.json"), &container).await
     }
 
-    pub(crate) async fn set_runtime(
+    pub(crate) async fn write_runtime(
         &self,
         pid: Option<i64>,
         started_at: Option<Timestamp>,
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         let runtime = self.dir().join("runtime");
         fs::create_dir_all(&runtime).await?;
         if let Some(pid) = pid.filter(|pid| *pid > 0) {
@@ -189,7 +210,7 @@ impl JobFs {
         Ok(())
     }
 
-    pub(crate) async fn clear(&self) -> io::Result<()> {
+    pub(crate) async fn clear(&self) -> Result<(), Error> {
         let mut entries = fs::read_dir(self.dir()).await?;
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_name() == "lock" {
@@ -209,7 +230,7 @@ impl JobFs {
 mod tests {
     use std::fs::{self, OpenOptions, TryLockError};
 
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use event::task::Task;
     use serde_json::json;
@@ -230,7 +251,7 @@ mod tests {
         job.agent_id = Some(Uuid::new_v4());
         let expected = serde_json::to_value(&job).unwrap();
 
-        let stored = job_fs.set_job(job.clone()).await.unwrap();
+        let stored = job_fs.write_job(job.clone()).await.unwrap();
         assert_eq!(serde_json::to_value(stored).unwrap(), expected);
         assert_eq!(
             serde_json::to_value(job_fs.job().await.unwrap()).unwrap(),
@@ -245,7 +266,7 @@ mod tests {
         );
 
         job.agent_id = None;
-        job_fs.set_job(job.clone()).await.unwrap();
+        job_fs.write_job(job.clone()).await.unwrap();
         assert_eq!(
             serde_json::to_value(job_fs.job().await.unwrap()).unwrap(),
             serde_json::to_value(job).unwrap()
@@ -254,16 +275,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_job_rejects_a_different_uuid_without_overwriting() {
+    async fn write_job_rejects_a_different_uuid_without_overwriting() {
         let root = tempdir().unwrap();
         let original = job();
         let job_fs = JobFs::new(root.path(), original.uuid);
-        job_fs.set_job(original.clone()).await.unwrap();
+        job_fs.write_job(original.clone()).await.unwrap();
         let contents = fs::read(job_fs.dir().join("job.json")).unwrap();
 
-        let error = job_fs.set_job(job()).await.unwrap_err();
+        let error = job_fs.write_job(job()).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(fs::read(job_fs.dir().join("job.json")).unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn node_round_trips_in_the_job_filesystem() {
+        let root = tempdir().unwrap();
+        let job_fs = JobFs::new(root.path().join("jobs"), Uuid::new_v4());
+        let expected = Node {
+            id: Uuid::new_v4(),
+            name: "step".to_owned(),
+            node_type: "shell".to_owned(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+
+        job_fs.write_node(&expected).await.unwrap();
+
+        assert_eq!(job_fs.node().await.unwrap(), expected);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(job_fs.dir().join("node.json")).unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -272,8 +317,11 @@ mod tests {
         let job_fs = JobFs::new(root.path().join("jobs"), Uuid::new_v4());
 
         for exit_code in [-1234, 0, 42] {
-            let result = JobResult { exit_code };
-            job_fs.set_job_result(result.clone()).await.unwrap();
+            let result = JobResult {
+                exit_code,
+                ..Default::default()
+            };
+            job_fs.write_job_result(result.clone()).await.unwrap();
             assert_eq!(job_fs.job_result().await.unwrap(), result);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(
@@ -295,7 +343,10 @@ mod tests {
 
         assert!(
             job_fs
-                .set_job_result(JobResult { exit_code: 0 })
+                .write_job_result(JobResult {
+                    exit_code: 0,
+                    ..Default::default()
+                })
                 .await
                 .is_err()
         );
@@ -414,10 +465,13 @@ mod tests {
         let job = job();
         let job_fs = JobFs::new(&blocked_root, job.uuid);
 
-        assert!(job_fs.set_job(job).await.is_err());
+        assert!(job_fs.write_job(job).await.is_err());
         assert!(
             job_fs
-                .set_job_result(JobResult { exit_code: 0 })
+                .write_job_result(JobResult {
+                    exit_code: 0,
+                    ..Default::default()
+                })
                 .await
                 .is_err()
         );

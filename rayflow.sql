@@ -15,6 +15,19 @@ CREATE TABLE IF NOT EXISTS graph (
     KEY idx_graph_uuid (uuid)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'versioned graph definitions with audit metadata';
 
+CREATE TABLE IF NOT EXISTS graph_draft (
+    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    uuid       CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph identifier',
+    name       VARCHAR(255)    NOT NULL DEFAULT '' COMMENT 'graph name',
+    graph      JSON            NOT NULL COMMENT 'serialized editable graph definition including nodes and edges',
+    updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
+    updated_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'last updater of the record',
+    created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
+    created_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'creator of the record',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_graph_draft_uuid (uuid)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'editable graph drafts with audit metadata';
+
 CREATE TABLE IF NOT EXISTS task (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
     uuid       CHAR(36)        NOT NULL DEFAULT '' COMMENT 'task unique identifier',
@@ -80,6 +93,7 @@ CREATE TABLE IF NOT EXISTS node_run (
     run_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
     data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
     graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
+    version    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'graph version used by the owning run',
     node_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'node unique identifier',
     revision   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'node revision, incremented on rerun/dryrun',
     status     VARCHAR(16)     NOT NULL DEFAULT 'Ready' COMMENT 'node status',
