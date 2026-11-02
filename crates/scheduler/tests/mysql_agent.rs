@@ -323,6 +323,54 @@ async fn direct_poll_matches_resources_reserves_claims_and_fails_expired_jobs() 
 }
 
 #[tokio::test]
+async fn polling_skips_a_locked_scheduled_job() {
+    let Some(mut db) = setup().await else {
+        return;
+    };
+    let now = Timestamp::now();
+    let run = Run::create()
+        .uuid(Uuid::new_v4())
+        .data_id(Uuid::new_v4())
+        .graph_id(Uuid::new_v4())
+        .version(1)
+        .revision(1)
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let (_, first) = configured_job(&mut db, &run, 1, 1).await;
+    let (_, second) = configured_job(&mut db, &run, 1, 1).await;
+
+    let mut other = db.clone();
+    let mut locked = db.transaction().await.unwrap();
+    toasty::sql::query("SELECT id FROM job WHERE id = ? FOR UPDATE")
+        .bind(first.id)
+        .exec(&mut locked)
+        .await
+        .unwrap();
+
+    let capacity = ResourceCapacity {
+        cpu_cores: 1,
+        memory_bytes: 1,
+    };
+    let claimed = tokio::time::timeout(
+        Duration::from_secs(2),
+        poll(&mut other, Uuid::new_v4(), capacity, 1),
+    )
+    .await
+    .expect("poll should not wait for the locked row")
+    .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, second.id);
+
+    locked.commit().await.unwrap();
+    let claimed = poll(&mut db, Uuid::new_v4(), capacity, 1).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, first.id);
+}
+
+#[tokio::test]
 async fn poll_checks_both_resources_and_scans_past_unfitting_candidates() {
     let Some(mut db) = setup().await else {
         return;

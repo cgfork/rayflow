@@ -195,36 +195,40 @@ impl AgentRef {
 
         while claimed.len() < maximum && !self.resource.exhausted() {
             let page_size = JOB_PAGE_SIZE.min(maximum - claimed.len());
+            // Toasty cannot express SKIP LOCKED. Lock only the queue rows we may
+            // claim, so other agents can move past an in-flight claim.
+            let ids: Vec<u64> = toasty::sql::query(
+                "SELECT id FROM job WHERE status = 'Scheduled' AND id > ? \
+                 AND required_cpu_cores <= ? AND required_memory_bytes <= ? \
+                 ORDER BY id ASC LIMIT ? FOR UPDATE SKIP LOCKED",
+            )
+            .bind(after_id)
+            .bind(self.resource.cpu_cores)
+            .bind(self.resource.memory_bytes)
+            .bind(page_size as u64)
+            .column_types([toasty::stmt::Type::U64])
+            .exec(&mut *backend)
+            .await?
+            .into_iter()
+            .map(|row| row.into_record()[0].clone().try_into())
+            .collect::<Result<_, toasty::Error>>()?;
+            if ids.is_empty() {
+                break;
+            }
+            let page_ended = ids.len() < page_size;
+            after_id = *ids.last().expect("nonempty locked page");
             let candidates = Job::all()
-                .filter(Job::fields().status().eq(Status::Scheduled))
+                .filter(Job::fields().id().in_list(ids))
                 .filter(Job::fields().uuid().in_list(self.active_jobs.clone()).not())
-                .filter(
-                    Job::fields()
-                        .required_cpu_cores()
-                        .le(self.resource.cpu_cores),
-                )
-                .filter(
-                    Job::fields()
-                        .required_memory_bytes()
-                        .le(self.resource.memory_bytes),
-                )
-                .filter(Job::fields().id().gt(after_id))
                 .include(Job::fields().task())
                 .include(Job::fields().run())
                 .include(Job::fields().node_run())
                 .include(Job::fields().node_config())
                 .include(Job::fields().run_config())
                 .order_by(Job::fields().id().asc())
-                .limit(page_size)
                 .exec(&mut *backend)
                 .await?;
-            if candidates.is_empty() {
-                break;
-            }
-
-            let page_ended = candidates.len() < page_size;
             for mut job in candidates {
-                after_id = job.id;
                 if job.required_cpu_cores > self.resource.cpu_cores
                     || job.required_memory_bytes > self.resource.memory_bytes
                 {
