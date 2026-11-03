@@ -21,6 +21,7 @@
 //! * `POST /job/terminate` — terminate a job and emit `TaskEvent::Terminate`.
 //! * `GET  /runs/graph_state` — read the current state of a run.
 
+pub mod agent;
 pub mod graph;
 pub mod graph_draft;
 pub mod job;
@@ -47,9 +48,12 @@ pub use task_event::{EmitTaskEventRequest, EmitTaskEventResponse};
 pub fn router<S>(state: App<S>) -> Router
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
+    S::graphs(..): Send,
     <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
 {
     graph::routes::<S>()
+        .merge(agent::routes::<S>())
         .merge(graph_draft::routes::<S>())
         .merge(run::routes::<S>())
         .merge(task_event::routes::<S>())

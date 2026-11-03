@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 
-use graph::GraphStore;
 use graph::types::DAG;
+use graph::{GraphStore, Page, PageRequest};
 use uuid::Uuid;
 
 /// Serves graphs from an in-memory registry keyed by graph id.
@@ -24,7 +24,8 @@ impl Graphs {
     }
 
     /// Registers `graph`, replacing any graph with the same id.
-    pub fn insert(&mut self, graph: DAG) {
+    pub fn insert(&mut self, mut graph: DAG) {
+        graph.node_count = graph.nodes.len();
         self.graphs.insert(graph.id, graph);
     }
 }
@@ -33,7 +34,15 @@ impl GraphStore<Uuid> for Graphs {
     type G = DAG;
     type Err = Infallible;
 
-    async fn load(&self, graph_id: Uuid, _version: Option<u64>) -> Result<DAG, Infallible> {
+    async fn graphs(
+        &mut self,
+        page: PageRequest,
+        graph_id: Option<Uuid>,
+    ) -> Result<Page<DAG>, Infallible> {
+        Ok(list_graphs(&self.graphs, page, graph_id))
+    }
+
+    async fn load(&mut self, graph_id: Uuid, _version: Option<u64>) -> Result<DAG, Infallible> {
         // An unknown graph resolves to an empty one, so a run's node runs still
         // read back (with no graph metadata) instead of failing the request.
         Ok(self.graphs.get(&graph_id).cloned().unwrap_or(DAG {
@@ -42,6 +51,7 @@ impl GraphStore<Uuid> for Graphs {
             version: 0,
             nodes: Vec::new(),
             edges: Vec::new(),
+            ..DAG::default()
         }))
     }
 }
@@ -86,7 +96,9 @@ impl StaticGraphStore {
         let graphs = EMBEDDED
             .iter()
             .map(|json| {
-                let graph: DAG = serde_json::from_str(json).expect("embedded graph is valid JSON");
+                let mut graph: DAG =
+                    serde_json::from_str(json).expect("embedded graph is valid JSON");
+                graph.node_count = graph.nodes.len();
                 (graph.id, graph)
             })
             .collect();
@@ -103,14 +115,40 @@ impl GraphStore<Uuid> for StaticGraphStore {
     type G = DAG;
     type Err = GraphNotFound;
 
-    fn load(
-        &self,
-        graph_id: Uuid,
-        _version: Option<u64>,
-    ) -> impl std::future::Future<Output = Result<DAG, GraphNotFound>> + Send {
-        let graph = self.graphs.get(&graph_id).cloned();
-        async move { graph.ok_or(GraphNotFound(graph_id)) }
+    async fn graphs(
+        &mut self,
+        page: PageRequest,
+        graph_id: Option<Uuid>,
+    ) -> Result<Page<DAG>, GraphNotFound> {
+        Ok(list_graphs(&self.graphs, page, graph_id))
     }
+
+    async fn load(&mut self, graph_id: Uuid, _version: Option<u64>) -> Result<DAG, GraphNotFound> {
+        self.graphs
+            .get(&graph_id)
+            .cloned()
+            .ok_or(GraphNotFound(graph_id))
+    }
+}
+
+fn list_graphs(
+    graphs: &HashMap<Uuid, DAG>,
+    page: PageRequest,
+    graph_id: Option<Uuid>,
+) -> Page<DAG> {
+    let mut graphs: Vec<_> = graphs
+        .values()
+        .filter(|graph| graph_id.is_none_or(|id| graph.id == id))
+        .cloned()
+        .collect();
+    graphs.sort_by_key(|graph| graph.id);
+    page.select(
+        graphs
+            .into_iter()
+            .enumerate()
+            .rev()
+            .map(|(index, graph)| (index as u64 + 1, graph)),
+    )
 }
 
 #[cfg(test)]

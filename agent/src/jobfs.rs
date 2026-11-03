@@ -295,6 +295,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "step".to_owned(),
             node_type: "shell".to_owned(),
+            settings: Default::default(),
             inputs: Vec::new(),
             outputs: Vec::new(),
         };

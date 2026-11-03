@@ -1,12 +1,12 @@
 //! Resource-aware job polling for agents.
 
-use crate::app::{App, AppError};
+use crate::app::{App, AppError, Page, PageQuery};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use graph::{GraphStore, types::DAG};
 use scheduler::{AgentRef, ResourceCapacity};
@@ -58,12 +58,30 @@ where
     S::Err: Send + Sync + 'static,
 {
     Router::new()
+        .route("/jobs", get(list_jobs::<S>))
         .route("/jobs/poll", post(poll::<S>))
         .route("/job/cancel", post(cancel_job::<S>))
         .route("/job/yield", post(yield_job::<S>))
         .route("/job/succeed", post(succeed_job::<S>))
         .route("/job/fail", post(fail_job::<S>))
         .route("/job/terminate", post(terminate_job::<S>))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListJobsQuery {
+    pub status: Option<scheduler::actuator::Status>,
+    pub agent_id: Option<Uuid>,
+    pub run_id: Option<Uuid>,
+}
+
+async fn list_jobs<S>(
+    State(app): State<App<S>>,
+    Query(page): Query<PageQuery>,
+    Query(query): Query<ListJobsQuery>,
+) -> Result<Json<Page<scheduler::Job>>, AppError> {
+    app.list_jobs(page, query.status, query.agent_id, query.run_id)
+        .await
+        .map(Json)
 }
 
 async fn cancel_job<S>(

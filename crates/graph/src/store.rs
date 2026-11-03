@@ -1,13 +1,14 @@
 //! MySQL persistence for versioned graph definitions.
 //!
-//! Register [`models`] when constructing a shared database handle, or use
-//! [`MySqlGraphStore::connect`]. The table layout matches `rayflow.sql`.
+//! Register [`models`] when constructing a database handle. [`Db`](toasty::Db)
+//! and [`Transaction`](toasty::Transaction) implement the graph store traits
+//! directly through [`Executor`]. The table layout matches `rayflow.sql`.
 
 use jiff::Timestamp;
-use toasty::{Db, Json};
+use toasty::{Executor, Json};
 use uuid::Uuid;
 
-use crate::{GraphStore, types::DAG, validator};
+use crate::{DraftGraphStore, GraphStore, Page, PageRequest, types::DAG, validator};
 
 /// One version of a graph, including audit metadata.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, toasty::Model)]
@@ -84,13 +85,18 @@ impl TryFrom<GraphRecord> for DAG {
     type Error = Error;
 
     fn try_from(record: GraphRecord) -> Result<Self, Self::Error> {
-        let graph = record.graph.0;
+        let mut graph = record.graph.0;
         if graph.id != record.uuid || graph.name != record.name || graph.version != record.version {
             return Err(Error::MetadataMismatch {
                 graph_id: record.uuid,
                 version: record.version,
             });
         }
+        graph.node_count = graph.nodes.len();
+        graph.updated_at = record.updated_at;
+        graph.updated_by = record.updated_by;
+        graph.created_at = record.created_at;
+        graph.created_by = record.created_by;
         Ok(graph)
     }
 }
@@ -99,99 +105,70 @@ impl TryFrom<GraphDraftRecord> for DAG {
     type Error = Error;
 
     fn try_from(record: GraphDraftRecord) -> Result<Self, Self::Error> {
-        let graph = record.graph.0;
+        let mut graph = record.graph.0;
         if graph.id != record.uuid || graph.name != record.name {
             return Err(Error::DraftMetadataMismatch(record.uuid));
         }
+        graph.node_count = graph.nodes.len();
+        graph.updated_at = record.updated_at;
+        graph.updated_by = record.updated_by;
+        graph.created_at = record.created_at;
+        graph.created_by = record.created_by;
         Ok(graph)
     }
 }
 
-/// A graph store backed by the MySQL `graph` table.
-#[derive(Clone)]
-pub struct MySqlGraphStore {
-    db: Db,
-}
-
-impl MySqlGraphStore {
-    /// Uses an existing database handle with [`GraphRecord`] registered.
-    pub fn new(db: Db) -> Self {
-        Self { db }
+impl<B: Executor> DraftGraphStore<Uuid> for B {
+    async fn list(&mut self, page: PageRequest) -> Result<Page<Self::G>, Error> {
+        let mut query = GraphDraftRecord::all();
+        if let Some(before) = page.before() {
+            query = query.filter(GraphDraftRecord::fields().id().lt(before));
+        }
+        let rows = query
+            .order_by(GraphDraftRecord::fields().id().desc())
+            .limit(page.limit() + 1)
+            .exec(self)
+            .await?;
+        let page = Page::new(rows, page.limit(), |row| row.id);
+        Ok(Page {
+            items: page
+                .items
+                .into_iter()
+                .map(DAG::try_from)
+                .collect::<Result<_, _>>()?,
+            next_cursor: page.next_cursor,
+        })
     }
 
-    /// Connects to MySQL and registers the graph model without creating tables.
-    pub async fn connect(url: &str) -> Result<Self, Error> {
-        let mut builder = Db::builder();
-        builder.models(models());
-        Ok(Self::new(builder.connect(url).await?))
-    }
-
-    /// Returns the database handle for graph metadata queries and updates.
-    pub fn db(&self) -> &Db {
-        &self.db
-    }
-
-    /// Inserts a graph version with audit metadata.
-    ///
-    /// Existing `(uuid, version)` pairs are rejected rather than overwritten.
-    pub async fn insert(&self, graph: &DAG, actor: &str) -> Result<GraphRecord, Error> {
-        let now = Timestamp::now();
-        let mut db = self.db.clone();
-        Ok(GraphRecord::create()
-            .uuid(graph.id)
-            .name(graph.name.clone())
-            .version(graph.version)
-            .graph(Json(graph.clone()))
-            .updated_at(now)
-            .updated_by(actor.to_owned())
-            .created_at(now)
-            .created_by(actor.to_owned())
-            .exec(&mut db)
-            .await?)
-    }
-
-    /// Reads the editable draft for a graph.
-    pub async fn read_draft(&self, graph_id: Uuid) -> Result<GraphDraftRecord, Error> {
-        let mut db = self.db.clone();
-        let record = GraphDraftRecord::filter_by_uuid(graph_id)
+    async fn read(&mut self, graph_id: Uuid) -> Result<DAG, Error> {
+        GraphDraftRecord::filter_by_uuid(graph_id)
             .first()
-            .exec(&mut db)
+            .exec(self)
             .await?
-            .ok_or(Error::DraftNotFound(graph_id))?;
-        let _: DAG = record.clone().try_into()?;
-        Ok(record)
+            .ok_or(Error::DraftNotFound(graph_id))?
+            .try_into()
     }
 
-    /// Loads the graph JSON from its editable draft.
-    pub async fn load_draft(&self, graph_id: Uuid) -> Result<DAG, Error> {
-        self.read_draft(graph_id).await?.try_into()
-    }
-
-    /// Creates or updates the editable draft for a graph.
-    pub async fn write_draft(&self, graph: &DAG, actor: &str) -> Result<GraphDraftRecord, Error> {
+    async fn write(&mut self, graph: &DAG, actor: &str) -> Result<(), Error> {
+        let mut graph = graph.clone();
+        graph.node_count = graph.nodes.len();
         let now = Timestamp::now();
-        let mut db = self.db.clone();
         let existing = GraphDraftRecord::filter_by_uuid(graph.id)
             .first()
-            .exec(&mut db)
+            .exec(&mut *self)
             .await?;
 
-        if let Some(mut record) = existing {
+        if let Some(record) = existing {
             GraphDraftRecord::filter_by_id(record.id)
                 .update()
                 .name(graph.name.clone())
                 .graph(Json(graph.clone()))
                 .updated_at(now)
                 .updated_by(actor.to_owned())
-                .exec(&mut db)
+                .exec(self)
                 .await?;
-            record.name = graph.name.clone();
-            record.graph = Json(graph.clone());
-            record.updated_at = now;
-            record.updated_by = actor.to_owned();
-            Ok(record)
         } else {
-            Ok(GraphDraftRecord::create()
+            GraphDraftRecord::create()
                 .uuid(graph.id)
                 .name(graph.name.clone())
                 .graph(Json(graph.clone()))
@@ -199,39 +176,30 @@ impl MySqlGraphStore {
                 .updated_by(actor.to_owned())
                 .created_at(now)
                 .created_by(actor.to_owned())
-                .exec(&mut db)
-                .await?)
+                .exec(self)
+                .await?;
         }
+        Ok(())
     }
 
-    /// Validates and publishes a draft as the next graph version.
-    pub async fn publish_draft(&self, graph_id: Uuid, actor: &str) -> Result<GraphRecord, Error> {
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
-        let draft = GraphDraftRecord::filter_by_uuid(graph_id)
-            .first()
-            .exec(&mut tx)
-            .await?
-            .ok_or(Error::DraftNotFound(graph_id))?;
-        let mut graph: DAG = draft.try_into()?;
-        validator::validate(&graph).map_err(|error| Error::InvalidDraft(error.to_string()))?;
+    /// Starts a transaction or savepoint, leaving any outer transaction to the caller.
+    async fn publish(&mut self, graph_id: Uuid, actor: &str) -> Result<(), Error> {
+        let mut tx = self.transaction().await?;
+        let mut graph = tx.read(graph_id).await?;
+        validator::validate_workflow(&graph).map_err(Error::InvalidDraft)?;
 
         let latest = GraphRecord::filter_by_uuid(graph_id)
             .order_by(GraphRecord::fields().version().desc())
             .first()
             .exec(&mut tx)
             .await?;
-        let version = match latest {
-            Some(record) => record
-                .version
-                .checked_add(1)
-                .ok_or(Error::VersionOverflow(graph_id))?,
-            None => 0,
-        };
-        graph.version = version;
+        graph.version = latest
+            .map_or(0, |record| record.version)
+            .checked_add(1)
+            .ok_or(Error::VersionOverflow(graph_id))?;
 
         let now = Timestamp::now();
-        let record = GraphRecord::create()
+        GraphRecord::create()
             .uuid(graph.id)
             .name(graph.name.clone())
             .version(graph.version)
@@ -243,17 +211,44 @@ impl MySqlGraphStore {
             .exec(&mut tx)
             .await?;
         tx.commit().await?;
-        Ok(record)
+        Ok(())
     }
 }
 
-impl GraphStore<Uuid> for MySqlGraphStore {
+impl<B: Executor> GraphStore<Uuid> for B {
     type G = DAG;
     type Err = Error;
 
+    async fn graphs(
+        &mut self,
+        page: PageRequest,
+        graph_id: Option<Uuid>,
+    ) -> Result<Page<Self::G>, Error> {
+        let mut query = GraphRecord::all();
+        if let Some(before) = page.before() {
+            query = query.filter(GraphRecord::fields().id().lt(before));
+        }
+        if let Some(graph_id) = graph_id {
+            query = query.filter(GraphRecord::fields().uuid().eq(graph_id));
+        }
+        let rows = query
+            .order_by(GraphRecord::fields().id().desc())
+            .limit(page.limit() + 1)
+            .exec(self)
+            .await?;
+        let page = Page::new(rows, page.limit(), |row| row.id);
+        Ok(Page {
+            items: page
+                .items
+                .into_iter()
+                .map(DAG::try_from)
+                .collect::<Result<_, _>>()?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
     /// Loads an exact version, or the highest version when none is specified.
-    async fn load(&self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Error> {
-        let mut db = self.db.clone();
+    async fn load(&mut self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Error> {
         let mut query = GraphRecord::filter_by_uuid(graph_id);
         if let Some(version) = version {
             query = query.filter(GraphRecord::fields().version().eq(version));
@@ -261,7 +256,7 @@ impl GraphStore<Uuid> for MySqlGraphStore {
         let record = query
             .order_by(GraphRecord::fields().version().desc())
             .first()
-            .exec(&mut db)
+            .exec(self)
             .await?
             .ok_or(Error::GraphNotFound { graph_id, version })?;
         record.try_into()

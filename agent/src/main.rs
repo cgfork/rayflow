@@ -6,17 +6,24 @@ use agent::{Agentic, errors::Error, settings::Settings};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let settings = Settings::load()?;
     let id = settings.id;
     let agent = Agentic::new(settings).await?;
     let running = agent.start();
     tokio::pin!(running);
-    println!("rayflow agent {id} started");
+    tracing::info!(agent_id = %id, "rayflow agent started");
 
     tokio::select! {
         result = &mut running => result?,
         signal = shutdown_signal() => {
-            println!("rayflow agent {id} shutting down");
+            tracing::info!(agent_id = %id, "rayflow agent shutting down");
             let (running, shutdown) = tokio::join!(&mut running, agent.shutdown());
             running?;
             shutdown?;

@@ -99,6 +99,20 @@ where
             .await?
             .collect();
         for task in &tasks {
+            match Job::create_for_task(task, &mut *tx).await {
+                Ok(_) => {}
+                Err(error @ (Error::NodeRunNotFound(_) | Error::RunNotFound(_))) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        node_run_id = task.node_run_id,
+                        %error,
+                        "skipping task whose run state no longer exists"
+                    );
+                    task.ack_with_config(&mut *tx, self.poll_config).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             let node_run = NodeRun::filter_by_id(task.node_run_id)
                 .get(&mut *tx)
                 .await?;
@@ -111,7 +125,6 @@ where
                     .exec(&mut *tx)
                     .await?;
             }
-            Job::create_for_task(task, &mut *tx).await?;
             task.ack_with_config(&mut *tx, self.poll_config).await?;
         }
         let events: Vec<_> =
@@ -357,12 +370,17 @@ impl Job {
     /// Persists a job with the node and run configurations in effect.
     pub async fn create_for_task<B: Executor>(task: &Task, backend: &mut B) -> Result<Job, Error> {
         let node_run = NodeRun::filter_by_id(task.node_run_id)
-            .get(&mut *backend)
-            .await?;
+            .first()
+            .exec(&mut *backend)
+            .await?
+            .ok_or(Error::NodeRunNotFound(task.node_run_id))?;
         let run = Run::filter_by_uuid(node_run.run_id)
-            .get(&mut *backend)
-            .await?;
+            .first()
+            .exec(&mut *backend)
+            .await?
+            .ok_or(Error::RunNotFound(node_run.run_id))?;
         let node_config = NodeConfig::filter_by_node_id(task.node_id)
+            .filter(NodeConfig::fields().version().le(node_run.version))
             .order_by(NodeConfig::fields().version().desc())
             .first()
             .exec(&mut *backend)

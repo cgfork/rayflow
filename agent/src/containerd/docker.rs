@@ -29,6 +29,12 @@ pub struct DockerSpec {
     pub name: String,
     /// Image reference that must be available before creation.
     pub image: String,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: Option<Vec<String>>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
     /// CPU limit in whole cores; zero leaves the Docker CPU limit unset.
     pub cpu_cores: u32,
     /// Memory limit in bytes; zero leaves the Docker memory limit unset.
@@ -49,6 +55,24 @@ impl TryFrom<&scheduler::Job> for DockerSpec {
         Ok(Self {
             name: format!("rayflow-{}", job.uuid),
             image: image.to_owned(),
+            command: config
+                .config
+                .get("command")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
+            env: config
+                .config
+                .get("env")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
+            working_dir: config
+                .config
+                .get("working_dir")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
             cpu_cores: job.required_cpu_cores,
             memory_bytes: job.required_memory_bytes,
         })
@@ -238,6 +262,9 @@ impl Containerd for DockerContainerd {
         })?;
         let body = ContainerCreateBody {
             image: Some(spec.image.clone()),
+            cmd: spec.command.clone(),
+            env: spec.env.clone(),
+            working_dir: spec.working_dir.clone(),
             host_config: Some(HostConfig {
                 nano_cpus: (spec.cpu_cores > 0)
                     .then_some(i64::from(spec.cpu_cores) * 1_000_000_000),

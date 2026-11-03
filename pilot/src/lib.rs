@@ -11,3 +11,12 @@ mod pilot;
 
 pub use config::Config;
 pub use pilot::{Error, Pilot, Step};
+
+/// Registers the scheduler, runtime, event, coordination, and graph models.
+pub fn models() -> toasty::ModelSet {
+    let mut models = scheduler::models();
+    for model in graph::models() {
+        models.add(model);
+    }
+    models
+}

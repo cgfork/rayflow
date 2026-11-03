@@ -19,7 +19,7 @@ use graph::GraphStore;
 /// A run of a graph version for a `(data_id, graph_id)`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, toasty::Model)]
 #[table = "run"]
-#[unique(data_id, graph_id, version)]
+#[unique(data_id, graph_id)]
 pub struct Run {
     #[key]
     #[auto]
@@ -158,9 +158,8 @@ impl<S> Backend<S> {
     /// started. A fresh `run` and a `Ready` node run per started node are created,
     /// and a task is enqueued for each.
     ///
-    /// Starting is a one-time operation per `(data_id, graph_id, version)`; an
-    /// existing run of the same graph version must be rerun instead. A newer graph
-    /// version may be started as its own run.
+    /// Starting is a one-time operation per `(data_id, graph_id)`; an existing
+    /// run must be rerun instead, even when a newer graph version is published.
     async fn start<E>(
         &mut self,
         tx: &mut E,
@@ -193,8 +192,7 @@ impl<S> Backend<S> {
             }
         }
 
-        // A run may only be started once per graph version; rerun it to run it again.
-        let started = Run::filter_by_data_id_and_graph_id_and_version(data_id, graph_id, version)
+        let started = Run::filter_by_data_id_and_graph_id(data_id, graph_id)
             .first()
             .exec(&mut *tx)
             .await?;

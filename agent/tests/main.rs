@@ -27,6 +27,7 @@ fn main_reports_invalid_configuration_before_connecting() {
 #[cfg(unix)]
 #[tokio::test]
 async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
+    use std::io::Read;
     use std::{convert::Infallible, time::Duration};
 
     use axum::{
@@ -43,7 +44,7 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
     };
     use uuid::Uuid;
 
-    for signal in ["-INT", "-TERM"] {
+    for (signal, log_filter) in [("-INT", None), ("-TERM", Some("off"))] {
         let (sender, mut requests) = mpsc::unbounded_channel();
         let router = Router::new().fallback(move |uri: Uri, body: Bytes| {
             let sender = sender.clone();
@@ -75,9 +76,13 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
             ),
         )
         .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent"));
+        command.env_clear();
+        if let Some(filter) = log_filter {
+            command.env("RUST_LOG", filter);
+        }
         let mut process = Process(
-            Command::new(env!("CARGO_BIN_EXE_agent"))
-                .env_clear()
+            command
                 .current_dir(root.path())
                 .env("RAYFLOW_AGENT_CONFIG", path)
                 .env("RAYFLOW_AGENT_ID", id.to_string())
@@ -86,8 +91,8 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
                 .env("RAYFLOW_AGENT_REQUEST_TIMEOUT", "1s")
                 .env("DOCKER_HOST", &address)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
@@ -120,6 +125,31 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
         .await
         .unwrap();
         assert!(status.success(), "{signal}: {status}");
+        let mut stdout = String::new();
+        process
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert!(stdout.is_empty(), "{stdout}");
+        let mut stderr = String::new();
+        process
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        if log_filter.is_none() {
+            assert!(stderr.contains("INFO"), "{stderr}");
+            assert!(stderr.contains("rayflow agent started"), "{stderr}");
+            assert!(stderr.contains("rayflow agent shutting down"), "{stderr}");
+            assert!(stderr.contains(&id.to_string()), "{stderr}");
+        } else {
+            assert!(stderr.is_empty(), "{stderr}");
+        }
         server.abort();
     }
 }

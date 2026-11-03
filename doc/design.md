@@ -16,15 +16,58 @@ Unused outputs are not validation errors. `validator::unreferenced_outputs` repo
 them by matching input sources in `node_name.file_name` form. Optional inputs count
 as references when they name an output.
 
-`graph::store::MySqlGraphStore` persists each `(uuid, version)` as a graph row.
+`toasty::Db` and `toasty::Transaction` implement `GraphStore` and
+`DraftGraphStore` directly through a shared `Executor` implementation.
+Store methods take `&mut self` and persist each `(uuid, version)` as a graph row.
+Graph store traits use native `async fn` without imposing `Send` on every
+returned future. Generic server routes require `S::load(..): Send` and
+`S::graphs(..): Send` through
+return-type notation. The server enables `#![feature(return_type_notation)]`,
+and `rust-toolchain.toml` pins the nightly used to build the workspace.
 `load(uuid, Some(version))` selects an exact version; `load(uuid, None)` selects
 the highest version. The JSON payload contains the complete DAG, while row
 metadata is checked against its UUID, name, and version when loading.
 
+`DAG` includes a node count and the `updated_at`, `updated_by`, `created_at`,
+and `created_by` audit fields. Audit fields are skipped during JSON serialization
+and deserialization; stores populate them from the record columns when loading,
+reading, or listing graphs. Node counts are recalculated from the graph nodes.
+
 The same store keeps one editable `graph_draft` row per graph UUID. Draft writes
 replace the JSON payload and update audit metadata without requiring the graph
-to be valid. Publishing validates the draft, assigns the next graph version,
-and inserts an immutable row into `graph`.
+to be valid. Publishing validates the draft and assigns one more than the
+maximum published version for that graph UUID, starting at version 1. The draft's
+version does not affect allocation. It inserts an immutable row into `graph`.
+Publishing on a database starts a
+transaction; publishing inside a transaction uses a savepoint, leaving the
+outer commit or rollback to the caller.
+
+Both listing methods accept a `PageRequest` (default 50, accepted
+limits 1–200). Database pages use descending row IDs and an exclusive `before`
+cursor. `GraphStore::graphs` includes all published versions and optionally
+filters by UUID; `DraftGraphStore::list` lists one editable row per UUID. Each
+query fetches at most `limit + 1` rows and returns `next_cursor` only when a
+further page exists. Both methods return `Page<Self::G>` with complete graph
+definitions and validate stored JSON against row metadata. Transactions list
+their own uncommitted writes. Server collection endpoints call the store traits
+and return `Page<DAG>`. Individual reads, draft writes, and publishing return
+`DAG` directly. The HTTP client reads each graph page in one request.
+
+```rust,ignore
+use graph::{DraftGraphStore, GraphStore, PageRequest};
+
+let page = GraphStore::graphs(&mut db, PageRequest::default(), Some(graph_id)).await?;
+if let Some(cursor) = page.next_cursor {
+    let next = GraphStore::graphs(
+        &mut db, PageRequest::new(Some(cursor), 50)?, Some(graph_id),
+    ).await?;
+}
+let drafts = DraftGraphStore::list(&mut db, PageRequest::default()).await?;
+```
+
+Cursors are specific to a store and filter. In-memory registries and filesystem
+caches use positions in a sorted snapshot, so their contents should stay fixed
+while traversing pages. Database cursors remain stable when newer rows arrive.
 
 ## Diffing
 
@@ -54,6 +97,11 @@ Commands are applied by `runtime::CommandApply`:
 and the command-log acknowledgement can commit atomically. Consumers must
 serialize command application.
 
+The `run` table has a unique `(data_id, graph_id)` key. A start pins the published
+graph version, and publishing another version does not permit a second run for
+the same pair. Use rerun for an existing run or a new data identifier for another
+execution.
+
 ## Event Logs
 
 `CommandEntry`, `Task`, and `TaskEventEntry` are append-only records. `Emit` adds
@@ -71,15 +119,20 @@ continuous poll, handle, and acknowledge loop; handlers must tolerate replay.
 transaction. It applies commands, creates jobs from tasks, activates ready nodes,
 settles terminal jobs, and applies task-event commands.
 
+Tasks whose node run or owning run no longer exists are acknowledged with a
+warning and remain in the append-only task log. They create no job and do not
+block valid commands or tasks. Other errors still roll back the consumer pass.
+
 `Scheduler<B>` abstracts job destinations. The default `AgentScheduler` fails jobs
 whose expiry is beyond the configured grace period. External implementations may
 submit jobs to systems such as Kubernetes or Volcano, but must use durable request
 records and reconcile retries after rollback.
 
-`RunConfig` stores the run configuration revision and graph version. Node
-configuration stores resource requirements and the required positive job lease.
-When a task becomes a job, the latest applicable node configuration and run
-configuration are pinned to that job.
+`RunConfig` stores the run configuration revision and graph version. Each graph
+node carries JSON task configuration, resource requirements, and a duration
+timeout. Publishing snapshots these settings to `NodeConfig`, keyed by graph
+version; job creation selects the latest node configuration no newer than the
+run's pinned version. This keeps historical executions reproducible.
 
 ## Agent Claims
 

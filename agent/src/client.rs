@@ -101,7 +101,30 @@ impl GraphStore<Uuid> for Client {
     type G = DAG;
     type Err = Error;
 
-    async fn load(&self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Error> {
+    async fn graphs(
+        &mut self,
+        page: graph::PageRequest,
+        graph_id: Option<Uuid>,
+    ) -> Result<graph::Page<Self::G>, Error> {
+        let mut query = vec![("limit", page.limit().to_string())];
+        if let Some(before) = page.before() {
+            query.push(("before", before.to_string()));
+        }
+        if let Some(graph_id) = graph_id {
+            query.push(("graph_id", graph_id.to_string()));
+        }
+        Ok(self
+            .http
+            .get(format!("{}/graphs", self.server_url))
+            .query(&query)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    async fn load(&mut self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Error> {
         self.graph(graph_id, version).await
     }
 }

@@ -7,15 +7,37 @@ use axum::{Json, Router, routing::get};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::app::{App, AppError};
+use crate::app::{App, AppError, Page, PageQuery};
 
 /// Builds published graph routes.
 pub(super) fn routes<S>() -> Router<App<S>>
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
+    S::graphs(..): Send,
     S::Err: Send + Sync + 'static,
 {
-    Router::new().route("/graphs/{graph_id}", get(read_graph::<S>))
+    Router::new()
+        .route("/graphs", get(list_graphs::<S>))
+        .route("/graphs/{graph_id}", get(read_graph::<S>))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListGraphsQuery {
+    pub graph_id: Option<Uuid>,
+}
+
+async fn list_graphs<S>(
+    State(app): State<App<S>>,
+    Query(page): Query<PageQuery>,
+    Query(query): Query<ListGraphsQuery>,
+) -> Result<Json<Page<DAG>>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::graphs(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.list_graphs(page, query.graph_id).await.map(Json)
 }
 
 /// Optional version selector for a published graph read.
@@ -33,6 +55,7 @@ async fn read_graph<S>(
 ) -> Result<Json<DAG>, AppError>
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
     S::Err: Send + Sync + 'static,
 {
     state.read_graph(graph_id, query.version).await.map(Json)

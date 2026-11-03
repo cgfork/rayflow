@@ -25,7 +25,18 @@ impl GraphStore<Uuid> for TestGraphStore {
     type G = DAG;
     type Err = Infallible;
 
-    async fn load(&self, _graph_id: Uuid, _version: Option<u64>) -> Result<Self::G, Self::Err> {
+    async fn graphs(
+        &mut self,
+        page: graph::PageRequest,
+        graph_id: Option<Uuid>,
+    ) -> Result<graph::Page<DAG>, Infallible> {
+        Ok(page.select(
+            std::iter::once((1, self.0.clone()))
+                .filter(|(_, graph)| graph_id.is_none_or(|id| graph.id == id)),
+        ))
+    }
+
+    async fn load(&mut self, _graph_id: Uuid, _version: Option<u64>) -> Result<Self::G, Self::Err> {
         Ok(self.0.clone())
     }
 }
@@ -49,6 +60,7 @@ async fn setup() -> Option<(Db, DAG, Uuid, Uuid)> {
         id: Uuid::new_v4(),
         name: "root".to_string(),
         node_type: "test".to_string(),
+        settings: Default::default(),
         inputs: Vec::new(),
         outputs: Vec::new(),
     };
@@ -58,9 +70,89 @@ async fn setup() -> Option<(Db, DAG, Uuid, Uuid)> {
         version: 1,
         nodes: vec![node],
         edges: Vec::new(),
+        node_count: 1,
+        ..DAG::default()
     };
     let graph_id = dag.id;
     Some((db, dag, Uuid::new_v4(), graph_id))
+}
+
+#[tokio::test]
+async fn start_rejects_an_existing_data_graph_pair_across_versions() {
+    let Some((mut db, mut dag, data_id, graph_id)) = setup().await else {
+        return;
+    };
+    let command = CommandEntry::new(data_id, graph_id, Command::Start { nodes: Vec::new() });
+    command
+        .apply(Backend::new(db.clone(), TestGraphStore(dag.clone())))
+        .await
+        .unwrap();
+    let initial = Run::filter_by_data_id_and_graph_id(data_id, graph_id)
+        .get(&mut db)
+        .await
+        .unwrap();
+
+    for version in [dag.version, dag.version + 1] {
+        dag.version = version;
+        assert!(matches!(
+            command
+                .apply(Backend::new(db.clone(), TestGraphStore(dag.clone())))
+                .await,
+            Err(Error::AlreadyStarted)
+        ));
+    }
+    let runs = Run::all().exec(&mut db).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].uuid, initial.uuid);
+    assert_eq!(runs[0].version, initial.version);
+    assert_eq!(NodeRun::all().exec(&mut db).await.unwrap().len(), 1);
+    assert_eq!(
+        event::task::Task::all().exec(&mut db).await.unwrap().len(),
+        1
+    );
+
+    CommandEntry::new(
+        Uuid::new_v4(),
+        graph_id,
+        Command::Start { nodes: Vec::new() },
+    )
+    .apply(Backend::new(db.clone(), TestGraphStore(dag.clone())))
+    .await
+    .unwrap();
+    dag.id = Uuid::new_v4();
+    CommandEntry::new(data_id, dag.id, Command::Start { nodes: Vec::new() })
+        .apply(Backend::new(db.clone(), TestGraphStore(dag)))
+        .await
+        .unwrap();
+    assert_eq!(Run::all().exec(&mut db).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn database_rejects_duplicate_data_graph_pairs_with_different_versions() {
+    let Some((mut db, dag, data_id, graph_id)) = setup().await else {
+        return;
+    };
+    let now = jiff::Timestamp::now();
+    for version in [1, 2] {
+        let result = Run::create()
+            .uuid(Uuid::new_v4())
+            .data_id(data_id)
+            .graph_id(graph_id)
+            .version(version)
+            .revision(0)
+            .created_at(now)
+            .updated_at(now)
+            .exec(&mut db)
+            .await;
+        if version == 1 {
+            result.unwrap();
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    let runs = Run::all().exec(&mut db).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].version, dag.version);
 }
 
 #[tokio::test]

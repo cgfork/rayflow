@@ -88,7 +88,8 @@ impl GraphFs {
             Some(version) => version,
             None => self.latest_version(graph_id).await?,
         };
-        let graph: DAG = read_json(&self.graph_path(graph_id, version)).await?;
+        let mut graph: DAG = read_json(&self.graph_path(graph_id, version)).await?;
+        graph.node_count = graph.nodes.len();
         if graph.id != graph_id || graph.version != version {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -100,7 +101,8 @@ impl GraphFs {
     }
 
     /// Writes a complete graph version to the cache atomically.
-    pub async fn write_graph(&self, graph: DAG) -> Result<(), Error> {
+    pub async fn write_graph(&self, mut graph: DAG) -> Result<(), Error> {
+        graph.node_count = graph.nodes.len();
         write_json(&self.graph_path(graph.id, graph.version), &graph).await
     }
 }
@@ -109,8 +111,61 @@ impl GraphStore<Uuid> for GraphFs {
     type G = DAG;
     type Err = Error;
 
+    async fn graphs(
+        &mut self,
+        page: graph::PageRequest,
+        graph_id: Option<Uuid>,
+    ) -> Result<graph::Page<DAG>, Error> {
+        let mut entries = match fs::read_dir(&self.root_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(graph::Page {
+                    items: vec![],
+                    next_cursor: None,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut versions = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let Ok(id) = entry.file_name().to_string_lossy().parse::<Uuid>() else {
+                continue;
+            };
+            if graph_id.is_some_and(|graph_id| graph_id != id) {
+                continue;
+            }
+            let mut children = fs::read_dir(entry.path()).await?;
+            while let Some(child) = children.next_entry().await? {
+                if child.file_type().await?.is_dir()
+                    && let Ok(version) = child.file_name().to_string_lossy().parse::<u64>()
+                {
+                    versions.push((id, version));
+                }
+            }
+        }
+        versions.sort_unstable();
+        let selected = page.select(
+            versions
+                .into_iter()
+                .enumerate()
+                .rev()
+                .map(|(index, version)| (index as u64 + 1, version)),
+        );
+        let mut items = Vec::with_capacity(selected.items.len());
+        for (id, version) in selected.items {
+            items.push(self.load(id, Some(version)).await?);
+        }
+        Ok(graph::Page {
+            items,
+            next_cursor: selected.next_cursor,
+        })
+    }
+
     /// Loads an exact version, or the highest cached version when omitted.
-    async fn load(&self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Error> {
+    async fn load(&mut self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Error> {
         self.load_version(graph_id, version).await
     }
 }
@@ -131,6 +186,7 @@ mod tests {
             version,
             nodes: Vec::new(),
             edges: Vec::new(),
+            ..DAG::default()
         }
     }
 
@@ -138,7 +194,7 @@ mod tests {
     async fn graph_versions_round_trip_in_the_graph_cache() {
         let root = tempdir().unwrap();
         let graph_dir = root.path().join("graph");
-        let graph_fs = GraphFs::new(&graph_dir);
+        let mut graph_fs = GraphFs::new(&graph_dir);
         let expected = graph(Uuid::new_v4(), 3, "test");
 
         graph_fs.write_graph(expected.clone()).await.unwrap();
@@ -166,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn omitted_version_loads_the_highest_cached_version() {
         let root = tempdir().unwrap();
-        let graph_fs = GraphFs::from_workdir(root.path());
+        let mut graph_fs = GraphFs::from_workdir(root.path());
         let graph_id = Uuid::new_v4();
         let older = graph(graph_id, 2, "older");
         let expected = graph(graph_id, 7, "newer");

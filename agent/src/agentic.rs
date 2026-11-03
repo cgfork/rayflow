@@ -62,7 +62,7 @@ impl Agentic {
 impl<C, R> Agentic<C, R>
 where
     C: Containerd,
-    R: GraphStore<Uuid, G = DAG> + Send + Sync,
+    R: GraphStore<Uuid, G = DAG> + Clone + Send + Sync,
 {
     /// Uses an existing daemon and an independent remote client.
     pub fn with_agent(
@@ -165,7 +165,7 @@ where
                                 }
                             }
                         }
-                        Err(error) => eprintln!("job poll failed: {error}"),
+                        Err(error) => tracing::warn!(%error, "job poll failed"),
                     }
                     polling = Box::pin(self.poll_after(self.settings.poll_interval));
                 }
@@ -184,7 +184,7 @@ where
         };
         match result {
             Ok(()) | Err(Error::JobRunning(_)) => return,
-            Err(error) => eprintln!("job {job_id} could not start: {error}"),
+            Err(error) => tracing::error!(%job_id, %error, "job could not start"),
         }
 
         loop {
@@ -193,7 +193,9 @@ where
             }
             match self.agentd.fail(job.clone()).await {
                 Ok(()) => return,
-                Err(error) => eprintln!("job {job_id} failure could not be persisted: {error}"),
+                Err(error) => {
+                    tracing::error!(%job_id, %error, "job failure could not be persisted");
+                }
             }
             sleep(self.settings.poll_interval).await;
         }
@@ -207,11 +209,11 @@ where
                     Ok(results) => {
                         for result in results {
                             if let Err(error) = self.report_result(&result).await {
-                                eprintln!("job {} result report failed: {error}", result.job_id);
+                                tracing::warn!(job_id = %result.job_id, %error, "job result report failed");
                             }
                         }
                     }
-                    Err(error) => eprintln!("job result poll failed: {error}"),
+                    Err(error) => tracing::warn!(%error, "job result poll failed"),
                 }
             }
             sleep(self.settings.poll_interval).await;
@@ -241,7 +243,7 @@ where
         loop {
             match self.agentd.watch().await {
                 Ok(()) => return Ok(()),
-                Err(error) => eprintln!("container watcher failed: {error}"),
+                Err(error) => tracing::warn!(%error, "container watcher failed"),
             }
             sleep(self.settings.poll_interval).await;
         }

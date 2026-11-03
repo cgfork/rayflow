@@ -11,6 +11,8 @@ graph = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "macros", "signal", "time", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 scheduler = { workspace = true }
 jiff = { workspace = true }

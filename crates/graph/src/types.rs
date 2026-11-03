@@ -1,3 +1,5 @@
+use jiff::Timestamp;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{Diff, Graph, Id, NodeMut, NodeRef};
@@ -58,6 +60,46 @@ impl Diff for Input {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Resource {
+    pub cpu_cores: u32,
+    pub memory_bytes: u64,
+}
+
+impl Diff for Resource {
+    type Item = (Self, Self);
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self != other).then(|| (self.clone(), other.clone()))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NodeSettings {
+    pub config: serde_json::Value,
+    pub resource: Resource,
+    #[serde(with = "jiff::fmt::serde::unsigned_duration::friendly::compact::required")]
+    pub timeout: Duration,
+}
+
+impl NodeSettings {
+    pub fn timeout_ms(&self) -> Option<u64> {
+        let milliseconds = u64::try_from(self.timeout.as_millis()).ok()?;
+        (milliseconds > 0
+            && self.timeout.subsec_nanos().is_multiple_of(1_000_000)
+            && milliseconds <= (i64::MAX / 1000) as u64)
+            .then_some(milliseconds)
+    }
+}
+
+impl Diff for NodeSettings {
+    type Item = (Self, Self);
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self != other).then(|| (self.clone(), other.clone()))
+    }
+}
+
 /// A single node (task) in a graph.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Node {
@@ -67,6 +109,8 @@ pub struct Node {
     pub name: String,
     /// Node type / task kind.
     pub node_type: String,
+    #[serde(default)]
+    pub settings: NodeSettings,
     /// Inputs consumed by the node.
     pub inputs: Vec<Input>,
     /// Outputs produced by the node.
@@ -88,7 +132,7 @@ impl std::fmt::Display for Node {
 }
 
 /// A directed acyclic graph of nodes connected by edges.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DAG {
     /// Unique graph identifier.
     pub id: Uuid,
@@ -96,6 +140,16 @@ pub struct DAG {
     pub name: String,
     /// Graph version.
     pub version: u64,
+    #[serde(default)]
+    pub node_count: usize,
+    #[serde(skip)]
+    pub updated_at: Timestamp,
+    #[serde(skip)]
+    pub updated_by: String,
+    #[serde(skip)]
+    pub created_at: Timestamp,
+    #[serde(skip)]
+    pub created_by: String,
     /// Nodes in the graph.
     pub nodes: Vec<Node>,
     /// Directed edges as `(from, to)` node-id pairs.
@@ -149,11 +203,13 @@ impl Graph for DAG {
 
     fn delete_node(&mut self, node_id: Self::NodeId) {
         self.nodes.retain(|node| node.id != node_id);
+        self.node_count = self.nodes.len();
         self.edges
             .retain(|&(from, to)| from != node_id && to != node_id);
     }
 
     fn add_node(&mut self, node: Self::NodeData<'_>) {
         self.nodes.push(node);
+        self.node_count = self.nodes.len();
     }
 }

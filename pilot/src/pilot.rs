@@ -161,7 +161,7 @@ where
                 }
                 _ = ticker.tick() => {
                     if let Err(error) = self.step().await {
-                        eprintln!("pilot: consumer pass failed: {error}");
+                        tracing::error!(%error, "pilot consumer pass failed");
                     }
                 }
             }
