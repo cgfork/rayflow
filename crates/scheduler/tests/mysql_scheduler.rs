@@ -38,7 +38,18 @@ impl GraphStore<Uuid> for TestGraphStore {
     type G = DAG;
     type Err = Infallible;
 
-    async fn load(&self, _graph_id: Uuid, _version: Option<u64>) -> Result<Self::G, Self::Err> {
+    async fn graphs(
+        &mut self,
+        page: graph::PageRequest,
+        graph_id: Option<Uuid>,
+    ) -> Result<graph::Page<DAG>, Infallible> {
+        Ok(page.select(
+            std::iter::once((1, self.0.clone()))
+                .filter(|(_, graph)| graph_id.is_none_or(|id| graph.id == id)),
+        ))
+    }
+
+    async fn load(&mut self, _graph_id: Uuid, _version: Option<u64>) -> Result<Self::G, Self::Err> {
         Ok(self.0.clone())
     }
 }
@@ -61,6 +72,7 @@ fn node(name: &str) -> Node {
         id: Uuid::new_v4(),
         name: name.to_string(),
         node_type: "test".to_string(),
+        settings: Default::default(),
         inputs: Vec::new(),
         outputs: Vec::new(),
     }
@@ -98,6 +110,8 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
             (c.id, d.id),
             (d.id, e.id),
         ],
+        node_count: 5,
+        ..DAG::default()
     };
     for node in &dag.nodes {
         let now = jiff::Timestamp::now();
@@ -118,6 +132,100 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
             .unwrap();
     }
     Some((db, dag, Uuid::new_v4()))
+}
+
+#[tokio::test]
+async fn orphaned_tasks_do_not_block_a_new_run() {
+    let Some((mut db, dag, data_id)) = setup().await else {
+        return;
+    };
+    let now = jiff::Timestamp::now();
+    let orphan = NodeRun::create()
+        .run_id(Uuid::new_v4())
+        .data_id(Uuid::new_v4())
+        .graph_id(Uuid::new_v4())
+        .version(1)
+        .node_id(Uuid::new_v4())
+        .revision(0)
+        .status(Status::Ready.to_string())
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    for node_run_id in [orphan.id, u64::MAX] {
+        Task::new(orphan.data_id, orphan.graph_id, orphan.node_id, node_run_id)
+            .emit(&mut db)
+            .await
+            .unwrap();
+    }
+    let graph_id = dag.id;
+    let mut actuator = Actuator::new(Backend::new(db.clone(), TestGraphStore(dag)), 64);
+    let mut transaction = db.transaction().await.unwrap();
+    assert_eq!(actuator.tick_in(&mut transaction).await.unwrap().tasks, 2);
+    transaction.rollback().await.unwrap();
+    assert_eq!(Task::poll(&mut db, 64).await.unwrap().count(), 2);
+
+    CommandEntry::new(data_id, graph_id, Command::Start { nodes: Vec::new() })
+        .emit(&mut db)
+        .await
+        .unwrap();
+    let step = actuator.tick().await.unwrap();
+    assert_eq!(step.commands, 1);
+    assert_eq!(step.tasks, 3);
+    assert_eq!(Run::all().exec(&mut db).await.unwrap().len(), 1);
+    let jobs = scheduler::Job::all().exec(&mut db).await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    let node = NodeRun::filter_by_id(jobs[0].node_run_id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(node.data_id, data_id);
+    assert_eq!(node.status, Status::Running.to_string());
+    assert_eq!(
+        NodeRun::filter_by_id(orphan.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .status,
+        Status::Ready.to_string()
+    );
+    assert_eq!(Task::all().exec(&mut db).await.unwrap().len(), 3);
+    assert_eq!(Task::poll(&mut db, 64).await.unwrap().count(), 0);
+    assert_eq!(actuator.tick().await.unwrap(), scheduler::Step::default());
+}
+
+#[tokio::test]
+async fn invalid_configuration_still_rolls_back_the_consumer_pass() {
+    let Some((mut db, dag, data_id)) = setup().await else {
+        return;
+    };
+    NodeConfig::filter_by_node_id(dag.nodes[0].id)
+        .update()
+        .lease(Some(0))
+        .exec(&mut db)
+        .await
+        .unwrap();
+    CommandEntry::new(data_id, dag.id, Command::Start { nodes: Vec::new() })
+        .emit(&mut db)
+        .await
+        .unwrap();
+    let mut actuator = Actuator::new(Backend::new(db.clone(), TestGraphStore(dag)), 64);
+    assert!(matches!(
+        actuator.tick().await,
+        Err(scheduler::Error::InvalidJobLease(0))
+    ));
+    assert!(Run::all().exec(&mut db).await.unwrap().is_empty());
+    assert!(NodeRun::all().exec(&mut db).await.unwrap().is_empty());
+    assert!(
+        scheduler::Job::all()
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(Task::all().exec(&mut db).await.unwrap().is_empty());
+    assert_eq!(CommandEntry::poll(&mut db, 64).await.unwrap().count(), 1);
 }
 
 #[tokio::test]

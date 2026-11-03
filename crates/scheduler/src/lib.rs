@@ -24,6 +24,10 @@ pub enum Error {
     Event(#[from] event::Error),
     #[error(transparent)]
     Runtime(#[from] runtime::Error),
+    #[error("node run not found for task: {0}")]
+    NodeRunNotFound(u64),
+    #[error("run not found for task: {0}")]
+    RunNotFound(uuid::Uuid),
     #[error("job not found for task: {0}")]
     JobNotFound(uuid::Uuid),
     #[error("job not found: {0}")]

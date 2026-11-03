@@ -10,7 +10,66 @@ use runtime::command::{NodeRun, Run};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::app::{AppError, RunApp};
+use crate::app::{App, AppError, Page, PageQuery, RunApp};
+
+#[derive(Debug, Serialize)]
+pub struct RunView {
+    pub state: GraphState,
+    pub graph: DAG,
+    pub current: bool,
+}
+
+impl<S> App<S> {
+    pub async fn list_runs(
+        &self,
+        page: PageQuery,
+        graph_id: Option<Uuid>,
+    ) -> Result<Page<Run>, AppError> {
+        let limit = page.limit()?;
+        let mut select = Run::all();
+        if let Some(before) = page.before {
+            select = select.filter(Run::fields().id().lt(before));
+        }
+        if let Some(graph_id) = graph_id {
+            select = select.filter(Run::fields().graph_id().eq(graph_id));
+        }
+        let items = select
+            .order_by(Run::fields().id().desc())
+            .limit(limit + 1)
+            .exec(&mut self.db.clone())
+            .await?;
+        Ok(Page::new(items, limit, |row| row.id))
+    }
+
+    pub async fn inspect_run(&self, id: Uuid) -> Result<RunView, AppError>
+    where
+        S: GraphStore<Uuid, G = DAG> + Clone,
+        S::Err: Send + Sync + 'static,
+    {
+        let mut db = self.db.clone();
+        let run = Run::filter_by_uuid(id)
+            .first()
+            .exec(&mut db)
+            .await?
+            .ok_or(AppError::RunIdNotFound(id))?;
+        let latest = Run::filter_by_data_id_and_graph_id(run.data_id, run.graph_id)
+            .order_by(Run::fields().version().desc())
+            .first()
+            .exec(&mut db)
+            .await?;
+        let current = latest.is_some_and(|latest| latest.uuid == run.uuid);
+        let graph = self.read_graph(run.graph_id, Some(run.version)).await?;
+        let state = self
+            .run_with(run.data_id, run.graph_id)
+            .graph_state_at(run, &graph)
+            .await?;
+        Ok(RunView {
+            state,
+            graph,
+            current,
+        })
+    }
+}
 
 /// The state of a single node, combining its node run and its graph definition.
 ///
@@ -83,7 +142,7 @@ pub struct GraphState {
 
 impl<S> RunApp<S>
 where
-    S: GraphStore<Uuid, G = DAG>,
+    S: GraphStore<Uuid, G = DAG> + Clone,
     <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
 {
     /// Returns the state of `node_id`: its node run combined with the graph node.
@@ -118,6 +177,10 @@ where
         // Load the graph before the node runs so no node run row is held across
         // an await (it keeps this future `Send`, so it can be used as a handler).
         let graph = self.graph(run.version).await?;
+        self.graph_state_at(run, &graph).await
+    }
+
+    async fn graph_state_at(&self, run: Run, graph: &DAG) -> Result<GraphState, AppError> {
         let mut db = self.db.clone();
         let rows = NodeRun::filter_by_run_id(run.uuid)
             .filter(NodeRun::fields().revision().le(run.revision))
@@ -173,6 +236,7 @@ where
     /// Loads the graph at `version` from the graph store.
     async fn graph(&self, version: u64) -> Result<DAG, AppError> {
         self.graph_store
+            .clone()
             .load(self.graph_id, Some(version))
             .await
             .map_err(|error| AppError::Graph(Box::new(error)))
@@ -194,6 +258,7 @@ mod tests {
             id,
             name: format!("node-{}", id.as_u128()),
             node_type: "script".to_string(),
+            settings: Default::default(),
             inputs: Vec::new(),
             outputs: Vec::new(),
         }
@@ -217,6 +282,8 @@ mod tests {
             version: 7,
             nodes: vec![node(node_id)],
             edges: Vec::new(),
+            node_count: 1,
+            ..DAG::default()
         };
 
         let run = Run::create()
@@ -290,6 +357,8 @@ mod tests {
             version: 7,
             nodes: vec![node(first), node(second)],
             edges: vec![(first, second)],
+            node_count: 2,
+            ..DAG::default()
         };
 
         let run = Run::create()

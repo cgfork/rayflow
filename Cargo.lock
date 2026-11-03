@@ -66,6 +66,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -2276,6 +2278,7 @@ dependencies = [
 name = "pilot"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "config",
  "coordinator",
  "event",
@@ -2289,6 +2292,9 @@ dependencies = [
  "thiserror",
  "toasty",
  "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3033,6 +3039,7 @@ dependencies = [
  "thiserror",
  "toasty",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -3191,6 +3198,9 @@ dependencies = [
  "toasty",
  "tokio",
  "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -3672,6 +3682,7 @@ dependencies = [
  "indexmap",
  "inventory",
  "jiff",
+ "serde",
  "serde_core",
  "serde_json",
  "toasty-core",
@@ -3682,6 +3693,8 @@ dependencies = [
  "toasty-macros",
  "tokio",
  "tokio-stream",
+ "toml",
+ "toml_edit",
  "tracing",
  "uuid",
 ]
@@ -3943,8 +3956,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3641d5bbb5349a79e1020a242d251efbc546ad8048d133958323ce9c40a9c9c"
 dependencies = [
  "indexmap",
+ "serde_core",
+ "serde_spanned",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

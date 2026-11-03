@@ -63,6 +63,18 @@ impl AgentRef {
         }
     }
 
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn resource(&self) -> ResourceCapacity {
+        self.resource
+    }
+
+    pub fn active_jobs(&self) -> &[Uuid] {
+        &self.active_jobs
+    }
+
     /// Redelivers inactive Polled jobs and resets their lifetime on delivery.
     async fn polled<B: Executor>(
         &mut self,

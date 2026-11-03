@@ -3,10 +3,13 @@
 //! Exposes the runtime over HTTP: [`router`] merges the service routes with the
 //! REST API in [`api`], which the server binary serves.
 
+#![feature(return_type_notation)]
+
 pub mod api;
 pub mod app;
 pub mod config;
 pub mod graph;
+pub mod migration;
 
 pub use app::App;
 pub use config::Config;
@@ -16,11 +19,13 @@ use ::graph::GraphStore;
 use ::graph::types::DAG;
 use axum::Router;
 use axum::routing::get;
+use toasty::schema::Model;
 use uuid::Uuid;
 
 /// Registers graph, runtime, and scheduling models together for the API.
 pub fn models() -> toasty::ModelSet {
     let mut models = scheduler::models();
+    models.add(app::AgentInstance::schema());
     for model in ::graph::models() {
         models.add(model);
     }
@@ -31,6 +36,8 @@ pub fn models() -> toasty::ModelSet {
 pub fn router<S>(state: App<S>) -> Router
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
+    S::graphs(..): Send,
     <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
 {
     service_routes().merge(api::router(state))

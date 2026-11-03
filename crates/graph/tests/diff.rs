@@ -26,6 +26,7 @@ fn node(id: u128) -> Node {
         id: Uuid::from_u128(id),
         name: format!("node-{id}"),
         node_type: "task".into(),
+        settings: Default::default(),
         inputs: vec![input()],
         outputs: vec![output()],
     }
@@ -36,11 +37,13 @@ fn graph() -> DAG {
         id: Uuid::from_u128(100),
         name: "graph".into(),
         version: 1,
+        node_count: 3,
         nodes: vec![node(1), node(2), node(3)],
         edges: vec![
             (Uuid::from_u128(1), Uuid::from_u128(2)),
             (Uuid::from_u128(2), Uuid::from_u128(3)),
         ],
+        ..DAG::default()
     }
 }
 
@@ -139,6 +142,17 @@ fn node_diff_detects_each_field_and_nested_values() {
             ..before.clone()
         },
         Node {
+            settings: graph::types::NodeSettings {
+                config: serde_json::json!({"image": "alpine:3.21"}),
+                resource: graph::types::Resource {
+                    cpu_cores: 1,
+                    memory_bytes: 1024,
+                },
+                timeout: std::time::Duration::from_secs(10),
+            },
+            ..before.clone()
+        },
+        Node {
             inputs: vec![],
             ..before.clone()
         },
@@ -212,6 +226,7 @@ fn graph_diff_reports_changed_missing_and_extra_nodes_and_edges() {
 fn graph_diff_handles_empty_graphs() {
     let populated = graph();
     let empty = DAG {
+        node_count: 0,
         nodes: vec![],
         edges: vec![],
         ..populated.clone()

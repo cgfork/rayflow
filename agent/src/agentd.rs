@@ -122,7 +122,7 @@ pub struct Agentd<C, R> {
 impl<C, R> Agentd<C, R>
 where
     C: Containerd,
-    R: GraphStore<Uuid, G = DAG>,
+    R: GraphStore<Uuid, G = DAG> + Clone,
 {
     /// Opens the workdir, discovers persisted jobs, and reconciles containers
     /// that already exited before the current process started.
@@ -214,6 +214,7 @@ where
         let graph = self
             .inner
             .graph_store
+            .clone()
             .load(run.graph_id, Some(run.version))
             .await
             .map_err(|error| Error::Agentd(format!("load graph: {error}")))?;

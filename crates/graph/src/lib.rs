@@ -1,8 +1,10 @@
 pub mod diff;
+pub mod pagination;
 pub mod store;
 pub mod types;
 pub mod validator;
 
+pub use pagination::{Page, PageRequest};
 pub use store::models;
 
 use std::{
@@ -127,22 +129,39 @@ pub trait Graph {
     }
 }
 
-/// Loads graphs by id.
-///
-/// `load` returns a `Send` future so a graph store can be awaited from an async
-/// context that must itself be `Send` (a request handler, say).
+/// Loads and lists graphs using native async methods.
+#[allow(async_fn_in_trait)]
 pub trait GraphStore<I: Id> {
     /// The graph type this store loads.
     type G: Graph<GraphId = I>;
     /// Error returned when loading a graph.
     type Err: std::error::Error;
+    /// Lists published versions, optionally restricted to one graph.
+    /// Cursors are local to the store and must be reused with the same filter.
+    async fn graphs(
+        &mut self,
+        page: PageRequest,
+        graph_id: Option<I>,
+    ) -> Result<Page<Self::G>, Self::Err>;
 
     /// Loads the graph with the given id, at `version` when one is given.
-    fn load(
-        &self,
-        graph_id: I,
-        version: Option<u64>,
-    ) -> impl std::future::Future<Output = Result<Self::G, Self::Err>> + Send;
+    async fn load(&mut self, graph_id: I, version: Option<u64>) -> Result<Self::G, Self::Err>;
+}
+
+/// Edits graph drafts and publishes immutable graph versions.
+#[allow(async_fn_in_trait)]
+pub trait DraftGraphStore<I: Id>: GraphStore<I> {
+    /// Lists editable drafts in descending cursor order.
+    async fn list(&mut self, page: PageRequest) -> Result<Page<Self::G>, Self::Err>;
+
+    /// Reads the editable draft for a graph.
+    async fn read(&mut self, graph_id: I) -> Result<Self::G, Self::Err>;
+
+    /// Creates or replaces a draft, recording the actor responsible.
+    async fn write(&mut self, graph: &Self::G, actor: &str) -> Result<(), Self::Err>;
+
+    /// Validates the draft and publishes it as the next graph version.
+    async fn publish(&mut self, graph_id: I, actor: &str) -> Result<(), Self::Err>;
 }
 
 /// Compares values, returning `None` when there are no differences.

@@ -86,6 +86,129 @@ pub fn validate<G: Graph>(graph: &G) -> Result<(), ValidationError<G::NodeId>> {
     Ok(())
 }
 
+/// Validates runnable settings and input bindings before publishing a DAG.
+pub fn validate_workflow(graph: &DAG) -> Result<(), String> {
+    validate(graph).map_err(|error| error.to_string())?;
+    let mut ids = HashSet::new();
+    let mut names = HashSet::new();
+    if graph.name.trim().is_empty() {
+        return Err("graph name must not be empty".into());
+    }
+    for node in &graph.nodes {
+        if !ids.insert(node.id) || node.name.trim().is_empty() || !names.insert(&node.name) {
+            return Err("node IDs and names must be unique and names must not be empty".into());
+        }
+        let settings = &node.settings;
+        if node.node_type.trim().is_empty() || !settings.config.is_object() {
+            return Err(format!(
+                "{}: task type and a JSON configuration object are required",
+                node.name
+            ));
+        }
+        if settings.resource.cpu_cores == 0 || settings.resource.memory_bytes == 0 {
+            return Err(format!(
+                "{}: CPU cores and memory must be positive",
+                node.name
+            ));
+        }
+        if settings.resource.memory_bytes > i64::MAX as u64 {
+            return Err(format!("{}: memory exceeds the supported limit", node.name));
+        }
+        if settings.timeout_ms().is_none() {
+            return Err(format!(
+                "{}: timeout must be positive whole milliseconds within timestamp range",
+                node.name
+            ));
+        }
+        if node.node_type == "docker" {
+            if !settings
+                .config
+                .get("image")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|image| !image.trim().is_empty())
+            {
+                return Err(format!("{}: Docker image is required", node.name));
+            }
+            for field in ["command", "env"] {
+                if settings.config.get(field).is_some_and(|value| {
+                    !value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+                }) {
+                    return Err(format!(
+                        "{}: Docker {field} must be an array of strings",
+                        node.name
+                    ));
+                }
+            }
+            if settings
+                .config
+                .get("working_dir")
+                .is_some_and(|value| !value.is_string())
+            {
+                return Err(format!(
+                    "{}: Docker working_dir must be a string",
+                    node.name
+                ));
+            }
+        }
+        for (label, ports) in [
+            (
+                "input",
+                node.inputs
+                    .iter()
+                    .map(|input| input.file_name.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "output",
+                node.outputs
+                    .iter()
+                    .map(|output| output.file_name.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let mut files = HashSet::new();
+            if ports
+                .iter()
+                .any(|file| file.trim().is_empty() || !files.insert(file))
+            {
+                return Err(format!(
+                    "{}: {label} file names must be nonempty and unique",
+                    node.name
+                ));
+            }
+        }
+        let mut upstream = HashSet::new();
+        let mut pending = vec![node.id];
+        while let Some(current) = pending.pop() {
+            for &(source, target) in &graph.edges {
+                if target == current && upstream.insert(source) {
+                    pending.push(source);
+                }
+            }
+        }
+        for input in &node.inputs {
+            let producers: Vec<_> = graph
+                .nodes
+                .iter()
+                .filter(|producer| {
+                    producer.outputs.iter().any(|output| {
+                        input.source == format!("{}.{}", producer.name, output.file_name)
+                    })
+                })
+                .collect();
+            if producers.len() != 1 || !upstream.contains(&producers[0].id) {
+                return Err(format!(
+                    "{}: input {} must select an upstream output",
+                    node.name, input.file_name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// An output that is not referenced by any input in the graph.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnreferencedOutput<'graph> {

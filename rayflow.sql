@@ -52,8 +52,8 @@ CREATE TABLE IF NOT EXISTS run (
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     PRIMARY KEY (id),
     UNIQUE KEY uk_run_uuid (uuid),
-    UNIQUE KEY uk_run_data_graph_version (data_id, graph_id, version)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'dag execution run, one row per (data_id, graph_id, version)';
+    UNIQUE KEY uk_run_data_graph (data_id, graph_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'dag execution run, one row per (data_id, graph_id)';
 
 CREATE TABLE IF NOT EXISTS run_config (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
@@ -103,6 +103,20 @@ CREATE TABLE IF NOT EXISTS node_run (
     UNIQUE KEY uk_node_run_run_node_revision (run_id, node_id, revision),
     KEY idx_node_run_data_graph (data_id, graph_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node status within a dag execution run, one row per revision';
+
+CREATE TABLE IF NOT EXISTS agent_instance (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    uuid CHAR(36) NOT NULL,
+    cpu_cores INT UNSIGNED NOT NULL,
+    memory_bytes BIGINT UNSIGNED NOT NULL,
+    active_jobs INT UNSIGNED NOT NULL,
+    first_seen_at DATETIME(6) NOT NULL,
+    last_seen_at DATETIME(6) NOT NULL,
+    online_until DATETIME(6) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_agent_instance_uuid (uuid),
+    KEY idx_agent_instance_online_until (online_until)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'agent observations for the web console; not used for scheduling';
 
 CREATE TABLE IF NOT EXISTS job (
     id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',

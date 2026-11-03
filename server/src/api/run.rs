@@ -1,6 +1,6 @@
 //! Run commands and state endpoints.
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -10,20 +10,48 @@ use graph::types::DAG;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::app::{App, AppError, GraphState};
+use crate::app::{App, AppError, GraphState, Page, PageQuery, RunView};
 
 /// Builds the run routes.
 pub(super) fn routes<S>() -> Router<App<S>>
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
     <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
 {
     Router::new()
+        .route("/runs", get(list_runs::<S>))
+        .route("/runs/{run_id}", get(inspect_run::<S>))
         .route("/runs/start", post(start_run::<S>))
         .route("/runs/rerun", post(rerun_run::<S>))
         .route("/runs/resume", post(resume_run::<S>))
         .route("/runs/dryrun", post(dryrun_run::<S>))
         .route("/runs/graph_state", get(get_graph_state::<S>))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListRunsQuery {
+    pub graph_id: Option<Uuid>,
+}
+
+async fn list_runs<S>(
+    State(app): State<App<S>>,
+    Query(page): Query<PageQuery>,
+    Query(query): Query<ListRunsQuery>,
+) -> Result<Json<Page<runtime::command::Run>>, AppError> {
+    app.list_runs(page, query.graph_id).await.map(Json)
+}
+
+async fn inspect_run<S>(
+    State(app): State<App<S>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RunView>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.inspect_run(id).await.map(Json)
 }
 
 /// Request body for `POST /runs/start`.
@@ -180,6 +208,7 @@ async fn get_graph_state<S>(
 ) -> Result<Json<GetGraphStateResponse>, AppError>
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
     <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
 {
     let response = state

@@ -9,7 +9,7 @@ on those libraries.
 
 ## Project Structure & Module Organization
 - `crates/event/` — `Event`, `Emit`, `Read`, `Poll`, and continuous `Reactive` consumer contracts. The always-available `command`, `task`, and `task_event` modules provide MySQL log persistence without depending on `runtime`.
-- `crates/graph/` — graph model. `src/lib.rs` defines the `Graph`/`Id`/`GraphStore` traits; `src/types.rs` holds node/edge types. Primitives and validation have no I/O. `src/store.rs` provides the MySQL `GraphRecord` model and `MySqlGraphStore`; `graph::models()` registers the versioned `graph` table. `load(uuid, None)` selects the highest version; explicit versions are exact matches. Creation and update audit fields are persisted.
+- `crates/graph/` — graph model. `src/lib.rs` defines the `Graph`/`Id`/`GraphStore`/`DraftGraphStore` traits; `src/types.rs` holds node/edge types. Primitives and validation have no I/O. `src/store.rs` implements the store traits directly for Toasty `Db` and `Transaction` through `Executor`; methods take `&mut self`. `graph::models()` registers the versioned `graph` and editable `graph_draft` tables. `load(uuid, None)` selects the highest version; explicit versions are exact matches. Creation and update audit fields are persisted. Publishing inside a transaction uses a savepoint and leaves the outer commit or rollback to the caller.
 - `crates/coordinator/` — leader election. `mysql::MySqlLeaderElection` (behind the default `mysql` feature) implements `LeaderElection` and competes for a named, expiring lease in the `leader_election` table; pilots renew it before every consumer pass.
 - `crates/runtime/` — command application and execution backend. `src/lib.rs` defines `CommandApply`; `src/backend.rs` holds `Status`; `src/command.rs` owns the `Run` and `NodeRun` models; scheduler owns `RunConfig` and `NodeConfig`. `src/backend.rs` also provides the MySQL backend; `command.rs` holds run state models and transitions. `Resume` transitions a Pending node to Ready and emits a new task for the same node run; the actuator moves it to Running when creating its job without emitting another task. `TaskEvent::Yield` maps to `Command::Pend` and ends the job as Yielded. MySQL support is unconditional, as in `event`. All log types and polling come from `event`.
 - `crates/scheduler/` — `Actuator` (`actuator.rs`) consumes command/task/task-event logs, applies commands, and creates `Job` instances from logical `Task` records that drive the FSM. `Scheduler<B>` (`scheduler.rs`) abstracts job scheduling to agents or external schedulers such as Kubernetes Volcano. `actuator.rs` also owns job and configuration models plus `JobRead`/`JobWrite` persistence contracts. No worker dependency; MySQL support is unconditional.
@@ -28,6 +28,7 @@ tasks directly without calling `run`. `Run` only transitions `Ready -> Running`.
 Actuation consumes the existing task and activates its node without another task.
 
 ## Build, Test, and Development Commands
+- Use the nightly pinned in `rust-toolchain.toml`; server routes use return-type notation (`S::load(..): Send`) with native async graph store methods.
 - `cargo build` — build all crates.
 - `cargo check -p runtime` — fast type-check of one crate.
 - `cargo check --workspace` — type-check everything.

@@ -5,21 +5,108 @@ durable files used by agents.
 
 ## Prerequisites
 
-Rayflow uses Rust edition 2024 and MySQL. Install a Rust toolchain that supports
-the workspace edition, create a MySQL database, and apply the schema before
-starting the server or pilot:
+Rayflow uses Rust edition 2024 and MySQL. Install rustup; Cargo selects the
+nightly pinned in `rust-toolchain.toml`, including rustfmt and Clippy. The server
+requires nightly for `#![feature(return_type_notation)]`, which lets its generic
+HTTP handlers require `S::load(..): Send` while `GraphStore` uses native
+`async fn` declarations.
+
+Initialize the MySQL database before starting the server or pilot. The script
+requires Cargo, plus permission to create the database and create or alter its
+tables:
 
 ```sh
-mysql -h 127.0.0.1 -u root -p rayflow < rayflow.sql
+export DATABASE_URL='mysql://root:password@127.0.0.1:3306/rayflow'
+./init-db.sh
 ```
 
-`rayflow.sql` creates the graph, run, configuration, node-run, job, event-log,
-poll-offset, and leader-election tables. The Toasty models are the source of
-truth; the SQL file is the deployment schema. The database named in
-`DATABASE_URL` must already exist.
+`init-db.sh` runs `cargo run -p server --bin init-db`. It loads `rayflow.yaml`,
+`RAYFLOW_CONFIG`, and environment overrides through the server's existing
+configuration loader. `DATABASE_URL` can override the configured connection.
+It creates the database if needed and applies the embedded Toasty `MigrationSet`
+from `server/src/migration.rs`. Applied migration IDs are recorded in
+`__toasty_migrations`, so subsequent runs skip completed migrations. Node.js and
+the MySQL command-line client are not required.
+
+The Toasty models define the application schema. `rayflow.sql` documents its
+current SQL form, and versioned files in `server/migrations/` describe database
+changes. The initial migration creates all application tables. For later schema
+changes, add a new migration file with a new ID in `MIGRATIONS` and update
+`rayflow.sql`; do not edit migrations already applied to a database.
+
+Stop the server, pilot, and agents before initializing an existing database.
+The script can be rerun and preserves existing rows. In addition to creating
+missing tables, it adds zero defaults for obsolete `job.assignment_version` and
+`job.steal_count` columns if they still exist without defaults. This allows the
+current job inserts to work with the older schema while preserving old values.
+It does not add these retired columns to new databases.
+
+For existing databases using the previous versioned run key, the script adds
+the unique `(data_id, graph_id)` key. If duplicate pairs exist, it stops with an
+error; resolve those records explicitly before rerunning. Inspect duplicates with:
+
+```sql
+SELECT data_id, graph_id, COUNT(*) AS run_count
+FROM run GROUP BY data_id, graph_id HAVING COUNT(*) > 1;
+```
+
+MySQL DDL can commit before a migration finishes. A failed migration is not
+recorded as applied, and these initialization migrations can be retried after
+resolving the reported error.
 
 Do not commit credentials in `rayflow.yaml`. Use an environment variable or a
 local, untracked configuration file for `database_url`.
+
+## Local startup
+
+The launcher requires Bash, Cargo, curl, and the Node.js/npm versions described
+in [Web UI](#web-ui).
+
+After configuring MySQL and running `./init-db.sh`, run this command from the
+repository root:
+
+```sh
+./dev.sh
+```
+
+The script installs UI dependencies when needed, builds the Rust binaries, and
+starts the API server, pilot, and Vite UI. It waits for the API and the UI proxy
+to become ready, then prints their addresses. The default UI address is
+`http://127.0.0.1:5173`, and the API listens on `127.0.0.1:8080`. Configuration
+uses the existing `rayflow.yaml` and environment overrides; the script does not
+create or migrate the database.
+
+For example, select a database explicitly or change the local ports:
+
+```sh
+DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow ./dev.sh
+RAYFLOW_DEV_API_PORT=8081 RAYFLOW_DEV_UI_PORT=5174 ./dev.sh
+```
+
+To also run a local execution agent, start Docker and use:
+
+```sh
+./dev.sh --agent
+```
+
+The agent connects to the local API. Unless `RAYFLOW_AGENT_ID` is set, the script
+generates a stable UUID in `.rayflow/dev/agent-id` and reuses it across restarts.
+Other agent settings use the existing configuration. Configure each node's
+Docker image, CPU and memory requirements, and timeout in Orchestration before
+publishing, then start a run from Runtime.
+
+Logs are written to `.rayflow/dev/{server,pilot,ui,agent}.log` and replaced on
+each startup. Press Ctrl-C to stop the processes started by the script. If a
+service exits unexpectedly or startup times out, the script stops its remaining
+services and exits with an error. Agent job containers retain the normal agent
+shutdown/recovery behavior. Use `./dev.sh --help` for options.
+
+The server, pilot, and agent use `tracing` to log to stderr, with `info` as the
+default level. Set `RUST_LOG` to change the level or filter individual crates:
+
+```sh
+RUST_LOG=info,pilot=debug,agent=debug ./dev.sh --agent
+```
 
 ## Build and test
 
@@ -140,6 +227,134 @@ Each agent needs a unique stable ID and a persistent workdir. The agent uses
 Docker's standard environment variables, including `DOCKER_HOST`, when a
 non-default Docker endpoint is required.
 
+## Web UI
+
+The React/TypeScript application lives in `ui/`. Use Node.js 20.19+ on the 20.x
+line, or 22.12+ on a newer line, with npm. Start the API server, then run:
+
+```sh
+npm ci --prefix ui
+npm run dev --prefix ui
+```
+
+Open `http://127.0.0.1:5173`. Vite forwards `/api/*` requests to
+`http://127.0.0.1:8080/*`. To use another API server:
+
+```sh
+RAYFLOW_API_URL=http://127.0.0.1:8081 npm run dev --prefix ui
+```
+
+The four sections use the same resource APIs as other clients:
+
+- **Orchestration:** create graphs, connect nodes, edit inputs and outputs,
+  save drafts, and publish immutable versions. The JSON editor supports import
+  through pasted JSON and export. The editor flags cycles and invalid roots;
+  unreferenced outputs are informational. Publishing also runs the existing
+  server validator. Node positions are local to the open editor.
+- **Runtime:** start runs and inspect every node in a run's pinned graph version.
+  Pending nodes can resume, and completed or pending nodes can rerun. These
+  actions append commands; the pilot applies them asynchronously. Historical
+  run versions are read-only because command endpoints target a data/graph pair.
+- **Schedule:** filter jobs by status, run, or owning agent. Cancel and terminate
+  use the existing job APIs and require an active claim. The agent reconciles
+  lost ownership or expiry before stopping its container.
+- **Agents:** inspect online/offline status, reported resource budgets, last
+  activity, and reported active job counts; open the agent's claimed jobs.
+
+Runtime, job, and agent views refresh every five seconds while visible.
+Lists use cursor pagination; text search and counts cover the displayed page.
+The run dialog offers recent published graphs and also accepts any published
+graph UUID. Publishing snapshots the node settings into versioned execution
+configuration, so each run uses the settings from its pinned graph version.
+
+Node execution settings are stored together under `settings`:
+
+```json
+{
+  "settings": {
+    "config": {
+      "image": "alpine:3.21",
+      "command": ["sh", "-c", "echo hello"],
+      "env": ["MODE=batch"],
+      "working_dir": "/tmp"
+    },
+    "resource": { "cpu_cores": 1, "memory_bytes": 268435456 },
+    "timeout": "10s"
+  }
+}
+```
+
+Docker requires `image`; `command`, `env`, and `working_dir` are optional.
+The JSON editor preserves additional configuration keys. The Docker provider
+currently uses these four fields and applies CPU/memory limits from `resource`.
+The UI displays memory in MiB; JSON stores bytes. Timeouts accept duration
+strings such as `10s`, `250ms`, and `2m`, with positive whole-millisecond precision.
+Timeouts use the existing job lease: delivery starts the expiry clock, and
+active polls do not extend it. Older graph JSON without settings remains
+readable but needs valid settings before republishing.
+
+Choose an input's source from another node's declared outputs. Selection creates
+the dependency when needed and excludes sources that would create a cycle.
+Producer and output renames update references; removing an output clears its
+bindings so they must be selected again before publishing. Unused outputs remain
+allowed. The publish API writes the graph and node configuration in one
+transaction; direct `DraftGraphStore::publish` callers must also provision
+`NodeConfig` before execution.
+
+The sidebar's audit identity is stored locally in the browser and sent as the
+draft/publish `actor`. It is audit metadata, not authentication. Deploy the UI
+and API behind your existing access controls.
+
+### Production hosting
+
+```sh
+npm run build --prefix ui
+```
+
+Serve `ui/dist/` at the site's root and proxy `/api/` to the Rayflow server,
+stripping the `/api` prefix. The Rust server does not serve the UI assets.
+`RAYFLOW_API_URL` configures only the Vite development proxy. For example, inside
+an nginx `server` block:
+
+```nginx
+root /srv/rayflow/ui/dist;
+
+location / {
+    try_files $uri $uri/ /index.html;
+}
+
+location /api/ {
+    proxy_pass http://127.0.0.1:8080/;
+    proxy_read_timeout 90s;
+}
+```
+
+Use HTTPS for deployments beyond localhost; the editor generates UUIDs with
+the browser's secure-context `crypto.randomUUID()` API.
+
+### UI and management API tests
+
+Browser integration tests start Vite and intercept API requests, so they do not
+require MySQL or a running Rayflow server:
+
+```sh
+cd ui
+npx playwright install chromium
+npm run test:e2e
+```
+
+The server integration tests exercise real HTTP handlers and MySQL persistence,
+including draft publishing, pagination, run versions, filtering, and agent
+observation. Run them from the repository root against a disposable database:
+
+```sh
+DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow_test \
+  cargo test -p server --test management
+```
+
+These tests create tables with unique prefixes. They skip when `DATABASE_URL`
+is absent.
+
 ## HTTP API
 
 The service endpoints are:
@@ -148,6 +363,11 @@ The service endpoints are:
 | --- | --- | --- |
 | `GET` | `/` | Reports `rayflow`. |
 | `GET` | `/health` | Liveness probe; returns `ok`. |
+| `GET` | `/graphs` | List published graph versions; optional `graph_id` filter. |
+| `GET` | `/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
+| `GET` | `/graph_drafts` | List editable DAGs. |
+| `GET` | `/runs` | List runs; optional `graph_id` filter. |
+| `GET` | `/runs/{run_id}` | Inspect the exact run UUID, its state, and its pinned graph. |
 | `POST` | `/runs/start` | Start a run; body has `data_id`, `graph_id`, and optional `nodes`. |
 | `POST` | `/runs/rerun` | Rerun one node; body has `data_id`, `graph_id`, and `node`. |
 | `POST` | `/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
@@ -157,6 +377,8 @@ The service endpoints are:
 | `PUT` | `/graphs/{graph_id}/draft` | Create or replace the draft. |
 | `POST` | `/graphs/{graph_id}/publish` | Validate and publish the draft as the next graph version. |
 | `POST` | `/task_events` | Emit an event for an existing task; body has `task_id` and `event`. |
+| `GET` | `/jobs` | List jobs; optional `status`, `agent_id`, and `run_id` filters. |
+| `GET` | `/agents` | List agent instances; optional `online=true` or `online=false`. |
 | `POST` | `/jobs/poll` | Long-poll and claim jobs that fit an agent's resources. |
 | `POST` | `/job/cancel` | Cancel a claimed job. |
 | `POST` | `/job/yield` | Yield a claimed job and defer the node. |
@@ -168,6 +390,20 @@ Run commands and task events return `202 Accepted` with the appended entry ID.
 Successful job actions return `204 No Content`. Claim conflicts and terminal
 state conflicts return `409 Conflict`; missing runs, tasks, or nodes return
 `404 Not Found`.
+
+Collection endpoints return `{ "items": [...], "next_cursor": null }` and
+accept `limit` (default 50, range 1–200) and `before` (a numeric row ID). Results
+are ordered by descending ID. Pass a non-null `next_cursor` as `before` to read
+the next page with the same filters. Job status values are `Scheduled`, `Polled`,
+`Yielded`, `Succeeded`, `Failed`, and `Terminated`.
+
+Graph and draft lists contain complete DAGs, including `id` (the graph UUID),
+`name`, `version`, `node_count`, `nodes`, and `edges`. Numeric database row IDs
+are used only for pagination cursors. Audit fields are stored in database
+columns and available on loaded Rust DAGs, but excluded from JSON responses.
+Run detail returns
+`{ "state": ..., "graph": ..., "current": true }`, where `current` indicates
+whether the selected run is the latest version for its data/graph pair.
 
 Example start request:
 
@@ -209,11 +445,13 @@ curl -X PUT http://127.0.0.1:8080/graphs/00000001-0000-0000-0000-000000000000/dr
   }'
 ```
 
-`GET` returns the draft JSON together with its audit fields. Drafts may be
+Draft reads and writes return the DAG directly. Drafts may be
 temporarily invalid while they are being edited. `POST /graphs/{graph_id}/publish`
 accepts `{ "actor": "publisher" }`, validates the graph (including the cycle
 and single-root rules), assigns the next version, and returns the immutable
-published graph record. Publishing does not delete the draft.
+published DAG directly. The version is the maximum published version for that
+graph UUID plus one, starting at 1. The draft's version is ignored when allocating
+the published version. Publishing does not delete the draft.
 
 ## Long polling and claims
 
@@ -251,6 +489,20 @@ the corresponding task event. Repeating a terminal action does not append a
 duplicate event. A yielded job releases its claim and moves the node to
 `Pending`; `POST /runs/resume` creates the next task.
 
+### Agent instances
+
+Each poll attempt upserts the agent UUID, total resource budget, reported
+active-job count, and database timestamps into `agent_instance` inside the
+same transaction that claims and loads jobs. A failed attempt rolls back both
+the observation and job changes. Internal idle retries start fresh transactions
+and refresh the observation; retry sleeps occur after transactions finish.
+
+An agent is online until twice `poll_timeout` plus 60 seconds after its last
+poll (two minutes with the default settings). Offline rows remain available for
+inspection. This is an observation of polling, not a container health check or
+scheduling eligibility rule. Existing agents appear after their next poll;
+there is no separate heartbeat or notification service.
+
 ## Agent workdir
 
 Each job has an isolated directory under `workdir`:
@@ -278,7 +530,9 @@ For a new database, apply `rayflow.sql` directly. Existing deployments must be
 migrated before restarting binaries when schema changes are introduced. The
 current schema includes versioned graph rows, editable graph drafts,
 `run_config.version`, pinned node configuration, resource requirements, agent
-claims, and persisted job expiry.
+claims, persisted job expiry, and `agent_instance` observations. Create the
+`agent_instance` table using its definition in `rayflow.sql` before running the
+updated server; polling now writes this table. No existing rows need backfilling.
 
 If a migration is needed, inspect the current `rayflow.sql` and apply an
 equivalent `ALTER TABLE` using a backup and a maintenance window. Do not assume

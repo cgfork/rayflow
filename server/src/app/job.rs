@@ -7,13 +7,43 @@ use scheduler::{
 };
 use uuid::Uuid;
 
-use super::{App, AppError};
+use super::{App, AppError, Page, PageQuery};
 
 impl<S> App<S> {
+    pub async fn list_jobs(
+        &self,
+        page: PageQuery,
+        status: Option<scheduler::actuator::Status>,
+        agent_id: Option<Uuid>,
+        run_id: Option<Uuid>,
+    ) -> Result<Page<Job>, AppError> {
+        let limit = page.limit()?;
+        let mut select = Job::all();
+        if let Some(before) = page.before {
+            select = select.filter(Job::fields().id().lt(before));
+        }
+        if let Some(status) = status {
+            select = select.filter(Job::fields().status().eq(status));
+        }
+        if let Some(agent_id) = agent_id {
+            select = select.filter(Job::fields().agent_id().eq(Some(agent_id)));
+        }
+        if let Some(run_id) = run_id {
+            select = select.filter(Job::fields().run_id().eq(run_id));
+        }
+        let items = select
+            .order_by(Job::fields().id().desc())
+            .limit(limit + 1)
+            .exec(&mut self.db.clone())
+            .await?;
+        Ok(Page::new(items, limit, |row| row.id))
+    }
+
     /// Claims fitting jobs and includes their configuration and original node revision.
     pub async fn poll(&self, agent: &mut AgentRef, maximum: usize) -> Result<Vec<Job>, AppError> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
+        self.observe_agent(&mut tx, agent).await?;
         let mut polling = agent.clone();
         let mut jobs: Vec<_> = polling.poll(&mut tx, maximum).await?.collect();
         for job in &mut jobs {

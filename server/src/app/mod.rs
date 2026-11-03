@@ -1,14 +1,18 @@
+mod agent;
 mod graph_draft;
 #[path = "graph.rs"]
 mod graph_read;
 mod job;
 mod offset;
 mod operation;
+mod pagination;
 mod state;
 mod task_event;
 
+pub use agent::{AgentInstance, AgentView};
 pub use offset::Offsets;
-pub use state::{GraphState, NodeState};
+pub use pagination::{Page, PageQuery};
+pub use state::{GraphState, NodeState, RunView};
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -89,6 +93,10 @@ impl<S> App<S> {
 /// Error returned by an app operation.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("{0}")]
+    InvalidRequest(String),
+    #[error("run not found: {0}")]
+    RunIdNotFound(Uuid),
     /// The requested run does not exist.
     #[error("run not found: data {data_id}, graph {graph_id}")]
     RunNotFound {
@@ -165,13 +173,16 @@ impl From<graph::store::Error> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match self {
-            AppError::RunNotFound { .. }
+            AppError::RunIdNotFound(_)
+            | AppError::RunNotFound { .. }
             | AppError::NodeRunNotFound(_)
             | AppError::TaskNotFound(_)
             | AppError::JobNotFound(_)
             | AppError::NodeNotFound(_)
             | AppError::GraphDraftNotFound(_) => StatusCode::NOT_FOUND,
-            AppError::GraphIdMismatch { .. } | AppError::InvalidGraph(_) => StatusCode::BAD_REQUEST,
+            AppError::InvalidRequest(_)
+            | AppError::GraphIdMismatch { .. }
+            | AppError::InvalidGraph(_) => StatusCode::BAD_REQUEST,
             AppError::JobConflict(_) => StatusCode::CONFLICT,
             AppError::Graph(_) | AppError::Backend(_) | AppError::Scheduled(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -214,6 +225,7 @@ pub(crate) mod test {
                 version: 0,
                 nodes: Vec::new(),
                 edges: Vec::new(),
+                ..DAG::default()
             })
         }
     }
@@ -222,7 +234,22 @@ pub(crate) mod test {
         type G = DAG;
         type Err = Infallible;
 
-        async fn load(&self, _graph_id: Uuid, _version: Option<u64>) -> Result<DAG, Infallible> {
+        async fn graphs(
+            &mut self,
+            page: graph::PageRequest,
+            graph_id: Option<Uuid>,
+        ) -> Result<graph::Page<DAG>, Infallible> {
+            Ok(page.select(
+                std::iter::once((1, self.0.clone()))
+                    .filter(|(_, graph)| graph_id.is_none_or(|id| graph.id == id)),
+            ))
+        }
+
+        async fn load(
+            &mut self,
+            _graph_id: Uuid,
+            _version: Option<u64>,
+        ) -> Result<DAG, Infallible> {
             Ok(self.0.clone())
         }
     }

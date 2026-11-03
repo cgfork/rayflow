@@ -9,11 +9,13 @@ fn graph(node_count: u128, edges: &[(u128, u128)]) -> DAG {
         id: Uuid::from_u128(100),
         name: "graph".into(),
         version: 1,
+        node_count: node_count as usize,
         nodes: (1..=node_count)
             .map(|id| Node {
                 id: Uuid::from_u128(id),
                 name: format!("node-{id}"),
                 node_type: "task".into(),
+                settings: Default::default(),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             })
@@ -22,6 +24,7 @@ fn graph(node_count: u128, edges: &[(u128, u128)]) -> DAG {
             .iter()
             .map(|&(from, to)| (Uuid::from_u128(from), Uuid::from_u128(to)))
             .collect(),
+        ..DAG::default()
     }
 }
 

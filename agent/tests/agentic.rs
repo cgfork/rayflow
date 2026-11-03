@@ -170,6 +170,7 @@ async fn polled_job_persists_node_starts_and_reports() {
         id: task.node_id,
         name: "job node".into(),
         node_type: "shell".into(),
+        settings: Default::default(),
         inputs: vec![],
         outputs: vec![],
     };
@@ -181,6 +182,8 @@ async fn polled_job_persists_node_starts_and_reports() {
             version: 1,
             nodes: vec![node.clone()],
             edges: vec![],
+            node_count: 1,
+            ..DAG::default()
         })
         .await
         .unwrap();
