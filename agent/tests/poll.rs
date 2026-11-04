@@ -664,6 +664,34 @@ async fn expired_job_fails_without_starting_a_container() {
 }
 
 #[tokio::test]
+async fn prepare_uses_the_run_version_after_the_workflow_is_upgraded() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut fixture = RunningAgent::new(vec![], 0, false, false).await;
+            fixture.runtime.shutdown().await.unwrap();
+            (&mut fixture.agent).await.unwrap().unwrap();
+            let executor = fixture.execution_agent().await;
+            let job = job();
+            let previous = job_graph(&job);
+            let mut upgraded = previous.clone();
+            upgraded.version += 1;
+            upgraded.nodes[0].name = "upgraded-node".into();
+            let graphs = GraphFs::from_workdir(fixture.workdir.path());
+            graphs.write_graph(previous.clone()).await.unwrap();
+            graphs.write_graph(upgraded.clone()).await.unwrap();
+            let mut value = serde_json::to_value(&job).unwrap();
+            value["run"]["version"] = json!(upgraded.version);
+            let job: Job = serde_json::from_value(value).unwrap();
+            executor.prepare(job.clone()).await.unwrap();
+            assert_eq!(
+                fixture.job_fs(job.uuid).node().await.unwrap(),
+                upgraded.nodes[0]
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn prepare_pulls_missing_images_and_run_detaches_with_resource_limits() {
     tokio::task::LocalSet::new().run_until(async {
     let mut fixture = RunningAgent::new(vec![], 0, false, false).await;

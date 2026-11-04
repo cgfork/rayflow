@@ -22,6 +22,7 @@ pub fn models() -> toasty::ModelSet {
 pub enum Command {
     Start { nodes: Vec<Uuid> },
     Rerun { node: Uuid },
+    Upgrade { version: u64, node: Uuid },
     Dryrun { nodes: Vec<Uuid> },
     Run { node: Uuid },
     Pend { node: Uuid },

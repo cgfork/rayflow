@@ -45,6 +45,14 @@ impl<S> RunApp<S> {
         self.emit_and_wait(Command::Rerun { node }).await
     }
 
+    pub async fn upgrade(&mut self, version: u64, node: Uuid) -> Result<CommandEntry, AppError> {
+        self.emit(Command::Upgrade { version, node }).await
+    }
+
+    pub async fn upgrade_wait(&mut self, version: u64, node: Uuid) -> Result<(), AppError> {
+        self.emit_and_wait(Command::Upgrade { version, node }).await
+    }
+
     pub async fn resume(&mut self, node: Uuid) -> Result<CommandEntry, AppError> {
         self.emit(Command::Resume { node }).await
     }

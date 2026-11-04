@@ -79,6 +79,8 @@ actuator normally register `scheduler::models()`.
 The scheduler crate connects logical tasks to executable jobs:
 
 - `Actuator` consumes commands, tasks, and task events and materializes jobs.
+- `CommandResult` stores a stable global error code and message for permanent
+  command-application failures before their command entries are acknowledged.
 - `Job`, `JobRead`, and `JobWrite` define job persistence and lifecycle.
 - `Scheduler` abstracts destinations such as direct agents or external
   schedulers.

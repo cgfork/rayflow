@@ -8,7 +8,7 @@ use event::{
 };
 use jiff::Timestamp;
 use std::time::Duration;
-use toasty::{Executor, stmt::IntoStatement};
+use toasty::{Executor, schema::Model, stmt::IntoStatement};
 use uuid::Uuid;
 
 const JOB_PAGE_SIZE: usize = 128;
@@ -204,16 +204,21 @@ impl AgentRef {
         let now = Timestamp::now();
         let mut claimed = Vec::new();
         let mut after_id = 0;
+        let table = backend
+            .schema()
+            .table_for(Job::id())
+            .name
+            .replace('`', "``");
 
         while claimed.len() < maximum && !self.resource.exhausted() {
             let page_size = JOB_PAGE_SIZE.min(maximum - claimed.len());
             // Toasty cannot express SKIP LOCKED. Lock only the queue rows we may
             // claim, so other agents can move past an in-flight claim.
-            let ids: Vec<u64> = toasty::sql::query(
-                "SELECT id FROM job WHERE status = 'Scheduled' AND id > ? \
+            let ids: Vec<u64> = toasty::sql::query(format!(
+                "SELECT id FROM `{table}` WHERE status = 'Scheduled' AND id > ? \
                  AND required_cpu_cores <= ? AND required_memory_bytes <= ? \
                  ORDER BY id ASC LIMIT ? FOR UPDATE SKIP LOCKED",
-            )
+            ))
             .bind(after_id)
             .bind(self.resource.cpu_cores)
             .bind(self.resource.memory_bytes)

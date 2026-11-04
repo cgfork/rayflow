@@ -44,7 +44,7 @@ async fn interrupted_command_application_can_be_retried() {
         .unwrap()
         .next()
         .unwrap();
-    backend.apply_in(&mut tx, &entry).await.unwrap();
+    assert!(backend.apply_in(&mut tx, &entry).await.unwrap().is_some());
     entry.ack(&mut tx).await.unwrap();
     // Simulate losing the connection before the commit becomes durable.
     tx.rollback().await.unwrap();
@@ -60,7 +60,7 @@ async fn interrupted_command_application_can_be_retried() {
     );
 
     let mut tx = db.transaction().await.unwrap();
-    backend.apply_in(&mut tx, &entry).await.unwrap();
+    let run_id = backend.apply_in(&mut tx, &entry).await.unwrap().unwrap();
     entry.ack(&mut tx).await.unwrap();
     tx.commit().await.unwrap();
     assert!(
@@ -70,7 +70,9 @@ async fn interrupted_command_application_can_be_retried() {
             .next()
             .is_none()
     );
-    assert_eq!(Run::all().exec(&mut db).await.unwrap().len(), 1);
+    let runs = Run::all().exec(&mut db).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].uuid, run_id);
 
     // The rolled-back insert leaves an auto-increment gap. Let the normal
     // persisted gap timeout expire before expecting the replacement task.

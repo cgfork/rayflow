@@ -25,7 +25,8 @@ use runtime::backend::Backend;
 use runtime::backend::Status;
 use runtime::command::{NodeRun, Run};
 use scheduler::{
-    Actuator, AgentRef, JobPoll, ResourceCapacity, TaskEvent, TaskEventEntry, actuator::NodeConfig,
+    Actuator, AgentRef, JobPoll, ResourceCapacity, TaskEvent, TaskEventEntry,
+    actuator::{CommandResult, NodeConfig},
 };
 use toasty::Db;
 use uuid::Uuid;
@@ -50,6 +51,51 @@ impl GraphStore<Uuid> for TestGraphStore {
     }
 
     async fn load(&mut self, _graph_id: Uuid, _version: Option<u64>) -> Result<Self::G, Self::Err> {
+        Ok(self.0.clone())
+    }
+}
+
+#[derive(Clone)]
+struct TimeoutGraphStore;
+
+impl GraphStore<Uuid> for TimeoutGraphStore {
+    type G = DAG;
+    type Err = graph::store::Error;
+
+    async fn graphs(
+        &mut self,
+        page: graph::PageRequest,
+        _graph_id: Option<Uuid>,
+    ) -> Result<graph::Page<DAG>, Self::Err> {
+        Ok(page.select(std::iter::empty::<(u64, DAG)>()))
+    }
+
+    async fn load(&mut self, _graph_id: Uuid, _version: Option<u64>) -> Result<DAG, Self::Err> {
+        Err(graph::store::Error::Toasty(
+            toasty::Error::transaction_timeout(std::time::Duration::from_secs(1)),
+        ))
+    }
+}
+
+#[derive(Clone)]
+struct FailVersionedGraphStore(DAG);
+
+impl GraphStore<Uuid> for FailVersionedGraphStore {
+    type G = DAG;
+    type Err = graph::store::Error;
+
+    async fn graphs(
+        &mut self,
+        page: graph::PageRequest,
+        _graph_id: Option<Uuid>,
+    ) -> Result<graph::Page<DAG>, Self::Err> {
+        Ok(page.select(std::iter::once((1, self.0.clone()))))
+    }
+
+    async fn load(&mut self, graph_id: Uuid, version: Option<u64>) -> Result<DAG, Self::Err> {
+        if version.is_some() {
+            return Err(graph::store::Error::GraphNotFound { graph_id, version });
+        }
         Ok(self.0.clone())
     }
 }
@@ -132,6 +178,119 @@ async fn setup() -> Option<(Db, DAG, Uuid)> {
             .unwrap();
     }
     Some((db, dag, Uuid::new_v4()))
+}
+
+#[tokio::test]
+async fn permanent_command_errors_are_recorded_and_acknowledged_once() {
+    let Some((mut db, dag, data_id)) = setup().await else {
+        return;
+    };
+    let entry = CommandEntry::new(
+        data_id,
+        dag.id,
+        Command::Rerun {
+            node: Uuid::new_v4(),
+        },
+    );
+    entry.emit(&mut db).await.unwrap();
+
+    let mut actuator = Actuator::new(Backend::new(db.clone(), TestGraphStore(dag)), 64);
+    let step = actuator.tick().await.unwrap();
+    assert_eq!(step.commands, 1);
+    assert!(
+        CommandEntry::poll(&mut db, 64)
+            .await
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    let results = CommandResult::all().exec(&mut db).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].command_id, entry.id);
+    assert_eq!(results[0].data_id, data_id);
+    assert_eq!(results[0].error_code, "RAYFLOW_RUN_NOT_FOUND");
+    assert!(results[0].error_message.contains("run not found"));
+
+    actuator.tick().await.unwrap();
+    assert_eq!(CommandResult::all().exec(&mut db).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn transient_command_errors_remain_pending_for_retry() {
+    let Some((mut db, dag, data_id)) = setup().await else {
+        return;
+    };
+    let graph_id = dag.id;
+    let entry = CommandEntry::new(data_id, graph_id, Command::Start { nodes: Vec::new() });
+    entry.emit(&mut db).await.unwrap();
+
+    let mut failing = Actuator::new(Backend::new(db.clone(), TimeoutGraphStore), 64);
+    assert!(failing.tick().await.is_err());
+    assert_eq!(
+        CommandEntry::poll(&mut db, 64)
+            .await
+            .unwrap()
+            .next()
+            .unwrap()
+            .id,
+        entry.id
+    );
+    assert!(CommandResult::all().exec(&mut db).await.unwrap().is_empty());
+
+    let mut retry = Actuator::new(Backend::new(db.clone(), TestGraphStore(dag)), 64);
+    assert_eq!(retry.tick().await.unwrap().commands, 1);
+    assert!(
+        CommandEntry::poll(&mut db, 64)
+            .await
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(CommandResult::all().exec(&mut db).await.unwrap().is_empty());
+    assert_eq!(Run::all().exec(&mut db).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn permanent_error_rolls_back_partial_command_effects() {
+    let Some((mut db, dag, data_id)) = setup().await else {
+        return;
+    };
+    let graph_id = dag.id;
+    let node_id = dag.nodes[0].id;
+    CommandEntry::new(
+        data_id,
+        graph_id,
+        Command::Start {
+            nodes: vec![node_id],
+        },
+    )
+    .emit(&mut db)
+    .await
+    .unwrap();
+    let mut start = Actuator::new(Backend::new(db.clone(), TestGraphStore(dag.clone())), 64);
+    start.tick().await.unwrap();
+    assert_eq!(node_run(&mut db, node_id).await.1, "Running");
+
+    let entry = CommandEntry::new(data_id, graph_id, Command::Succeed { node: node_id });
+    entry.emit(&mut db).await.unwrap();
+    let mut fail = Actuator::new(Backend::new(db.clone(), FailVersionedGraphStore(dag)), 64);
+    assert_eq!(fail.tick().await.unwrap().commands, 1);
+
+    assert_eq!(node_run(&mut db, node_id).await.1, "Running");
+    let result = CommandResult::filter_by_command_id(entry.id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(result.error_code, "RAYFLOW_GRAPH_ERROR");
+    assert!(result.error_message.contains("graph not found"));
+    assert!(
+        CommandEntry::poll(&mut db, 64)
+            .await
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[tokio::test]

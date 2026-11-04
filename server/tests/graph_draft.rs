@@ -6,7 +6,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 #[tokio::test]
-async fn published_settings_pin_job_configuration_to_the_node_run_version() {
+async fn published_settings_pin_job_configuration_to_the_run_version() {
     use event::{Emit, task::Task};
     use jiff::Timestamp;
     use runtime::command::{NodeRun, Run};
@@ -56,7 +56,7 @@ async fn published_settings_pin_job_configuration_to_the_node_run_version() {
             .run_id(run.uuid)
             .data_id(run.data_id)
             .graph_id(run.graph_id)
-            .version(version)
+            .version(1)
             .node_id(draft.nodes[0].id)
             .revision(1)
             .status("Running")

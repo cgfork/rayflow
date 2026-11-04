@@ -1,8 +1,9 @@
 //! Consumes runtime logs and materializes jobs from logical tasks.
 use crate::Error;
 use event::{Emit, command::CommandEntry, task::Task, task_event::TaskEventEntry};
-use graph::{Graph, GraphStore};
+use graph::{ForkPoint, GraphStore};
 use jiff::Timestamp;
+pub use runtime::command::CommandResult;
 use runtime::{
     backend::Backend,
     command::{NodeRun, Run},
@@ -76,7 +77,7 @@ impl<S> Actuator<S> {
 impl<S> Actuator<S>
 where
     S: GraphStore<Uuid>,
-    S::G: Graph<NodeId = Uuid>,
+    S::G: ForkPoint<NodeId = Uuid>,
     S::Err: Send + Sync + 'static,
 {
     async fn consume_commands(&mut self, tx: &mut toasty::Transaction<'_>) -> Result<usize, Error> {
@@ -188,6 +189,7 @@ impl Status {
 pub fn models() -> toasty::ModelSet {
     toasty::models!(
         Job,
+        CommandResult,
         Run,
         NodeRun,
         NodeConfig,
@@ -380,7 +382,7 @@ impl Job {
             .await?
             .ok_or(Error::RunNotFound(node_run.run_id))?;
         let node_config = NodeConfig::filter_by_node_id(task.node_id)
-            .filter(NodeConfig::fields().version().le(node_run.version))
+            .filter(NodeConfig::fields().version().le(run.version))
             .order_by(NodeConfig::fields().version().desc())
             .first()
             .exec(&mut *backend)

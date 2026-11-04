@@ -44,7 +44,11 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
     };
     use uuid::Uuid;
 
-    for (signal, log_filter) in [("-INT", None), ("-TERM", Some("off"))] {
+    for (signal, log_filter, config_variable) in [
+        ("-INT", None, None),
+        ("-TERM", Some("off"), Some("RAYFLOW_AGENT_CONFIG")),
+        ("-TERM", None, Some("RAYFLOW_CONFIG")),
+    ] {
         let (sender, mut requests) = mpsc::unbounded_channel();
         let router = Router::new().fallback(move |uri: Uri, body: Bytes| {
             let sender = sender.clone();
@@ -67,7 +71,11 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let root = tempdir().unwrap();
         let id = Uuid::new_v4();
-        let path = root.path().join("agent.yaml");
+        let path = root.path().join(if config_variable.is_some() {
+            "agent.yaml"
+        } else {
+            "rayflow.yaml"
+        });
         std::fs::write(
             &path,
             format!(
@@ -81,10 +89,12 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
         if let Some(filter) = log_filter {
             command.env("RUST_LOG", filter);
         }
+        if let Some(variable) = config_variable {
+            command.env(variable, path);
+        }
         let mut process = Process(
             command
                 .current_dir(root.path())
-                .env("RAYFLOW_AGENT_CONFIG", path)
                 .env("RAYFLOW_AGENT_ID", id.to_string())
                 .env("RAYFLOW_AGENT_SERVER_URL", &address)
                 .env("RAYFLOW_AGENT_POLL_INTERVAL", "10ms")
@@ -147,6 +157,7 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
             assert!(stderr.contains("rayflow agent started"), "{stderr}");
             assert!(stderr.contains("rayflow agent shutting down"), "{stderr}");
             assert!(stderr.contains(&id.to_string()), "{stderr}");
+            assert!(stderr.contains(&address), "{stderr}");
         } else {
             assert!(stderr.is_empty(), "{stderr}");
         }

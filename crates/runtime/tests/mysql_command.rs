@@ -12,9 +12,9 @@ use event::command::CommandEntry;
 use graph::GraphStore;
 use graph::types::{DAG, Node};
 use runtime::CommandApply;
+use runtime::backend::Backend;
 use runtime::backend::Status;
-use runtime::command::{NodeRun, Run};
-use runtime::{Error, backend::Backend};
+use runtime::command::{CommandResult, NodeRun, Run};
 use toasty::Db;
 use uuid::Uuid;
 
@@ -94,13 +94,17 @@ async fn start_rejects_an_existing_data_graph_pair_across_versions() {
 
     for version in [dag.version, dag.version + 1] {
         dag.version = version;
-        assert!(matches!(
-            command
-                .apply(Backend::new(db.clone(), TestGraphStore(dag.clone())))
-                .await,
-            Err(Error::AlreadyStarted)
-        ));
+        command
+            .apply(Backend::new(db.clone(), TestGraphStore(dag.clone())))
+            .await
+            .unwrap();
     }
+    let result = CommandResult::filter_by_command_id(command.id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(result.error_code, "RAYFLOW_RUN_ALREADY_STARTED");
+    assert!(result.error_message.contains("already started"));
     let runs = Run::all().exec(&mut db).await.unwrap();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].uuid, initial.uuid);
@@ -179,10 +183,15 @@ async fn resume_returns_to_ready_and_enqueues_one_task() {
         1
     );
     let resume = CommandEntry::new(data_id, graph_id, Command::Resume { node });
-    assert!(matches!(
-        resume.apply(backend.clone()).await,
-        Err(Error::InvalidTransition { .. })
-    ));
+    resume.apply(backend.clone()).await.unwrap();
+    assert_eq!(
+        CommandResult::filter_by_command_id(resume.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .error_code,
+        "RAYFLOW_INVALID_TRANSITION"
+    );
     CommandEntry::new(data_id, graph_id, Command::Run { node })
         .apply(backend.clone())
         .await
@@ -191,17 +200,29 @@ async fn resume_returns_to_ready_and_enqueues_one_task() {
         .apply(backend.clone())
         .await
         .unwrap();
-    let (first, second) =
-        tokio::join!(resume.apply(backend.clone()), resume.apply(backend.clone()));
-    let mut successes = 0;
-    for result in [first, second] {
-        match result {
-            Ok(()) => successes += 1,
-            Err(Error::InvalidTransition { .. } | Error::ConcurrentUpdate(_)) => {}
-            Err(error) => panic!("unexpected resume error: {error}"),
-        }
-    }
-    assert_eq!(successes, 1);
+    let first_resume = CommandEntry::new(data_id, graph_id, Command::Resume { node });
+    let second_resume = CommandEntry::new(data_id, graph_id, Command::Resume { node });
+    let (first, second) = tokio::join!(
+        first_resume.apply(backend.clone()),
+        second_resume.apply(backend.clone())
+    );
+    first.unwrap();
+    second.unwrap();
+    let rejected = CommandResult::all()
+        .filter(
+            CommandResult::fields()
+                .command_id()
+                .in_list(vec![first_resume.id, second_resume.id]),
+        )
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(rejected.len(), 1);
+    assert!(
+        ["RAYFLOW_INVALID_TRANSITION", "RAYFLOW_CONCURRENT_UPDATE"]
+            .contains(&rejected[0].error_code.as_str())
+    );
+    assert!(rejected[0].error_message.contains(&node.to_string()));
     let resumed = NodeRun::filter_by_id(initial.id)
         .get(&mut db)
         .await
@@ -212,10 +233,16 @@ async fn resume_returns_to_ready_and_enqueues_one_task() {
     assert_eq!(tasks.len(), 2);
     assert_ne!(tasks[0].id, tasks[1].id);
     assert!(tasks.iter().all(|task| task.node_run_id == initial.id));
-    assert!(matches!(
-        resume.apply(backend.clone()).await,
-        Err(Error::InvalidTransition { .. })
-    ));
+    let resume_ready = CommandEntry::new(data_id, graph_id, Command::Resume { node });
+    resume_ready.apply(backend.clone()).await.unwrap();
+    assert_eq!(
+        CommandResult::filter_by_command_id(resume_ready.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .error_code,
+        "RAYFLOW_INVALID_TRANSITION"
+    );
     CommandEntry::new(data_id, graph_id, Command::Run { node })
         .apply(backend.clone())
         .await
@@ -224,10 +251,16 @@ async fn resume_returns_to_ready_and_enqueues_one_task() {
         .apply(backend.clone())
         .await
         .unwrap();
-    assert!(matches!(
-        resume.apply(backend).await,
-        Err(Error::InvalidTransition { .. })
-    ));
+    let resume_succeeded = CommandEntry::new(data_id, graph_id, Command::Resume { node });
+    resume_succeeded.apply(backend).await.unwrap();
+    assert_eq!(
+        CommandResult::filter_by_command_id(resume_succeeded.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .error_code,
+        "RAYFLOW_INVALID_TRANSITION"
+    );
     assert_eq!(
         event::task::Task::all().exec(&mut db).await.unwrap().len(),
         2
@@ -271,33 +304,22 @@ async fn concurrent_run_transitions_once_without_creating_tasks() {
         .unwrap();
 
     // Guarded updates allow only one consumer to apply the transition.
-    let transition = CommandEntry::new(data_id, graph_id, Command::Run { node });
+    let first_transition = CommandEntry::new(data_id, graph_id, Command::Run { node });
+    let second_transition = CommandEntry::new(data_id, graph_id, Command::Run { node });
     let (first, second) = tokio::join!(
-        transition.apply(backend.clone()),
-        transition.apply(backend.clone())
+        first_transition.apply(backend.clone()),
+        second_transition.apply(backend.clone())
     );
-
-    let mut applied = 0;
-    let mut rejected = 0;
-    for result in [first, second] {
-        match result {
-            Ok(()) => applied += 1,
-            Err(Error::InvalidTransition {
-                node: rejected_node,
-                ..
-            }) => {
-                assert_eq!(rejected_node, node);
-                rejected += 1;
-            }
-            Err(Error::ConcurrentUpdate(rejected_node)) => {
-                assert_eq!(rejected_node, node);
-                rejected += 1;
-            }
-            Err(error) => panic!("unexpected transition error: {error}"),
-        }
-    }
-    assert_eq!(applied, 1);
-    assert_eq!(rejected, 1);
+    first.unwrap();
+    second.unwrap();
+    let rejected = CommandResult::all().exec(&mut db).await.unwrap();
+    assert_eq!(rejected.len(), 1);
+    assert!([first_transition.id, second_transition.id].contains(&rejected[0].command_id));
+    assert!(
+        ["RAYFLOW_INVALID_TRANSITION", "RAYFLOW_CONCURRENT_UPDATE"]
+            .contains(&rejected[0].error_code.as_str())
+    );
+    assert!(rejected[0].error_message.contains(&node.to_string()));
 
     let node_run = NodeRun::all()
         .first()
@@ -379,12 +401,16 @@ async fn dryrun_creates_tasks_for_ready_targets_only() {
                 .status,
             Status::Running.to_string()
         );
-        assert!(matches!(
-            CommandEntry::new(data_id, graph_id, Command::Run { node })
-                .apply(backend.clone())
-                .await,
-            Err(Error::InvalidTransition { .. })
-        ));
+        let duplicate = CommandEntry::new(data_id, graph_id, Command::Run { node });
+        duplicate.apply(backend.clone()).await.unwrap();
+        assert_eq!(
+            CommandResult::filter_by_command_id(duplicate.id)
+                .get(&mut db)
+                .await
+                .unwrap()
+                .error_code,
+            "RAYFLOW_INVALID_TRANSITION"
+        );
     }
     assert_eq!(
         event::task::Task::all().exec(&mut db).await.unwrap().len(),
@@ -416,6 +442,7 @@ async fn rerun_creates_a_ready_revision_and_one_task() {
         .unwrap()
         .remove(0);
     assert_eq!(original.status, Status::Succeeded.to_string());
+    assert_eq!(original.ineffective, 0);
     for revision in [1, 2] {
         CommandEntry::new(data_id, graph_id, Command::Rerun { node })
             .apply(backend.clone())
@@ -431,7 +458,16 @@ async fn rerun_creates_a_ready_revision_and_one_task() {
             .await
             .unwrap();
         assert_eq!(current.status, Status::Ready.to_string());
+        assert_eq!(current.ineffective, 0);
         assert_ne!(current.id, original.id);
+        let history = NodeRun::filter_by_run_id(original.run_id)
+            .filter(NodeRun::fields().node_id().eq(node))
+            .filter(NodeRun::fields().revision().lt(revision))
+            .exec(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), revision as usize);
+        assert!(history.iter().all(|row| row.ineffective == 1));
         let tasks = event::task::Task::all().exec(&mut db).await.unwrap();
         assert_eq!(tasks.len(), revision as usize + 1);
         let current_tasks: Vec<_> = tasks
@@ -449,6 +485,169 @@ async fn rerun_creates_a_ready_revision_and_one_task() {
             .status,
         Status::Succeeded.to_string()
     );
+}
+
+#[tokio::test]
+async fn rerun_from_an_earlier_revision_preserves_history_and_enqueues_one_task() {
+    let Some((mut db, mut dag, data_id, graph_id)) = setup().await else {
+        return;
+    };
+    let node = dag.nodes[0].id;
+    let mut successor = dag.nodes[0].clone();
+    successor.id = Uuid::new_v4();
+    successor.name = "successor".to_string();
+    let successor_id = successor.id;
+    dag.edges.push((node, successor_id));
+    dag.nodes.push(successor);
+    dag.node_count = dag.nodes.len();
+    dag.version = 7;
+    let mut backend = Backend::new(db.clone(), TestGraphStore(dag));
+    for command in [
+        Command::Start { nodes: vec![] },
+        Command::Run { node },
+        Command::Succeed { node },
+        Command::Rerun { node },
+        Command::Run { node },
+        Command::Succeed { node },
+        Command::Rerun { node: successor_id },
+    ] {
+        CommandEntry::new(data_id, graph_id, command)
+            .apply(backend.clone())
+            .await
+            .unwrap();
+    }
+    let run = Run::filter_by_data_id_and_graph_id(data_id, graph_id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(run.revision, 2);
+    let history = NodeRun::all().exec(&mut db).await.unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|row| row.node_id == node)
+            .map(|row| row.revision)
+            .max(),
+        Some(1)
+    );
+    let task_count = event::task::Task::all().exec(&mut db).await.unwrap().len();
+    let command = CommandEntry::new(data_id, graph_id, Command::Rerun { node });
+    let mut tx = db.transaction().await.unwrap();
+    assert_eq!(
+        backend.apply_in(&mut tx, &command).await.unwrap(),
+        Some(run.uuid)
+    );
+    tx.commit().await.unwrap();
+
+    let updated = Run::filter_by_uuid(run.uuid).get(&mut db).await.unwrap();
+    assert_eq!(updated.revision, 3);
+    assert_eq!(updated.version, run.version);
+    let current = NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, 3)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(current.status, Status::Ready.to_string());
+    assert_eq!(current.version, run.version);
+    assert_eq!(current.data_id, data_id);
+    assert_eq!(current.graph_id, graph_id);
+    let tasks = event::task::Task::all().exec(&mut db).await.unwrap();
+    assert_eq!(tasks.len(), task_count + 1);
+    assert_eq!(
+        tasks
+            .iter()
+            .filter(|task| task.node_run_id == current.id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        NodeRun::all().exec(&mut db).await.unwrap().len(),
+        history.len() + 1
+    );
+    for mut previous in history {
+        let preserved = NodeRun::filter_by_id(previous.id)
+            .get(&mut db)
+            .await
+            .unwrap();
+        if [node, successor_id].contains(&previous.node_id) {
+            assert_eq!(preserved.ineffective, 1);
+            assert!(preserved.updated_at >= previous.updated_at);
+            previous.ineffective = 1;
+            previous.updated_at = preserved.updated_at;
+        }
+        assert_eq!(
+            serde_json::to_value(preserved).unwrap(),
+            serde_json::to_value(previous).unwrap()
+        );
+    }
+    assert!(CommandResult::all().exec(&mut db).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rerun_rejects_the_latest_active_state_from_an_earlier_revision() {
+    let Some((mut db, mut dag, data_id, graph_id)) = setup().await else {
+        return;
+    };
+    let node = dag.nodes[0].id;
+    let mut successor = dag.nodes[0].clone();
+    successor.id = Uuid::new_v4();
+    successor.name = "successor".to_string();
+    let successor_id = successor.id;
+    dag.edges.push((node, successor_id));
+    dag.nodes.push(successor);
+    dag.node_count = dag.nodes.len();
+    let backend = Backend::new(db.clone(), TestGraphStore(dag));
+    for command in [
+        Command::Start { nodes: vec![] },
+        Command::Run { node },
+        Command::Succeed { node },
+        Command::Rerun { node },
+        Command::Run { node },
+        Command::Rerun { node: successor_id },
+    ] {
+        CommandEntry::new(data_id, graph_id, command)
+            .apply(backend.clone())
+            .await
+            .unwrap();
+    }
+    let run = Run::filter_by_data_id_and_graph_id(data_id, graph_id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(run.revision, 2);
+    let task_count = event::task::Task::all().exec(&mut db).await.unwrap().len();
+    let node_run_count = NodeRun::all().exec(&mut db).await.unwrap().len();
+    for status in [Status::Running, Status::Pending] {
+        NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, 1)
+            .update()
+            .status(status.to_string())
+            .exec(&mut db)
+            .await
+            .unwrap();
+        let command = CommandEntry::new(data_id, graph_id, Command::Rerun { node });
+        command.apply(backend.clone()).await.unwrap();
+        let result = CommandResult::filter_by_command_id(command.id)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(result.error_code, "RAYFLOW_INVALID_TRANSITION");
+        assert!(result.error_message.contains(&status.to_string()));
+        assert_eq!(
+            Run::filter_by_uuid(run.uuid)
+                .get(&mut db)
+                .await
+                .unwrap()
+                .revision,
+            2
+        );
+        assert_eq!(
+            NodeRun::all().exec(&mut db).await.unwrap().len(),
+            node_run_count
+        );
+        assert_eq!(
+            event::task::Task::all().exec(&mut db).await.unwrap().len(),
+            task_count
+        );
+    }
 }
 
 #[tokio::test]

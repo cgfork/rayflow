@@ -254,19 +254,19 @@ pub(crate) mod test {
         }
     }
 
-    /// Connects and rebuilds the schema from the Toasty models, or returns
+    /// Connects and creates isolated tables from the Toasty models, or returns
     /// `None` when no `DATABASE_URL` is configured.
     pub(crate) async fn setup() -> Option<Db> {
         let url = std::env::var("DATABASE_URL").ok()?;
 
         let mut builder = Db::builder();
         builder.models(crate::models());
+        builder.table_name_prefix(&format!("server_{}_", Uuid::new_v4().simple()));
         let db = builder
             .connect(&url)
             .await
             .expect("connect to DATABASE_URL");
 
-        db.reset_db().await.expect("reset database");
         db.push_schema().await.expect("push schema");
 
         Some(db)

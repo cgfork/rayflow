@@ -6,7 +6,7 @@ export function Badge({ children, status = '' }: { children: ReactNode; status?:
 }
 export function ErrorBanner({ error, retry }: { error?: string; retry?: () => void }) {
   if (!error) return null;
-  return <div className="error-banner" role="alert"><AlertCircle size={17} /><span>{error}</span>{retry && <button className="text-button" onClick={retry}>Try again</button>}</div>;
+  return <div className="error-banner" role="alert"><AlertCircle size={17} /><span>{error}</span>{retry && <button className="text-button" type="button" onClick={retry}>Try again</button>}</div>;
 }
 export function Empty({ title, children, action }: { title: string; children: ReactNode; action?: ReactNode }) {
   return <div className="empty"><div className="empty-icon"><CircleDashed size={30} /></div><h3>{title}</h3><p>{children}</p>{action}</div>;
@@ -22,7 +22,7 @@ export function PageHeader({ eyebrow, title, description, children }: { eyebrow:
   return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div><div className="actions">{children}</div></div>;
 }
 export function Pagination({ page, count, more, previous, next }: { page: number; count: number; more: boolean; previous: () => void; next: () => void }) {
-  return <div className="pagination"><span>{count} records on this page</span><div><button className="icon-button" aria-label="Previous page" disabled={page <= 1} onClick={previous}><ArrowLeft size={16} /></button><span>Page {page}</span><button className="icon-button" aria-label="Next page" disabled={!more} onClick={next}><ArrowRight size={16} /></button></div></div>;
+  return <div className="pagination"><span>{count} records on this page</span><div><button className="icon-button" type="button" aria-label="Previous page" disabled={page <= 1} onClick={previous}><ArrowLeft size={16} /></button><span>Page {page}</span><button className="icon-button" type="button" aria-label="Next page" disabled={!more} onClick={next}><ArrowRight size={16} /></button></div></div>;
 }
 export function Modal({ title, children, close, wide = false }: { title: string; children: ReactNode; close: () => void; wide?: boolean }) {
   const dialog = useRef<HTMLDialogElement>(null);

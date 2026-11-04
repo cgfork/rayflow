@@ -4,7 +4,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use coordinator::TransactionalLeaderElection;
-use graph::{Graph, GraphStore};
+use graph::{ForkPoint, GraphStore};
 use runtime::{Error as BackendError, backend::Backend};
 use scheduler::{Actuator, AgentScheduler, Scheduler};
 use server::StaticGraphStore;
@@ -100,7 +100,7 @@ where
     E: for<'tx> TransactionalLeaderElection<toasty::Transaction<'tx>>,
     S: for<'tx> Scheduler<toasty::Transaction<'tx>>,
     G: GraphStore<Uuid>,
-    G::G: Graph<NodeId = Uuid>,
+    G::G: ForkPoint<NodeId = Uuid>,
     G::Err: Send + Sync + 'static,
 {
     /// Returns whether this pilot currently holds the leader lease.

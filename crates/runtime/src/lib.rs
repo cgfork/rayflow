@@ -19,6 +19,10 @@ pub enum Error {
     /// The run has already been started; it must be rerun instead.
     #[error("run already started; rerun instead")]
     AlreadyStarted,
+    #[error("upgrade version {requested} must be newer than current version {current}")]
+    InvalidUpgradeVersion { current: u64, requested: u64 },
+    #[error("upgrade node must be shared between the current and target graph versions: {0}")]
+    InvalidUpgradeNode(Uuid),
     /// A node referenced by a command is not part of the graph.
     #[error("node not found in graph: {0}")]
     NodeNotFound(Uuid),
@@ -43,12 +47,43 @@ pub enum Error {
     Event(#[from] event::Error),
 }
 
+impl Error {
+    /// Returns the stable Rayflow error code for this error variant.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Toasty(_) => "RAYFLOW_DATABASE_ERROR",
+            Self::Graph(_) => "RAYFLOW_GRAPH_ERROR",
+            Self::AlreadyStarted => "RAYFLOW_RUN_ALREADY_STARTED",
+            Self::InvalidUpgradeVersion { .. } => "RAYFLOW_INVALID_UPGRADE_VERSION",
+            Self::InvalidUpgradeNode(_) => "RAYFLOW_INVALID_UPGRADE_NODE",
+            Self::NodeNotFound(_) => "RAYFLOW_NODE_NOT_FOUND",
+            Self::NodeRunNotFound(_) => "RAYFLOW_NODE_RUN_NOT_FOUND",
+            Self::RunNotFound { .. } => "RAYFLOW_RUN_NOT_FOUND",
+            Self::InvalidTransition { .. } => "RAYFLOW_INVALID_TRANSITION",
+            Self::ConcurrentUpdate(_) => "RAYFLOW_CONCURRENT_UPDATE",
+            Self::Event(_) => "RAYFLOW_EVENT_ERROR",
+        }
+    }
+
+    pub(crate) fn contains_toasty_error(&self) -> bool {
+        let mut source = Some(self as &(dyn std::error::Error + 'static));
+        while let Some(error) = source {
+            if error.downcast_ref::<toasty::Error>().is_some() {
+                return true;
+            }
+            source = error.source();
+        }
+        false
+    }
+}
+
 /// Applies a command entry to a backend, driving node state.
 #[allow(async_fn_in_trait)]
 pub trait CommandApply<B> {
-    /// Error returned when applying a command entry.
+    /// Error that prevented processing and should be retried.
     type Err: std::error::Error;
 
-    /// Applies this command entry to `backend`.
+    /// Applies this command entry to `backend`. Permanent failures are recorded
+    /// by the backend and return `Ok(())`.
     async fn apply(&self, backend: B) -> Result<(), Self::Err>;
 }

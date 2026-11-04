@@ -88,6 +88,7 @@ pub struct NodeState {
     pub revision: u64,
     /// Node status, e.g. `Succeeded`.
     pub status: String,
+    pub ineffective: u32,
     /// When the node run row was created.
     pub created_at: Timestamp,
     /// When the node run row was last updated.
@@ -111,6 +112,7 @@ impl NodeState {
             node_id: node_run.node_id,
             revision: node_run.revision,
             status: node_run.status,
+            ineffective: node_run.ineffective,
             created_at: node_run.created_at,
             updated_at: node_run.updated_at,
             name: node.name,
@@ -121,7 +123,7 @@ impl NodeState {
     }
 }
 
-/// The state of every node of a run at its current revision.
+/// The effective node states of a run at its current revision.
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphState {
     /// Unique identifier of the run.
@@ -171,7 +173,7 @@ where
         Ok(NodeState::join(node_run, node_info))
     }
 
-    /// Returns the state of every node of the run at its current revision.
+    /// Returns effective node states at or before the run's current revision.
     pub async fn graph_state(&self) -> Result<GraphState, AppError> {
         let run = self.run().await?;
         // Load the graph before the node runs so no node run row is held across
@@ -184,6 +186,7 @@ where
         let mut db = self.db.clone();
         let rows = NodeRun::filter_by_run_id(run.uuid)
             .filter(NodeRun::fields().revision().le(run.revision))
+            .filter(NodeRun::fields().ineffective().eq(0))
             .exec(&mut db)
             .await?;
 

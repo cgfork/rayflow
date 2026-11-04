@@ -76,6 +76,17 @@ while traversing pages. Database cursors remain stable when newer rows arrive.
 nodes by ID, reports changed payloads, and separately reports missing/extra nodes
 and edges. Graph metadata and iteration order do not affect structural diffs.
 
+`DAG` implements `ForkPoint` using structural diffing. Calling
+`current.fork_point(&previous)` returns the unique earliest node to execute in
+the current graph: a new node, a node with a changed payload, or the target of a
+changed incoming edge. Changes downstream of another changed node do not create
+additional fork points. The result is `None` when no current node needs execution
+or independent branches have multiple first changes. Removing only a terminal
+node therefore produces no fork point in the remaining graph. `shared_nodes`
+returns all ancestors of the fork point from the current graph, each once in
+node order. It excludes the fork point, downstream nodes, and unrelated branches,
+and returns an empty iterator when there is no unique fork point.
+
 ## Commands
 
 Commands are applied by `runtime::CommandApply`:
@@ -84,6 +95,7 @@ Commands are applied by `runtime::CommandApply`:
 | --- | --- |
 | `Start { nodes }` | Creates a run and initial ready node runs; empty `nodes` select graph roots. |
 | `Rerun { node }` | Advances the run revision and creates a ready node run and task. |
+| `Upgrade { version, node }` | Pins a newer published version and reruns the selected shared node at one new revision. |
 | `Dryrun { nodes }` | Mocks non-target predecessors as succeeded and prepares targets. |
 | `Run { node }` | Changes `Ready` to `Running` without creating another task. |
 | `Pend { node }` | Changes `Ready` or `Running` to `Pending` after a yield. |
@@ -100,7 +112,33 @@ serialize command application.
 The `run` table has a unique `(data_id, graph_id)` key. A start pins the published
 graph version, and publishing another version does not permit a second run for
 the same pair. Use rerun for an existing run or a new data identifier for another
-execution.
+execution. `Upgrade` is a separate command; `Rerun` keeps the pinned version.
+
+An upgrade requires a target version and a selected node. It loads both exact
+graph versions and requires the node to belong to
+`target.shared_nodes(&current)`. Only the selected node is made ready; its
+descendants activate as it succeeds. An empty shared set or a node outside it
+produces `RAYFLOW_INVALID_UPGRADE_NODE` without changing the run. Node history
+remains stored by revision. The selected node follows the same status
+rules as `Rerun`: `Ready`, `Succeeded`, `Failed`, and `Terminated` can restart;
+`Running` and `Pending` cannot. Equal or older target versions and missing
+published versions are recorded as command errors without changing the run.
+
+Upgrade changes `Run.version` and invokes the same rerun implementation in one
+transaction. It keeps the run UUID and data ID, advances the revision once, and
+creates one ready node run and task for the selected node. Rerun and upgrade mark
+all existing descendant node runs `ineffective = 1`, across revisions, using the
+run's selected graph version. The selected node's records with a revision below
+the new run revision are also marked ineffective. Ancestors and other branches
+remain unchanged. New node runs default to `ineffective = 0`. Graph state and run
+inspection return only the latest effective record at or before the run's current
+revision for each node. Nodes without an effective record are omitted from the
+state, while their history remains stored. An ineffective predecessor cannot
+satisfy a successor's dependency. Successor checks use the latest node state at or
+before the current revision, including rows recorded under earlier graph versions.
+`NodeRun.version` records the graph version when
+the row was created and does not control commands, task scheduling, or events.
+The run's current version selects the graph and node configuration for execution.
 
 ## Event Logs
 

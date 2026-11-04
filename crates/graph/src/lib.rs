@@ -1,4 +1,5 @@
 pub mod diff;
+mod fork_point;
 pub mod pagination;
 pub mod store;
 pub mod types;
@@ -168,4 +169,28 @@ pub trait DraftGraphStore<I: Id>: GraphStore<I> {
 pub trait Diff {
     type Item;
     fn diff(&self, other: &Self) -> Option<Self::Item>;
+}
+
+/// Finds where execution of this graph first differs from another version.
+pub trait ForkPoint: Graph {
+    /// Returns the unique earliest changed node in `self`.
+    /// Returns `None` when no nodes need execution or changes start on separate branches.
+    fn fork_point(&self, other: &Self) -> Option<Self::NodeId>;
+
+    /// Returns every ancestor of the fork point once, in this graph's node order.
+    fn shared_nodes(&self, other: &Self) -> impl Iterator<Item = NodeRef<'_, Self>> {
+        let fork_point = self.fork_point(other);
+        let mut pending: Vec<_> = fork_point.into_iter().collect();
+        let mut ancestors = Vec::new();
+        while let Some(node) = pending.pop() {
+            for predecessor in self.incoming_edges(node) {
+                if Some(predecessor) != fork_point && !ancestors.contains(&predecessor) {
+                    ancestors.push(predecessor);
+                    pending.push(predecessor);
+                }
+            }
+        }
+        self.nodes()
+            .filter(move |node| ancestors.contains(&node.id))
+    }
 }
