@@ -11,9 +11,10 @@ pub use store::models;
 use std::{
     borrow::{Borrow, BorrowMut},
     fmt::{Debug, Display},
+    hash::Hash,
 };
 
-pub trait Id: Copy + PartialEq + Debug + Display {}
+pub trait Id: Copy + Eq + Hash + Debug + Display {}
 
 pub struct Node<I, N> {
     pub id: I,
@@ -181,11 +182,10 @@ pub trait ForkPoint: Graph {
     fn shared_nodes(&self, other: &Self) -> impl Iterator<Item = NodeRef<'_, Self>> {
         let fork_point = self.fork_point(other);
         let mut pending: Vec<_> = fork_point.into_iter().collect();
-        let mut ancestors = Vec::new();
+        let mut ancestors = std::collections::HashSet::new();
         while let Some(node) = pending.pop() {
             for predecessor in self.incoming_edges(node) {
-                if Some(predecessor) != fork_point && !ancestors.contains(&predecessor) {
-                    ancestors.push(predecessor);
+                if Some(predecessor) != fork_point && ancestors.insert(predecessor) {
                     pending.push(predecessor);
                 }
             }

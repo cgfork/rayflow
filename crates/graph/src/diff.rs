@@ -1,4 +1,7 @@
-use std::borrow::Borrow;
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+};
 
 use crate::{Diff, Graph};
 
@@ -29,19 +32,24 @@ where
         let other_nodes: Vec<_> = other.nodes().collect();
         let edges: Vec<_> = self.edges().collect();
         let other_edges: Vec<_> = other.edges().collect();
+        let mut other_node_indices = HashMap::with_capacity(other_nodes.len());
+        for (index, node) in other_nodes.iter().enumerate() {
+            other_node_indices.entry(node.id).or_insert(index);
+        }
+        let node_ids: HashSet<_> = nodes.iter().map(|node| node.id).collect();
+        let edge_ids: HashSet<_> = edges.iter().copied().collect();
+        let other_edge_ids: HashSet<_> = other_edges.iter().copied().collect();
         let mut diff = GraphDiff {
-            node_diffs: Vec::new(),
-            node_miss: Vec::new(),
-            node_over: Vec::new(),
-            edge_miss: Vec::new(),
-            edge_over: Vec::new(),
+            node_diffs: Vec::with_capacity(nodes.len().min(other_nodes.len())),
+            node_miss: Vec::with_capacity(other_nodes.len()),
+            node_over: Vec::with_capacity(nodes.len()),
+            edge_miss: Vec::with_capacity(other_edges.len()),
+            edge_over: Vec::with_capacity(edges.len()),
         };
 
         for node in &nodes {
-            if let Some(other_node) = other_nodes
-                .iter()
-                .find(|other_node| other_node.id == node.id)
-            {
+            if let Some(&index) = other_node_indices.get(&node.id) {
+                let other_node = &other_nodes[index];
                 if let Some(node_diff) = node.data.borrow().diff(other_node.data.borrow()) {
                     diff.node_diffs.push(node_diff);
                 }
@@ -53,20 +61,20 @@ where
         diff.node_miss.extend(
             other_nodes
                 .iter()
-                .filter(|other_node| !nodes.iter().any(|node| node.id == other_node.id))
+                .filter(|other_node| !node_ids.contains(&other_node.id))
                 .map(|node| node.id),
         );
         diff.edge_miss.extend(
             other_edges
                 .iter()
                 .copied()
-                .filter(|edge| !edges.contains(edge)),
+                .filter(|edge| !edge_ids.contains(edge)),
         );
         diff.edge_over.extend(
             edges
                 .iter()
                 .copied()
-                .filter(|edge| !other_edges.contains(edge)),
+                .filter(|edge| !other_edge_ids.contains(edge)),
         );
 
         if diff.node_diffs.is_empty()

@@ -159,6 +159,7 @@ where
         let node_run = NodeRun::filter_by_run_id(run.uuid)
             .filter(NodeRun::fields().node_id().eq(node_id))
             .filter(NodeRun::fields().revision().le(run.revision))
+            .filter(NodeRun::fields().ineffective().eq(0))
             .order_by(NodeRun::fields().revision().desc())
             .first()
             .exec(&mut db)
@@ -268,7 +269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_state_embeds_node_run_and_graph_node() {
+    async fn node_state_and_graph_state_use_effective_node_runs() {
         let Some(mut db) = setup().await else {
             eprintln!("skipping: set DATABASE_URL to run the MySQL app test");
             return;
@@ -294,7 +295,7 @@ mod tests {
             .data_id(data_id)
             .graph_id(graph_id)
             .version(7)
-            .revision(0)
+            .revision(1)
             .created_at(now)
             .updated_at(now)
             .exec(&mut db)
@@ -314,6 +315,21 @@ mod tests {
             .exec(&mut db)
             .await
             .expect("create node run");
+
+        NodeRun::create()
+            .run_id(run.uuid)
+            .data_id(data_id)
+            .graph_id(graph_id)
+            .version(run.version)
+            .node_id(node_id)
+            .revision(1)
+            .status(Status::Failed.to_string())
+            .ineffective(1)
+            .created_at(now)
+            .updated_at(now)
+            .exec(&mut db)
+            .await
+            .expect("create ineffective node run");
 
         let config = Config {
             addr: "0.0.0.0:0".parse().unwrap(),
@@ -335,7 +351,7 @@ mod tests {
         let state = run_app.graph_state().await.expect("graph_state");
         assert_eq!(state.data_id, data_id);
         assert_eq!(state.graph_id, graph_id);
-        assert_eq!(state.revision, 0);
+        assert_eq!(state.revision, 1);
         assert_eq!(state.nodes.len(), 1);
         assert_eq!(state.nodes[0].node_id, node_id);
         assert_eq!(state.nodes[0].name, node(node_id).name);
