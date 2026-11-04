@@ -1,12 +1,32 @@
 //! Published graph read operations.
 
-use graph::GraphStore;
 use graph::types::DAG;
+use graph::{ForkPoint, GraphStore};
 use uuid::Uuid;
 
 use super::{App, AppError, Page, PageQuery};
 
 impl<S> App<S> {
+    pub async fn shared_graph_nodes(
+        &self,
+        graph_id: Uuid,
+        from_version: u64,
+        version: u64,
+    ) -> Result<Vec<Uuid>, AppError>
+    where
+        S: GraphStore<Uuid, G = DAG> + Clone,
+        S::Err: Send + Sync + 'static,
+    {
+        if version <= from_version {
+            return Err(AppError::InvalidRequest(
+                "the target version must be newer than the current version".into(),
+            ));
+        }
+        let previous = self.read_graph(graph_id, Some(from_version)).await?;
+        let target = self.read_graph(graph_id, Some(version)).await?;
+        Ok(target.shared_nodes(&previous).map(|node| node.id).collect())
+    }
+
     pub async fn list_graphs(
         &self,
         page: PageQuery,

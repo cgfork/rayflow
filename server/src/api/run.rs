@@ -24,6 +24,7 @@ where
         .route("/runs/{run_id}", get(inspect_run::<S>))
         .route("/runs/start", post(start_run::<S>))
         .route("/runs/rerun", post(rerun_run::<S>))
+        .route("/runs/upgrade", post(upgrade_run::<S>))
         .route("/runs/resume", post(resume_run::<S>))
         .route("/runs/dryrun", post(dryrun_run::<S>))
         .route("/runs/graph_state", get(get_graph_state::<S>))
@@ -122,6 +123,33 @@ where
     Ok((
         StatusCode::ACCEPTED,
         Json(RerunRunResponse { id: entry.id }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpgradeRunRequest {
+    pub data_id: Uuid,
+    pub graph_id: Uuid,
+    pub version: u64,
+    pub node: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpgradeRunResponse {
+    pub id: Uuid,
+}
+
+async fn upgrade_run<S: Clone>(
+    State(state): State<App<S>>,
+    Json(request): Json<UpgradeRunRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let entry = state
+        .run_with(request.data_id, request.graph_id)
+        .upgrade(request.version, request.node)
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(UpgradeRunResponse { id: entry.id }),
     ))
 }
 

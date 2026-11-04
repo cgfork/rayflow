@@ -15,10 +15,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     let settings = Settings::load()?;
     let id = settings.id;
+    let server_url = settings.server_url.clone();
     let agent = Agentic::new(settings).await?;
     let running = agent.start();
     tokio::pin!(running);
-    tracing::info!(agent_id = %id, "rayflow agent started");
+    tracing::info!(agent_id = %id, %server_url, "rayflow agent started");
 
     tokio::select! {
         result = &mut running => result?,

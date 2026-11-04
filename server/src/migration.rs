@@ -17,6 +17,21 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "unique_run",
         include_str!("../migrations/0003_unique_run.sql"),
     ),
+    MigrationFile::new(
+        4,
+        "command_result",
+        include_str!("../migrations/0004_command_result.sql"),
+    ),
+    MigrationFile::new(
+        5,
+        "command_result_error_code",
+        include_str!("../migrations/0005_command_result_error_code.sql"),
+    ),
+    MigrationFile::new(
+        6,
+        "node_run_ineffective",
+        include_str!("../migrations/0006_node_run_ineffective.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

@@ -1,0 +1,2 @@
+ALTER TABLE node_run
+    ADD COLUMN ineffective INT UNSIGNED NOT NULL DEFAULT 0 AFTER status;

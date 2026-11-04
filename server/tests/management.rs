@@ -165,6 +165,93 @@ async fn graph_lists_paginate_drafts_and_published_versions() {
 }
 
 #[tokio::test]
+async fn graph_state_and_run_detail_return_only_latest_effective_node_runs() {
+    let Some((app, mut db)) = setup().await else {
+        return;
+    };
+    let mut definition = graph("effective-state");
+    let first = definition.nodes[0].id;
+    let mut second_node = definition.nodes[0].clone();
+    second_node.id = Uuid::new_v4();
+    second_node.name = "second".into();
+    let second = second_node.id;
+    definition.nodes.push(second_node);
+    definition.edges.push((first, second));
+    definition.node_count = definition.nodes.len();
+    db.write(&definition, "editor").await.unwrap();
+    db.publish(definition.id, "editor").await.unwrap();
+    let published = db.load(definition.id, None).await.unwrap();
+    let now = Timestamp::now();
+    let run = Run::create()
+        .uuid(Uuid::new_v4())
+        .data_id(Uuid::new_v4())
+        .graph_id(definition.id)
+        .version(published.version)
+        .revision(2)
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    for (node, revision, status, ineffective) in [
+        (first, 0, "Succeeded", 0),
+        (first, 1, "Failed", 0),
+        (first, 2, "Succeeded", 1),
+        (first, 3, "Ready", 0),
+        (second, 0, "Succeeded", 1),
+        (second, 2, "Ready", 1),
+    ] {
+        NodeRun::create()
+            .run_id(run.uuid)
+            .data_id(run.data_id)
+            .graph_id(run.graph_id)
+            .version(0)
+            .node_id(node)
+            .revision(revision)
+            .status(status)
+            .ineffective(ineffective)
+            .created_at(now)
+            .updated_at(now)
+            .exec(&mut db)
+            .await
+            .unwrap();
+    }
+    let state_path = format!(
+        "/runs/graph_state?data_id={}&graph_id={}",
+        run.data_id, run.graph_id
+    );
+    let detail_path = format!("/runs/{}", run.uuid);
+    let state = get(&app, &state_path).await;
+    let detail = get(&app, &detail_path).await;
+    assert_eq!(state, detail["state"]);
+    assert_eq!(state["uuid"], run.uuid.to_string());
+    assert_eq!(state["version"], published.version);
+    assert_eq!(state["revision"], 2);
+    assert_eq!(state["edges"], json!([[first, second]]));
+    assert_eq!(state["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(state["nodes"][0]["node_id"], first.to_string());
+    assert_eq!(state["nodes"][0]["revision"], 1);
+    assert_eq!(state["nodes"][0]["status"], "Failed");
+    assert_eq!(state["nodes"][0]["ineffective"], 0);
+    NodeRun::filter_by_run_id(run.uuid)
+        .update()
+        .ineffective(1)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(get(&app, &state_path).await["nodes"], json!([]));
+    assert_eq!(get(&app, &detail_path).await["state"]["nodes"], json!([]));
+    assert_eq!(
+        NodeRun::filter_by_run_id(run.uuid)
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .len(),
+        6
+    );
+}
+
+#[tokio::test]
 async fn run_detail_reads_the_selected_version_and_latest_node_revision() {
     let Some((app, mut db)) = setup().await else {
         return;

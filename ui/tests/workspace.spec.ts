@@ -1,5 +1,5 @@
 import { expect, test, type Page as BrowserPage } from '@playwright/test';
-import type { Graph, Job, RunView } from '../src/types';
+import type { Graph, Job, NodeStatus, RunView } from '../src/types';
 
 const graphId = '10000000-0000-4000-8000-000000000001';
 const runId = '20000000-0000-4000-8000-000000000001';
@@ -19,7 +19,7 @@ const graph: Graph = {
 };
 const baseJob: Job = { id: 1, uuid: jobId, task_id: '70000000-0000-4000-8000-000000000001', run_id: runId, node_run_id: 1, status: 'Polled', required_cpu_cores: 2, required_memory_bytes: 2147483648, agent_id: agentId, polled_at: now, expired_at: new Date(Date.now() + 60000).toISOString(), created_at: now, updated_at: now };
 
-async function backend(page: BrowserPage, options: { empty?: boolean; historical?: boolean } = {}) {
+async function backend(page: BrowserPage, options: { empty?: boolean; historical?: boolean; rootStatus?: NodeStatus; rootRevision?: number; versions?: number[]; sharedNodes?: Record<number, string[]> } = {}) {
   let draft = structuredClone(graph);
   let jobs = [structuredClone(baseJob)];
   const calls: { path: string; method: string; body: unknown }[] = [];
@@ -35,7 +35,8 @@ async function backend(page: BrowserPage, options: { empty?: boolean; historical
     const fulfill = (data: unknown, status = 200) => route.fulfill({ status, json: data });
     if (failures.has(path)) return fulfill({ error: 'Database temporarily unavailable' }, failures.get(path));
     if (path === '/health') return route.fulfill({ status: 200, body: 'ok' });
-    if (path === '/graph_drafts' || path === '/graphs') return fulfill({ items: options.empty ? [] : [path === '/graph_drafts' ? draft : graph], next_cursor: null });
+    if (path === '/graph_drafts') return fulfill({ items: options.empty ? [] : [draft], next_cursor: null });
+    if (path === '/graphs') return fulfill({ items: options.empty ? [] : (options.versions ?? [graph.version]).map((version) => ({ ...graph, version })), next_cursor: null });
     if (path.endsWith('/draft')) {
       if (method === 'PUT') {
         draft = body!.graph as Graph;
@@ -45,11 +46,12 @@ async function backend(page: BrowserPage, options: { empty?: boolean; historical
     }
     if (path.endsWith('/publish')) return fulfill({ ...draft, version: 3 }, 201);
     if (path === `/graphs/${graphId}`) return fulfill(graph);
-    if (path === '/runs/start' || path === '/runs/resume' || path === '/runs/rerun') return fulfill({ id: crypto.randomUUID() }, 202);
+    if (path === `/graphs/${graphId}/shared-nodes`) return fulfill(options.sharedNodes?.[Number(url.searchParams.get('version'))] ?? [graph.nodes[0].id]);
+    if (path === '/runs/start' || path === '/runs/resume' || path === '/runs/rerun' || path === '/runs/upgrade') return fulfill({ id: crypto.randomUUID() }, 202);
     if (path === '/runs') return fulfill({ items: [{ id: 1, uuid: runId, graph_id: graphId, data_id: dataId, version: 2, revision: 3, created_at: now, updated_at: now }], next_cursor: null });
     if (path === `/runs/${runId}`) {
       const result: RunView = { graph, current: !options.historical, state: { uuid: runId, graph_id: graphId, data_id: dataId, version: 2, revision: 3,
-        nodes: graph.nodes.slice(0, 3).map((node, index) => ({ ...node, node_id: node.id, status: index === 0 ? 'Succeeded' : index === 1 ? 'Pending' : 'Running', revision: 3, updated_at: now })),
+        nodes: graph.nodes.slice(0, 3).map((node, index) => ({ ...node, node_id: node.id, status: index === 0 ? options.rootStatus ?? 'Succeeded' : index === 1 ? 'Pending' : 'Running', revision: index === 0 ? options.rootRevision ?? 3 : 3, updated_at: now })),
       } };
       return fulfill(result);
     }
@@ -127,10 +129,265 @@ test('shows every runtime node and submits resume without pretending the state c
   await expect(page.locator('.inspector .badge')).toHaveText('Pending');
 });
 
+test('upgrades from the Runtime list using a shared node from an earlier revision', async ({ page }) => {
+  const { calls } = await backend(page, { versions: [3, 2, 1], rootRevision: 2 });
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Upgrade run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Upgrade workflow' });
+  const versions = dialog.getByRole('combobox', { name: 'Target version' });
+  const nodes = dialog.getByRole('combobox', { name: 'Shared restart node' });
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeDisabled();
+  await expect(versions.locator('option')).toHaveCount(2);
+  const sharedRequest = page.waitForRequest((request) => request.url().includes('/shared-nodes?'));
+  await versions.selectOption('3');
+  expect(new URL((await sharedRequest).url()).searchParams.toString()).toBe('from_version=2&version=3');
+  await expect(nodes.locator('option')).toHaveCount(2);
+  await expect(nodes.locator(`option[value="${graph.nodes[0].id}"]`)).toHaveText('extract_data · Succeeded (earlier revision)');
+  await nodes.selectOption(graph.nodes[0].id);
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  expect(calls.some((call) => call.path === '/runs/upgrade')).toBe(false);
+  await page.getByRole('button', { name: 'Upgrade run 20000000' }).click();
+  await versions.selectOption('3');
+  await nodes.selectOption(graph.nodes[0].id);
+  await page.screenshot({ path: 'test-results/runtime-upgrade.png', fullPage: true });
+  await dialog.getByRole('button', { name: 'Confirm upgrade' }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole('status').filter({ hasText: 'Upgrade command accepted for v3 from extract_data' })).toBeVisible();
+  expect(calls.filter((call) => call.path === '/runs/upgrade')).toEqual([
+    { path: '/runs/upgrade', method: 'POST', body: { graph_id: graphId, data_id: dataId, version: 3, node: graph.nodes[0].id } },
+  ]);
+  expect(calls.some((call) => call.path === '/runs/start' || call.path === '/runs/rerun')).toBe(false);
+  await expect(page.locator('tbody .badge')).toHaveText('v2');
+});
+
+test('retries a rejected upgrade from the Runtime detail header', async ({ page }) => {
+  const { calls, failures } = await backend(page, { versions: [3, 2] });
+  failures.set('/runs/upgrade', 503);
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+  await page.getByRole('button', { name: 'Upgrade', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Upgrade workflow' });
+  await dialog.getByRole('combobox', { name: 'Target version' }).selectOption('3');
+  await dialog.getByRole('combobox', { name: 'Shared restart node' }).selectOption(graph.nodes[0].id);
+  await dialog.getByRole('button', { name: 'Confirm upgrade' }).click();
+  await expect(dialog.getByRole('alert')).toContainText('Database temporarily unavailable');
+  await expect(page.getByRole('status').filter({ hasText: 'Upgrade command accepted' })).toHaveCount(0);
+  failures.delete('/runs/upgrade');
+  await dialog.getByRole('button', { name: 'Try again' }).click();
+  await expect(dialog.getByRole('alert')).toHaveCount(0);
+  expect(calls.filter((call) => call.path === '/runs/upgrade')).toHaveLength(1);
+  await dialog.getByRole('button', { name: 'Confirm upgrade' }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(calls.filter((call) => call.path === '/runs/upgrade')).toHaveLength(2);
+});
+
+test('blocks upgrades from active and waiting shared nodes', async ({ page }) => {
+  const { calls } = await backend(page, { versions: [3, 2], sharedNodes: { 3: graph.nodes.slice(1).map((node) => node.id) } });
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Upgrade run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Upgrade workflow' });
+  await dialog.getByRole('combobox', { name: 'Target version' }).selectOption('3');
+  const nodes = dialog.getByRole('combobox', { name: 'Shared restart node' });
+  for (const node of graph.nodes.slice(1)) await expect(nodes.locator(`option[value="${node.id}"]`)).toHaveJSProperty('disabled', true);
+  await expect(nodes.locator(`option[value="${graph.nodes[0].id}"]`)).toHaveCount(0);
+  await expect(dialog.getByText(/No shared nodes are eligible/)).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeDisabled();
+  expect(calls.some((call) => call.path === '/runs/upgrade')).toBe(false);
+});
+
+test('clears the shared node when changing upgrade versions and blocks incompatible versions', async ({ page }) => {
+  const { calls } = await backend(page, { versions: [4, 3, 2], sharedNodes: { 3: [graph.nodes[0].id], 4: [] } });
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Upgrade run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Upgrade workflow' });
+  const versions = dialog.getByRole('combobox', { name: 'Target version' });
+  const nodes = dialog.getByRole('combobox', { name: 'Shared restart node' });
+  await versions.selectOption('3');
+  await nodes.selectOption(graph.nodes[0].id);
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeEnabled();
+  await versions.selectOption('4');
+  await expect(nodes).toHaveValue('');
+  await expect(dialog.getByText('These versions have no shared restart nodes.')).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeDisabled();
+  await versions.selectOption('3');
+  await expect(nodes).toHaveValue('');
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeDisabled();
+  expect(calls.some((call) => call.path === '/runs/upgrade')).toBe(false);
+});
+
+test('handles missing newer versions and historical runs in the upgrade dialog', async ({ page }) => {
+  const { calls } = await backend(page, { historical: true });
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Upgrade run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Upgrade workflow' });
+  await expect(dialog.getByText('No newer published versions are available.')).toBeVisible();
+  await expect(dialog.getByText(/This is a historical run version/)).toBeVisible();
+  await expect(dialog.getByRole('combobox', { name: 'Target version' })).toBeDisabled();
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeDisabled();
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+  await expect(page.getByRole('button', { name: 'Upgrade', exact: true })).toBeDisabled();
+  expect(calls.some((call) => call.path === '/runs/upgrade')).toBe(false);
+});
+
+test('retries shared-node lookup failures before allowing an upgrade', async ({ page }) => {
+  const { failures } = await backend(page, { versions: [3, 2] });
+  failures.set(`/graphs/${graphId}/shared-nodes`, 503);
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Upgrade run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Upgrade workflow' });
+  await dialog.getByRole('combobox', { name: 'Target version' }).selectOption('3');
+  await expect(dialog.getByRole('alert')).toContainText('Database temporarily unavailable');
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeDisabled();
+  failures.delete(`/graphs/${graphId}/shared-nodes`);
+  await dialog.getByRole('button', { name: 'Try again' }).click();
+  await dialog.getByRole('combobox', { name: 'Shared restart node' }).selectOption(graph.nodes[0].id);
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeEnabled();
+});
+
+test('pages through upgrade versions without submitting a selected command', async ({ page }) => {
+  const { calls } = await backend(page);
+  await page.route('**/api/graphs?**', async (route) => {
+    const url = new URL(route.request().url());
+    expect(url.searchParams.get('graph_id')).toBe(graphId);
+    const older = url.searchParams.get('before') === '50';
+    return route.fulfill({ json: { items: [{ ...graph, version: older ? 3 : 4 }], next_cursor: older ? null : 50 } });
+  });
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Upgrade run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Upgrade workflow' });
+  const versions = dialog.getByRole('combobox', { name: 'Target version' });
+  const nodes = dialog.getByRole('combobox', { name: 'Shared restart node' });
+  await versions.selectOption('4');
+  await nodes.selectOption(graph.nodes[0].id);
+  await dialog.getByRole('button', { name: 'Next page' }).click();
+  await expect(versions).toHaveValue('');
+  await expect(nodes).toHaveValue('');
+  await expect(dialog.getByRole('button', { name: 'Confirm upgrade' })).toBeDisabled();
+  expect(calls.some((call) => call.path === '/runs/upgrade')).toBe(false);
+  await versions.selectOption('3');
+  await nodes.selectOption(graph.nodes[0].id);
+  await dialog.getByRole('button', { name: 'Confirm upgrade' }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(calls.find((call) => call.path === '/runs/upgrade')?.body).toEqual({ graph_id: graphId, data_id: dataId, version: 3, node: graph.nodes[0].id });
+});
+
+test('reruns from the Runtime list using the same data and graph IDs', async ({ page }) => {
+  const { calls } = await backend(page);
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Rerun run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Rerun workflow' });
+  await expect(dialog.getByRole('button', { name: 'Confirm command' })).toBeDisabled();
+  const picker = dialog.getByRole('combobox', { name: 'Start from node' });
+  await expect(picker.locator(`option[value="${graph.nodes[1].id}"]`)).toHaveJSProperty('disabled', true);
+  await expect(picker.locator(`option[value="${graph.nodes[2].id}"]`)).toHaveJSProperty('disabled', true);
+  await expect(picker.locator(`option[value="${graph.nodes[3].id}"]`)).toHaveJSProperty('disabled', true);
+  await picker.selectOption(graph.nodes[0].id);
+  expect(calls.some((call) => call.path === '/runs/rerun')).toBe(false);
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  expect(calls.some((call) => call.path === '/runs/rerun')).toBe(false);
+
+  await page.getByRole('button', { name: 'Rerun run 20000000' }).click();
+  await picker.selectOption(graph.nodes[0].id);
+  await page.screenshot({ path: 'test-results/runtime-rerun.png', fullPage: true });
+  await dialog.getByRole('button', { name: 'Confirm command' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Rerun command accepted for extract_data' })).toBeVisible();
+  expect(calls.filter((call) => call.path === '/runs/rerun')).toEqual([
+    { path: '/runs/rerun', method: 'POST', body: { graph_id: graphId, data_id: dataId, node: graph.nodes[0].id } },
+  ]);
+  expect(calls.some((call) => call.path === '/runs/start')).toBe(false);
+  await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+  await expect(page.getByText('Revision 3', { exact: true })).toBeVisible();
+  await expect(page.locator('.react-flow__node').filter({ hasText: 'extract_data' })).toContainText('Succeeded');
+});
+
+for (const status of ['Ready', 'Succeeded', 'Failed', 'Terminated'] as const) {
+  test(`reruns a ${status} node from the Runtime inspector`, async ({ page }) => {
+    const { calls } = await backend(page, { rootStatus: status });
+    await page.goto('/#/runtime');
+    await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+    await page.locator('.react-flow__node').filter({ hasText: 'extract_data' }).click();
+    await page.getByRole('button', { name: 'Rerun node', exact: true }).click();
+    await expect(page.getByRole('combobox', { name: 'Start from node' })).toHaveValue(graph.nodes[0].id);
+    await page.getByRole('button', { name: 'Confirm command' }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Rerun command accepted' })).toBeVisible();
+    expect(calls.find((call) => call.path === '/runs/rerun')?.body).toEqual({ graph_id: graphId, data_id: dataId, node: graph.nodes[0].id });
+    await expect(page.locator('.inspector .badge')).toHaveText(status);
+  });
+}
+
+test('retries a rejected rerun from the run detail header', async ({ page }) => {
+  const { calls, failures } = await backend(page);
+  failures.set('/runs/rerun', 503);
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+  await page.getByRole('button', { name: 'Rerun', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Rerun workflow' });
+  await dialog.getByRole('combobox', { name: 'Start from node' }).selectOption(graph.nodes[0].id);
+  await dialog.getByRole('button', { name: 'Confirm command' }).click();
+  await expect(dialog.getByRole('alert')).toContainText('Database temporarily unavailable');
+  await expect(page.getByRole('status').filter({ hasText: 'Rerun command accepted' })).toHaveCount(0);
+  failures.delete('/runs/rerun');
+  await dialog.getByRole('button', { name: 'Confirm command' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Rerun command accepted' })).toBeVisible();
+  expect(calls.filter((call) => call.path === '/runs/rerun')).toHaveLength(2);
+});
+
+test('reruns an earlier-revision node from the Runtime list and inspector', async ({ page }) => {
+  const { calls } = await backend(page, { rootRevision: 2 });
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Rerun run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Rerun workflow' });
+  const picker = dialog.getByRole('combobox', { name: 'Start from node' });
+  const option = picker.locator(`option[value="${graph.nodes[0].id}"]`);
+  await expect(option).toHaveJSProperty('disabled', false);
+  await expect(option).toHaveText('extract_data · Succeeded (earlier revision)');
+  await picker.selectOption(graph.nodes[0].id);
+  await dialog.getByRole('button', { name: 'Confirm command' }).click();
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+  await expect(page.getByRole('button', { name: 'Rerun', exact: true })).toBeEnabled();
+  await page.locator('.react-flow__node').filter({ hasText: 'extract_data' }).click();
+  await page.getByRole('button', { name: 'Rerun node', exact: true }).click();
+  await expect(picker).toHaveValue(graph.nodes[0].id);
+  await dialog.getByRole('button', { name: 'Confirm command' }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(calls.filter((call) => call.path === '/runs/rerun')).toEqual([
+    { path: '/runs/rerun', method: 'POST', body: { graph_id: graphId, data_id: dataId, node: graph.nodes[0].id } },
+    { path: '/runs/rerun', method: 'POST', body: { graph_id: graphId, data_id: dataId, node: graph.nodes[0].id } },
+  ]);
+  expect(calls.some((call) => call.path === '/runs/start')).toBe(false);
+});
+
+test('blocks reruns for active and waiting nodes including earlier revisions', async ({ page }) => {
+  const { calls } = await backend(page, { rootRevision: 2, rootStatus: 'Pending' });
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Rerun run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Rerun workflow' });
+  await expect(dialog.getByText(/No nodes are eligible/)).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Confirm command' })).toBeDisabled();
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+  await expect(page.getByRole('button', { name: 'Rerun', exact: true })).toBeDisabled();
+  for (const node of graph.nodes) {
+    await page.locator('.react-flow__node').filter({ hasText: node.name }).click();
+    await expect(page.getByRole('button', { name: 'Rerun node', exact: true })).toBeDisabled();
+  }
+  await page.locator('.react-flow__node').filter({ hasText: 'extract_data' }).click();
+  await expect(page.getByRole('button', { name: 'Resume node' })).toBeDisabled();
+  expect(calls.some((call) => call.path === '/runs/rerun')).toBe(false);
+});
+
 test('keeps historical run commands disabled', async ({ page }) => {
   await backend(page, { historical: true });
   await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Rerun run 20000000' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Rerun workflow' });
+  await expect(dialog.getByText(/This is a historical run version/)).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Confirm command' })).toBeDisabled();
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
   await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+  await expect(page.getByRole('button', { name: 'Rerun', exact: true })).toBeDisabled();
   await page.locator('.react-flow__node').filter({ hasText: 'clean_records' }).click();
   await expect(page.getByRole('button', { name: 'Resume node' })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Rerun node' })).toBeDisabled();

@@ -1,9 +1,9 @@
 //! Migration integration tests use temporary databases, including legacy DDL
 //! that the current Toasty models cannot express.
 
-use runtime::command::Run;
+use runtime::command::{NodeRun, Run};
 use server::migration::{MIGRATIONS, initialize};
-use toasty::{Db, sql};
+use toasty::{Db, migration::MigrationSet, sql};
 use url::Url;
 use uuid::Uuid;
 
@@ -19,6 +19,29 @@ async fn connect(url: &str) -> Db {
         .connect(url)
         .await
         .unwrap()
+}
+
+async fn legacy_database(url: &str) -> Db {
+    let mut admin_url = Url::parse(url).unwrap();
+    let name = admin_url.path().strip_prefix('/').unwrap().to_owned();
+    assert!(name.starts_with("rayflow_migration_"));
+    admin_url.set_path("/information_schema");
+    let mut admin = connect(admin_url.as_str()).await;
+    sql::statement(format!("CREATE DATABASE `{name}`"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    let mut db = connect(url).await;
+    let migrations: &'static MigrationSet = &MIGRATIONS;
+    MigrationSet::new(&migrations.migrations()[..1])
+        .apply(&db)
+        .await
+        .unwrap();
+    sql::statement("DROP TABLE __toasty_migrations")
+        .exec(&mut db)
+        .await
+        .unwrap();
+    db
 }
 
 async fn cleanup(url: &str, db: &mut Db) {
@@ -47,6 +70,55 @@ async fn create_run(db: &mut Db, data_id: Uuid, graph_id: Uuid, version: u64) ->
 }
 
 #[tokio::test]
+async fn node_run_ineffective_migration_preserves_history_and_defaults_to_zero() {
+    let Some(url) = database_url() else { return };
+    let mut db = legacy_database(&url).await;
+    let migrations: &'static MigrationSet = &MIGRATIONS;
+    MigrationSet::new(&migrations.migrations()[..5])
+        .apply(&db)
+        .await
+        .unwrap();
+    let run = create_run(&mut db, Uuid::new_v4(), Uuid::new_v4(), 1).await;
+    let node = Uuid::new_v4();
+    sql::statement("INSERT INTO node_run (run_id, data_id, graph_id, node_id, status) VALUES (?, ?, ?, ?, 'Succeeded')")
+        .bind(run.uuid).bind(run.data_id).bind(run.graph_id).bind(node)
+        .exec(&mut db).await.unwrap();
+    let report = initialize(&url).await.unwrap();
+    assert_eq!(report.applied(), MIGRATIONS.migrations().len() - 5);
+    assert_eq!(report.skipped(), 5);
+    let preserved = NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, 0)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(preserved.ineffective, 0);
+    assert_eq!(preserved.status, "Succeeded");
+    sql::statement("INSERT INTO node_run (run_id, data_id, graph_id, node_id, revision) VALUES (?, ?, ?, ?, 1)")
+        .bind(run.uuid).bind(run.data_id).bind(run.graph_id).bind(node)
+        .exec(&mut db).await.unwrap();
+    let current = NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, 1)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(current.ineffective, 0);
+    NodeRun::filter_by_id(preserved.id)
+        .update()
+        .ineffective(1)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(initialize(&url).await.unwrap().applied(), 0);
+    assert_eq!(
+        NodeRun::filter_by_id(preserved.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .ineffective,
+        1
+    );
+    cleanup(&url, &mut db).await;
+}
+
+#[tokio::test]
 async fn initialization_creates_the_database_and_tracks_migrations() {
     let Some(url) = database_url() else { return };
     let first = initialize(&url).await.unwrap();
@@ -68,18 +140,28 @@ async fn initialization_creates_the_database_and_tracks_migrations() {
     );
     assert!(sql::query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME IN ('assignment_version', 'steal_count')")
         .exec(&mut db).await.unwrap().is_empty());
+    assert_eq!(
+        sql::query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'command_result'")
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let command_result_columns = sql::query(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'command_result' AND COLUMN_NAME IN ('error_code', 'error_message', 'error')",
+    )
+    .exec(&mut db)
+    .await
+    .unwrap();
+    assert_eq!(command_result_columns.len(), 2);
     cleanup(&url, &mut db).await;
 }
 
 #[tokio::test]
 async fn legacy_job_columns_get_defaults_without_losing_values() {
     let Some(url) = database_url() else { return };
-    initialize(&url).await.unwrap();
-    let mut db = connect(&url).await;
-    sql::statement("DROP TABLE __toasty_migrations")
-        .exec(&mut db)
-        .await
-        .unwrap();
+    let mut db = legacy_database(&url).await;
     sql::statement("ALTER TABLE job ADD COLUMN assignment_version BIGINT UNSIGNED NOT NULL, ADD COLUMN steal_count INT UNSIGNED NOT NULL")
         .exec(&mut db).await.unwrap();
     sql::statement(
@@ -116,12 +198,7 @@ async fn legacy_job_columns_get_defaults_without_losing_values() {
 #[tokio::test]
 async fn duplicate_runs_fail_migration_without_deleting_rows_and_can_be_retried() {
     let Some(url) = database_url() else { return };
-    initialize(&url).await.unwrap();
-    let mut db = connect(&url).await;
-    sql::statement("DROP TABLE __toasty_migrations")
-        .exec(&mut db)
-        .await
-        .unwrap();
+    let mut db = legacy_database(&url).await;
     sql::statement("ALTER TABLE run DROP INDEX uk_run_data_graph, ADD UNIQUE KEY legacy_run_key (data_id, graph_id, version)")
         .exec(&mut db).await.unwrap();
     let data_id = Uuid::new_v4();
@@ -144,7 +221,7 @@ async fn duplicate_runs_fail_migration_without_deleting_rows_and_can_be_retried(
         .await
         .unwrap();
     let report = initialize(&url).await.unwrap();
-    assert_eq!(report.applied(), 1);
+    assert_eq!(report.applied(), MIGRATIONS.migrations().len() - 2);
     assert_eq!(report.skipped(), 2);
     assert_eq!(Run::all().exec(&mut db).await.unwrap()[0].uuid, first.uuid);
     assert!(

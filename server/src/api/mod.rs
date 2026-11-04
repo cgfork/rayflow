@@ -6,6 +6,7 @@
 //!
 //! * `POST /runs/start` — emit `Command::Start` for a run.
 //! * `POST /runs/rerun` — emit `Command::Rerun` for one node.
+//! * `POST /runs/upgrade` — upgrade to a newer graph version from a selected shared node.
 //! * `POST /runs/resume` — emit `Command::Resume` for a pending node.
 //! * `POST /runs/dryrun` — emit `Command::Dryrun` for the given nodes.
 //! * `GET  /graphs/{graph_id}/draft` — read an editable graph draft.
@@ -40,7 +41,7 @@ pub use job::{JobActionRequest, PollJobsRequest, PollJobsResponse};
 pub use run::{
     DryrunRunRequest, DryrunRunResponse, GetGraphStateRequest, GetGraphStateResponse,
     RerunRunRequest, RerunRunResponse, ResumeRunRequest, ResumeRunResponse, StartRunRequest,
-    StartRunResponse,
+    StartRunResponse, UpgradeRunRequest, UpgradeRunResponse,
 };
 pub use task_event::{EmitTaskEventRequest, EmitTaskEventResponse};
 

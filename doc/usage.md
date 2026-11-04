@@ -33,6 +33,9 @@ current SQL form, and versioned files in `server/migrations/` describe database
 changes. The initial migration creates all application tables. For later schema
 changes, add a new migration file with a new ID in `MIGRATIONS` and update
 `rayflow.sql`; do not edit migrations already applied to a database.
+Migration 4 adds `command_result` for permanently failed command applications.
+Migration 5 stores stable error codes and messages separately, preserving errors
+recorded by migration 4.
 
 Stop the server, pilot, and agents before initializing an existing database.
 The script can be rerun and preserves existing rows. In addition to creating
@@ -72,7 +75,7 @@ repository root:
 The script installs UI dependencies when needed, builds the Rust binaries, and
 starts the API server, pilot, and Vite UI. It waits for the API and the UI proxy
 to become ready, then prints their addresses. The default UI address is
-`http://127.0.0.1:5173`, and the API listens on `127.0.0.1:8080`. Configuration
+`http://127.0.0.1:5173`, and the API listens on `127.0.0.1:5172`. Configuration
 uses the existing `rayflow.yaml` and environment overrides; the script does not
 create or migrate the database.
 
@@ -89,9 +92,13 @@ To also run a local execution agent, start Docker and use:
 ./dev.sh --agent
 ```
 
-The agent connects to the local API. Unless `RAYFLOW_AGENT_ID` is set, the script
-generates a stable UUID in `.rayflow/dev/agent-id` and reuses it across restarts.
-Other agent settings use the existing configuration. Configure each node's
+The script passes `RAYFLOW_AGENT_SERVER_URL` directly to the agent, using
+`http://127.0.0.1:5172` or the port selected by `RAYFLOW_DEV_API_PORT`. You do not
+need to add `server_url` to the configuration file for `./dev.sh --agent`.
+The agent logs the resolved URL in `.rayflow/dev/agent.log` when it starts.
+Unless `RAYFLOW_AGENT_ID` is set, the script generates a stable UUID in
+`.rayflow/dev/agent-id` and reuses it across restarts. Other agent settings use
+the existing configuration. Configure each node's
 Docker image, CPU and memory requirements, and timeout in Orchestration before
 publishing, then start a run from Runtime.
 
@@ -252,9 +259,15 @@ The four sections use the same resource APIs as other clients:
   unreferenced outputs are informational. Publishing also runs the existing
   server validator. Node positions are local to the open editor.
 - **Runtime:** start runs and inspect every node in a run's pinned graph version.
-  Pending nodes can resume, and completed or pending nodes can rerun. These
-  actions append commands; the pilot applies them asynchronously. Historical
-  run versions are read-only because command endpoints target a data/graph pair.
+  Use **Rerun** in the run list or detail header to choose a starting node, or
+  select a node on the graph and use **Rerun node**. Ready, succeeded, failed,
+  and terminated nodes can rerun using their latest state at or before the
+  current revision; pending nodes in the current revision can resume. Rerun
+  keeps the data ID and published graph version and creates a new revision
+  one higher than the run's current revision, preserving earlier node runs.
+  These actions append commands; the pilot applies them
+  asynchronously. Historical run versions are read-only because command
+  endpoints target a data/graph pair.
 - **Schedule:** filter jobs by status, run, or owning agent. Cancel and terminate
   use the existing job APIs and require an active claim. The agent reconciles
   lost ownership or expiry before stopping its container.
@@ -365,11 +378,13 @@ The service endpoints are:
 | `GET` | `/health` | Liveness probe; returns `ok`. |
 | `GET` | `/graphs` | List published graph versions; optional `graph_id` filter. |
 | `GET` | `/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
+| `GET` | `/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
 | `GET` | `/graph_drafts` | List editable DAGs. |
 | `GET` | `/runs` | List runs; optional `graph_id` filter. |
 | `GET` | `/runs/{run_id}` | Inspect the exact run UUID, its state, and its pinned graph. |
 | `POST` | `/runs/start` | Start a run; body has `data_id`, `graph_id`, and optional `nodes`. |
 | `POST` | `/runs/rerun` | Rerun one node; body has `data_id`, `graph_id`, and `node`. |
+| `POST` | `/runs/upgrade` | Upgrade an existing run; body has `data_id`, `graph_id`, the newer published `version`, and a `node` selected from the shared nodes. |
 | `POST` | `/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
 | `POST` | `/runs/dryrun` | Prepare targets while mocking predecessors; body has `data_id`, `graph_id`, and optional `nodes`. |
 | `GET` | `/runs/graph_state` | Read state with `data_id` and `graph_id` query parameters. |
@@ -387,6 +402,39 @@ The service endpoints are:
 | `POST` | `/job/terminate` | Terminate a claimed job. |
 
 Run commands and task events return `202 Accepted` with the appended entry ID.
+In Runtime, click **Upgrade** on a run or its detail page. Select a newer
+published version and an eligible shared restart node, then confirm. The UI
+uses the graph's shared-node calculation and the same node-state rules as rerun.
+Shared nodes include all upstream ancestors of the fork point, including the root.
+To upgrade a run, send `POST /runs/upgrade` with a body such as:
+
+```json
+{
+  "data_id": "30000000-0000-4000-8000-000000000001",
+  "graph_id": "10000000-0000-4000-8000-000000000001",
+  "version": 2,
+  "node": "60000000-0000-4000-8000-000000000003"
+}
+```
+
+The pilot applies the separate `Upgrade` command after the request is accepted.
+It keeps the run UUID and data ID, changes its graph version, and reruns the
+selected node using the same rules as ordinary rerun. The node must be in
+`target.shared_nodes(&current)` and its latest status must be ready, succeeded,
+failed, or terminated. The revision advances once and all descendant node runs,
+plus the selected node's records from earlier revisions, are marked
+`ineffective = 1`. Their historical statuses remain available, but
+their results cannot satisfy dependencies until those nodes run again. New node
+runs default to `ineffective = 0`. Ancestors and other branches remain unchanged.
+`GET /runs/graph_state` and the state in `GET /runs/{run_id}` include only effective
+node runs, choosing each node's latest effective revision at or before the run's
+current revision. Invalidated history remains stored but is omitted from graph state.
+`node_run.version`
+records historical information and does not control command application.
+If the node is not shared or the shared
+set is empty, the command records `RAYFLOW_INVALID_UPGRADE_NODE` and leaves the
+run unchanged. Ordinary rerun continues using the existing graph version.
+
 Successful job actions return `204 No Content`. Claim conflicts and terminal
 state conflicts return `409 Conflict`; missing runs, tasks, or nodes return
 `404 Not Found`.

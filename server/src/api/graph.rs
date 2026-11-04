@@ -20,6 +20,28 @@ where
     Router::new()
         .route("/graphs", get(list_graphs::<S>))
         .route("/graphs/{graph_id}", get(read_graph::<S>))
+        .route("/graphs/{graph_id}/shared-nodes", get(shared_nodes::<S>))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SharedNodesQuery {
+    pub from_version: u64,
+    pub version: u64,
+}
+
+async fn shared_nodes<S>(
+    Path(graph_id): Path<Uuid>,
+    Query(query): Query<SharedNodesQuery>,
+    State(app): State<App<S>>,
+) -> Result<Json<Vec<Uuid>>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.shared_graph_nodes(graph_id, query.from_version, query.version)
+        .await
+        .map(Json)
 }
 
 #[derive(Debug, Deserialize)]

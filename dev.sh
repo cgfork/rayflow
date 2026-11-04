@@ -16,11 +16,12 @@ Options:
 Environment:
   DATABASE_URL           Override the MySQL URL for server and pilot.
   RAYFLOW_CONFIG         Use a different configuration file.
-  RAYFLOW_DEV_API_PORT   Local API port (default: 8080).
+  RAYFLOW_DEV_API_PORT   Local API port (default: 5172).
   RAYFLOW_DEV_UI_PORT    Local UI port (default: 5173).
   RAYFLOW_AGENT_ID       Override the local agent UUID when using --agent.
 
 Logs: .rayflow/dev/{server,pilot,ui,agent}.log
+With --agent, the agent's server URL is set to the local API URL automatically.
 Press Ctrl-C to stop all processes started by this script.
 EOF
 }
@@ -87,13 +88,13 @@ fi
 packages=(-p server -p pilot)
 if "$with_agent"; then
     packages+=(-p agent)
-    if [[ -z "${RAYFLOW_AGENT_ID:-}" ]]; then
+    agent_id="${RAYFLOW_AGENT_ID:-}"
+    if [[ -z "$agent_id" ]]; then
         if [[ ! -s "$log_dir/agent-id" ]]; then
             node -e 'console.log(require("node:crypto").randomUUID())' > "$log_dir/agent-id"
         fi
-        export RAYFLOW_AGENT_ID="$(cat "$log_dir/agent-id")"
+        agent_id="$(cat "$log_dir/agent-id")"
     fi
-    export RAYFLOW_AGENT_SERVER_URL="$api_url"
 fi
 
 printf 'Building Rayflow...\n'
@@ -174,7 +175,7 @@ start pilot "$target_dir/debug/pilot"
 start ui env RAYFLOW_API_URL="$api_url" npm run dev --prefix ui -- --port "$ui_port" --strictPort
 wait_for_health "$ui_url/api/health"
 if "$with_agent"; then
-    start agent "$target_dir/debug/agent"
+    start agent env RAYFLOW_AGENT_ID="$agent_id" RAYFLOW_AGENT_SERVER_URL="$api_url" "$target_dir/debug/agent"
 fi
 check_processes
 

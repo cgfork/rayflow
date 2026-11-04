@@ -2837,6 +2837,7 @@ dependencies = [
  "thiserror",
  "toasty",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

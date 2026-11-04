@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS node_run (
     node_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'node unique identifier',
     revision   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'node revision, incremented on rerun/dryrun',
     status     VARCHAR(16)     NOT NULL DEFAULT 'Ready' COMMENT 'node status',
+    ineffective INT UNSIGNED  NOT NULL DEFAULT 0 COMMENT 'invalidated by an upstream rerun or upgrade',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     PRIMARY KEY (id),
@@ -157,6 +158,19 @@ CREATE TABLE IF NOT EXISTS command_entry (
     PRIMARY KEY (id),
     UNIQUE KEY uk_command_entry_uuid (uuid)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'append-only command event log';
+
+CREATE TABLE IF NOT EXISTS command_result (
+    id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    command_id     CHAR(36)        NOT NULL COMMENT 'failed command unique identifier',
+    command_offset BIGINT UNSIGNED NOT NULL COMMENT 'failed command log offset',
+    data_id        CHAR(36)        NOT NULL COMMENT 'data unique identifier',
+    graph_id       CHAR(36)        NOT NULL COMMENT 'graph unique identifier',
+    error_code     VARCHAR(64)     NOT NULL COMMENT 'stable Rayflow error code',
+    error_message  TEXT            NOT NULL COMMENT 'permanent command application error message',
+    created_at     DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'failure recording timestamp',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_command_result_command_id (command_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'permanently failed command results';
 
 CREATE TABLE IF NOT EXISTS task_event (
     id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key, used as the event offset',
