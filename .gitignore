@@ -21,3 +21,4 @@ target
 #.idea/
 # Local agent state.
 .rayflow/
+rayflow.yaml
