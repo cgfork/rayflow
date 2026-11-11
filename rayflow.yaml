@@ -1,3 +1,0 @@
-# Rayflow server configuration.
-addr: 0.0.0.0:8080
-database_url: mysql://root:Hf.smE8739_n@100.72.56.51:3306/rayflow
