@@ -1,6 +1,7 @@
 //! Migration integration tests use temporary databases, including legacy DDL
 //! that the current Toasty models cannot express.
 
+use jiff::Timestamp;
 use runtime::command::{NodeRun, Run};
 use server::migration::{MIGRATIONS, initialize};
 use toasty::{Db, migration::MigrationSet, sql};
@@ -126,10 +127,55 @@ async fn initialization_creates_the_database_and_tracks_migrations() {
     assert_eq!(first.skipped(), 0);
     let mut db = connect(&url).await;
     let run = create_run(&mut db, Uuid::new_v4(), Uuid::new_v4(), 1).await;
+    let now = Timestamp::now();
+    let user = server::auth::User::new("local", "alice", "Alice".into(), None);
+    server::auth::UserRecord::create()
+        .id(user.id.clone())
+        .profile(serde_json::to_value(&user).unwrap())
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    server::auth::Session::create()
+        .token_hash("a".repeat(64))
+        .user_id(user.id.clone())
+        .expires_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    server::auth::LoginFlow::create()
+        .state_hash("b".repeat(64))
+        .browser_hash("c".repeat(64))
+        .nonce("nonce")
+        .verifier("verifier")
+        .expires_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
     let second = initialize(&url).await.unwrap();
     assert_eq!(second.applied(), 0);
     assert_eq!(second.skipped(), MIGRATIONS.migrations().len());
     assert_eq!(Run::all().exec(&mut db).await.unwrap()[0].uuid, run.uuid);
+    assert_eq!(
+        server::auth::Session::all().exec(&mut db).await.unwrap()[0].user_id,
+        user.id
+    );
+    assert_eq!(
+        server::auth::UserRecord::all()
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        server::auth::LoginFlow::all()
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         sql::query("SELECT id FROM __toasty_migrations")
             .exec(&mut db)

@@ -32,6 +32,11 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "node_run_ineffective",
         include_str!("../migrations/0006_node_run_ineffective.sql"),
     ),
+    MigrationFile::new(
+        7,
+        "authentication",
+        include_str!("../migrations/0007_authentication.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

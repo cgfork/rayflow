@@ -30,8 +30,20 @@ impl Client {
         if settings.request_timeout.is_zero() {
             return Err(Error::Settings("request timeout must be positive"));
         }
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = &settings.auth_token {
+            if token.is_empty() {
+                return Err(Error::Settings("auth_token must not be empty"));
+            }
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| Error::Settings("auth_token must be a valid HTTP header"))?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
         Ok(Self {
             http: reqwest::Client::builder()
+                .default_headers(headers)
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(settings.request_timeout)
                 .build()?,
             server_url: settings.server_url.trim_end_matches('/').to_owned(),

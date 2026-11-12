@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod app;
+pub mod auth;
 pub mod config;
 pub mod graph;
 pub mod migration;
@@ -26,6 +27,9 @@ use uuid::Uuid;
 pub fn models() -> toasty::ModelSet {
     let mut models = scheduler::models();
     models.add(app::AgentInstance::schema());
+    models.add(auth::Session::schema());
+    models.add(auth::LoginFlow::schema());
+    models.add(auth::UserRecord::schema());
     for model in ::graph::models() {
         models.add(model);
     }

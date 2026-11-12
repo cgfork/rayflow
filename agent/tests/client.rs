@@ -6,7 +6,7 @@ use std::sync::{
 use agent::{client::Client, errors::Error, settings::Settings};
 use axum::{
     Json, Router,
-    http::{StatusCode, Uri},
+    http::{HeaderMap, StatusCode, Uri},
 };
 use scheduler::ResourceCapacity;
 use serde_json::{Value, json};
@@ -18,26 +18,30 @@ async fn explicit_job_actions_send_ids_and_preserve_http_errors() {
     let (sender, mut requests) = mpsc::unbounded_channel();
     let response_status = Arc::new(AtomicU16::new(204));
     let status = response_status.clone();
-    let router = Router::new().fallback(move |uri: Uri, Json(body): Json<Value>| {
-        let sender = sender.clone();
-        let status = status.clone();
-        async move {
-            sender.send((uri.path().to_owned(), body)).unwrap();
-            StatusCode::from_u16(status.load(Ordering::SeqCst)).unwrap()
-        }
-    });
+    let router = Router::new().fallback(
+        move |uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+            let sender = sender.clone();
+            let status = status.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer test-fleet-token");
+                sender.send((uri.path().to_owned(), body)).unwrap();
+                StatusCode::from_u16(status.load(Ordering::SeqCst)).unwrap()
+            }
+        },
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}/", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let workdir = tempfile::tempdir().unwrap();
     let agent_id = Uuid::new_v4();
     let job_id = Uuid::new_v4();
-    let settings = Settings::new(
+    let mut settings = Settings::new(
         agent_id,
         address,
         workdir.path(),
         ResourceCapacity::default(),
     );
+    settings.auth_token = Some("test-fleet-token".into());
     let client = Client::new(&settings).unwrap();
 
     for status in [204, 409, 404, 503] {

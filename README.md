@@ -10,6 +10,7 @@ forward, deferred, resumed, and recovered across processes.
 - [Design](doc/design.md) — graph validation, event sourcing, transactions, scheduling, and job semantics.
 - [Modules](doc/modules.md) — crate and binary responsibilities, APIs, and workspace layout.
 - [Usage](doc/usage.md) — configuration, web UI, HTTP endpoints, deployment, migrations, and development commands.
+- [Authentication](doc/authentication.md) — user login, company SSO, LDAP, and agent credentials.
 
 ## Quick Start
 

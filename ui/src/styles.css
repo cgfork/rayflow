@@ -14,6 +14,23 @@
   --radius: 12px;
 }
 * { box-sizing: border-box; }
+.login-page { min-height: 100dvh; display: grid; place-items: center; padding: 32px 18px; background: radial-gradient(ellipse at top, #e8eaff, #f6f7fb 65%); }
+.login-card { width: min(100%, 430px); padding: 36px; background: white; border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 16px 55px #2634510d; }
+.login-card .brand { color: #151d32; padding: 0; justify-content: center; }
+.login-heading { text-align: center; margin: 32px 0 25px; }
+.login-heading h1 { font-size: 24px; letter-spacing: -.7px; overflow-wrap: anywhere; }
+.login-heading p { color: var(--muted); }
+.login-symbol { display: inline-grid; place-items: center; width: 48px; height: 48px; margin-bottom: 18px; color: var(--accent); background: #eef0ff; border-radius: 13px; }
+.login-card form { display: grid; gap: 18px; }
+.login-card label { display: grid; gap: 8px; font-weight: 550; }
+.login-card .button { width: 100%; justify-content: center; }
+.login-card button[type=submit] { margin-top: 4px; }
+.login-divider { text-align: center; color: var(--muted); font-size: 11px; margin-top: 22px; }
+.login-error { padding: 12px; background: #fff1f1; border: 1px solid #f1d0d0; border-radius: 8px; color: #a03838; }
+.signed-in-user { min-width: 0; }
+.signed-in-user strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.sign-out { border: 0; padding: 5px 0 0; background: none; color: #a8b0ff; font-size: 11px; }
+@media (max-width: 480px) { .login-card { padding: 28px 22px; } }
 body { margin: 0; font-size: 13px; }
 button, input, textarea, select { font: inherit; }
 button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }

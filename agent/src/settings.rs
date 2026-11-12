@@ -12,10 +12,13 @@ use uuid::Uuid;
 
 use crate::errors::Error;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Settings {
     pub id: Uuid,
     pub server_url: String,
+    /// Fleet credential when server authentication is enabled.
+    #[serde(default)]
+    pub auth_token: Option<String>,
     pub workdir: PathBuf,
     pub resources: ResourceCapacity,
     pub batch: usize,
@@ -23,6 +26,20 @@ pub struct Settings {
     pub poll_interval: Duration,
     #[serde(with = "jiff::fmt::serde::unsigned_duration::required")]
     pub request_timeout: Duration,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("id", &self.id)
+            .field("server_url", &self.server_url)
+            .field("workdir", &self.workdir)
+            .field("resources", &self.resources)
+            .field("batch", &self.batch)
+            .field("poll_interval", &self.poll_interval)
+            .field("request_timeout", &self.request_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Settings {
@@ -81,6 +98,7 @@ impl Settings {
         Self {
             id,
             server_url: server_url.into(),
+            auth_token: None,
             workdir: workdir.into(),
             resources,
             batch: 64,

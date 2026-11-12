@@ -32,6 +32,7 @@ use crate::Config;
 pub struct App<S> {
     db: Db,
     pub(crate) config: Config,
+    pub(crate) auth: Option<crate::auth::Auth>,
     offsets: Offsets,
     graph_store: S,
 }
@@ -53,9 +54,17 @@ impl<S> App<S> {
         Self {
             db,
             config,
+            auth: None,
             offsets,
             graph_store,
         }
+    }
+
+    /// Installs shared login providers and session storage for the HTTP router.
+    pub fn with_auth(mut self, auth: crate::auth::Auth) -> Self {
+        self.config.auth = auth.config().clone();
+        self.auth = Some(auth);
+        self
     }
 
     /// Connects to `url`, registering runtime and scheduling models, and builds an
