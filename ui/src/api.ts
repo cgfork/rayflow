@@ -8,9 +8,11 @@ export class ApiError extends Error {
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {
     ...options,
-    headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
+    credentials: 'same-origin',
+    headers: { 'X-Rayflow-Request': '1', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
   });
   if (!response.ok) {
+    if (response.status === 401 && !path.startsWith('/auth/')) window.dispatchEvent(new Event('rayflow:unauthorized'));
     const text = await response.text();
     let message = text || `Request failed (${response.status})`;
     try { message = JSON.parse(text).error || message; } catch { message = text || message; }

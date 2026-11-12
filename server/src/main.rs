@@ -20,7 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = toasty::Db::builder();
     builder.models(server::models());
     let db = builder.connect(&config.database_url).await?;
-    let state = App::new(db.clone(), config.clone(), db);
+    let auth = server::auth::Auth::new(config.auth.clone(), db.clone()).await?;
+    let state = App::new(db.clone(), config.clone(), db).with_auth(auth);
 
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
     tracing::info!(address = %config.addr, "rayflow server listening");

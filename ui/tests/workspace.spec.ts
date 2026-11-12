@@ -35,6 +35,7 @@ async function backend(page: BrowserPage, options: { empty?: boolean; historical
     const fulfill = (data: unknown, status = 200) => route.fulfill({ status, json: data });
     if (failures.has(path)) return fulfill({ error: 'Database temporarily unavailable' }, failures.get(path));
     if (path === '/health') return route.fulfill({ status: 200, body: 'ok' });
+    if (path === '/auth/providers') return fulfill({ enabled: false, company_name: 'Rayflow', providers: [] });
     if (path === '/graph_drafts') return fulfill({ items: options.empty ? [] : [draft], next_cursor: null });
     if (path === '/graphs') return fulfill({ items: options.empty ? [] : (options.versions ?? [graph.version]).map((version) => ({ ...graph, version })), next_cursor: null });
     if (path.endsWith('/draft')) {

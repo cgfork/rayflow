@@ -3,6 +3,10 @@
 This guide covers local development, configuration, HTTP operations, and the
 durable files used by agents.
 
+See [Authentication](authentication.md) for user login, company SSO, LDAP, and
+agent credentials. Authentication is opt-in; enable it before exposing the
+console or API outside a trusted development environment.
+
 ## Prerequisites
 
 Rayflow uses Rust edition 2024 and MySQL. Install rustup; Cargo selects the

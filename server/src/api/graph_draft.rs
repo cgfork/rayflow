@@ -4,7 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use graph::GraphStore;
 use graph::types::DAG;
 use serde::Deserialize;
@@ -68,6 +68,7 @@ where
 async fn write_graph_draft<S>(
     Path(graph_id): Path<Uuid>,
     State(state): State<App<S>>,
+    user: Option<Extension<crate::auth::User>>,
     Json(request): Json<WriteGraphDraftRequest>,
 ) -> Result<impl IntoResponse, AppError>
 where
@@ -75,7 +76,13 @@ where
     S::Err: Send + Sync + 'static,
 {
     let graph = state
-        .write_graph_draft(graph_id, request.graph, &request.actor)
+        .write_graph_draft(
+            graph_id,
+            request.graph,
+            user.as_ref()
+                .map(|user| user.id.as_str())
+                .unwrap_or(&request.actor),
+        )
         .await?;
     Ok((StatusCode::OK, Json(graph)))
 }
@@ -83,12 +90,20 @@ where
 async fn publish_graph_draft<S>(
     Path(graph_id): Path<Uuid>,
     State(state): State<App<S>>,
+    user: Option<Extension<crate::auth::User>>,
     Json(request): Json<PublishGraphDraftRequest>,
 ) -> Result<impl IntoResponse, AppError>
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
     S::Err: Send + Sync + 'static,
 {
-    let graph = state.publish_graph_draft(graph_id, &request.actor).await?;
+    let graph = state
+        .publish_graph_draft(
+            graph_id,
+            user.as_ref()
+                .map(|user| user.id.as_str())
+                .unwrap_or(&request.actor),
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(graph)))
 }

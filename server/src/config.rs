@@ -29,6 +29,9 @@ fn default_poll_retry_interval() -> Duration {
 /// Runtime configuration for the API server.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Config {
+    /// User authentication; disabled for backwards-compatible local development.
+    #[serde(default)]
+    pub auth: crate::auth::AuthConfig,
     /// Address the HTTP server binds and listens on.
     pub addr: SocketAddr,
     /// MySQL connection URL. Required.
@@ -50,6 +53,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            auth: crate::auth::AuthConfig::default(),
             addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             database_url: String::new(),
             poll_timeout: default_poll_timeout(),
@@ -75,6 +79,8 @@ impl Config {
         let config: Self = builder
             .add_source(
                 Environment::with_prefix("RAYFLOW")
+                    .prefix_separator("_")
+                    .separator("__")
                     .try_parsing(true)
                     .ignore_empty(true),
             )
@@ -92,6 +98,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        self.auth.validate().map_err(ConfigError::Message)?;
         if self.poll_timeout < Duration::from_millis(2) {
             return Err(ConfigError::Message(
                 "poll_timeout must be at least 2ms".to_owned(),
@@ -133,6 +140,27 @@ mod tests {
         assert_eq!(config.database_url, "mysql://localhost/rayflow");
         assert_eq!(config.poll_timeout, Duration::from_secs(30));
         assert_eq!(config.poll_retry_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn nested_authentication_environment_overrides_preserve_existing_names() {
+        let source = [
+            ("RAYFLOW_ADDR".into(), "127.0.0.1:8082".into()),
+            ("RAYFLOW_POLL_TIMEOUT".into(), "20s".into()),
+            ("RAYFLOW_AUTH__ENABLED".into(), "true".into()),
+            ("RAYFLOW_AUTH__OIDC__CLIENT_SECRET".into(), "secret".into()),
+        ]
+        .into_iter()
+        .collect();
+        let config: Config = Builder::builder()
+            .add_source(File::from_str("database_url: mysql://localhost/rayflow\nauth:\n  oidc:\n    issuer_url: https://company.example.com\n    client_id: rayflow\n    client_secret: overridden\n", config::FileFormat::Yaml))
+            .add_source(Environment::with_prefix("RAYFLOW").prefix_separator("_").separator("__").try_parsing(true).source(Some(source)))
+            .build().unwrap().try_deserialize().unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.addr.port(), 8082);
+        assert_eq!(config.poll_timeout, Duration::from_secs(20));
+        assert!(config.auth.enabled);
+        assert_eq!(config.auth.oidc.unwrap().client_secret, "secret");
     }
 
     #[test]

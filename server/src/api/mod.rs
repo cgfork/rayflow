@@ -53,11 +53,20 @@ where
     S::graphs(..): Send,
     <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
 {
+    let auth = crate::auth::AuthState {
+        auth: state.auth.clone(),
+        enabled: state.config.auth.enabled,
+    };
     graph::routes::<S>()
         .merge(agent::routes::<S>())
         .merge(graph_draft::routes::<S>())
         .merge(run::routes::<S>())
         .merge(task_event::routes::<S>())
         .merge(job::routes::<S>())
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_auth,
+        ))
         .with_state(state)
+        .merge(crate::auth::routes(auth.auth, auth.enabled))
 }

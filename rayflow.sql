@@ -202,3 +202,26 @@ CREATE TABLE IF NOT EXISTS leader_election (
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last acquisition or renewal timestamp',
     PRIMARY KEY (name)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'named coordinator leader leases';
+
+-- User login, browser sessions, and single-use SSO state.
+CREATE TABLE IF NOT EXISTS auth_user (
+    id VARCHAR(64) NOT NULL PRIMARY KEY,
+    profile JSON NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_session (
+    token_hash VARCHAR(64) NOT NULL PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    INDEX auth_session_expires_at (expires_at)
+);
+
+CREATE TABLE IF NOT EXISTS auth_login_flow (
+    state_hash VARCHAR(64) NOT NULL PRIMARY KEY,
+    browser_hash VARCHAR(64) NOT NULL,
+    nonce TEXT NOT NULL,
+    verifier TEXT NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    INDEX auth_login_flow_expires_at (expires_at)
+);
