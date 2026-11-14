@@ -11,6 +11,7 @@ pub mod auth;
 pub mod config;
 pub mod graph;
 pub mod migration;
+pub mod storage;
 
 pub use app::App;
 pub use config::Config;
@@ -23,7 +24,7 @@ use axum::routing::get;
 use toasty::schema::Model;
 use uuid::Uuid;
 
-/// Registers graph, runtime, and scheduling models together for the API.
+/// Registers catalog, graph, runtime, scheduling, and authentication models.
 pub fn models() -> toasty::ModelSet {
     let mut models = scheduler::models();
     models.add(app::AgentInstance::schema());
@@ -31,6 +32,9 @@ pub fn models() -> toasty::ModelSet {
     models.add(auth::LoginFlow::schema());
     models.add(auth::UserRecord::schema());
     for model in ::graph::models() {
+        models.add(model);
+    }
+    for model in catalog::models() {
         models.add(model);
     }
     models
@@ -73,9 +77,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn models_include_graph_runtime_and_scheduler() {
+    fn models_include_catalog_graph_runtime_and_scheduler() {
         let models = models();
-        for model in scheduler::models().into_iter().chain(::graph::models()) {
+        for model in scheduler::models()
+            .into_iter()
+            .chain(::graph::models())
+            .chain(catalog::models())
+        {
             assert!(models.contains(model.id()));
         }
     }

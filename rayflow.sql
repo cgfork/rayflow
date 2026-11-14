@@ -58,17 +58,14 @@ CREATE TABLE IF NOT EXISTS run (
 CREATE TABLE IF NOT EXISTS run_config (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
     run_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
-    version    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'graph version',
-    revision   BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'run revision this config applies to',
     annotation JSON            NOT NULL COMMENT 'run annotation key/value map',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     created_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'creator of the record',
     updated_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'last updater of the record',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_run_config_run_revision (run_id, revision),
     KEY idx_run_config_run_id (run_id)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'run annotation configuration, one row per run revision';
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'run annotation snapshots referenced by jobs';
 
 CREATE TABLE IF NOT EXISTS node_config (
     id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
@@ -205,23 +202,62 @@ CREATE TABLE IF NOT EXISTS leader_election (
 
 -- User login, browser sessions, and single-use SSO state.
 CREATE TABLE IF NOT EXISTS auth_user (
-    id VARCHAR(64) NOT NULL PRIMARY KEY,
-    profile JSON NOT NULL,
-    updated_at TIMESTAMP(6) NOT NULL
-);
+    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    user_id    VARCHAR(64) NOT NULL COMMENT 'stable user identity derived from provider and subject',
+    profile    JSON NOT NULL COMMENT 'provider identity and user display profile',
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last profile update timestamp',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_auth_user_user_id (user_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT = 'authenticated user directory';
 
 CREATE TABLE IF NOT EXISTS auth_session (
-    token_hash VARCHAR(64) NOT NULL PRIMARY KEY,
-    user_id VARCHAR(64) NOT NULL,
-    expires_at TIMESTAMP(6) NOT NULL,
-    INDEX auth_session_expires_at (expires_at)
-);
+    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    token_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 digest of the browser session token',
+    user_id    VARCHAR(64) NOT NULL COMMENT 'authenticated user identity',
+    expires_at DATETIME(6) NOT NULL COMMENT 'session expiry timestamp',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_auth_session_token_hash (token_hash),
+    KEY auth_session_expires_at (expires_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT = 'browser authentication sessions';
 
 CREATE TABLE IF NOT EXISTS auth_login_flow (
-    state_hash VARCHAR(64) NOT NULL PRIMARY KEY,
-    browser_hash VARCHAR(64) NOT NULL,
-    nonce TEXT NOT NULL,
-    verifier TEXT NOT NULL,
-    expires_at TIMESTAMP(6) NOT NULL,
-    INDEX auth_login_flow_expires_at (expires_at)
-);
+    id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    state_hash   VARCHAR(64) NOT NULL COMMENT 'SHA-256 digest of the single-use OIDC state',
+    browser_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 digest of the browser binding token',
+    nonce        TEXT NOT NULL COMMENT 'OIDC nonce for ID token validation',
+    verifier     TEXT NOT NULL COMMENT 'PKCE verifier for authorization code exchange',
+    expires_at   DATETIME(6) NOT NULL COMMENT 'login flow expiry timestamp',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_auth_login_flow_state_hash (state_hash),
+    KEY auth_login_flow_expires_at (expires_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT = 'single-use browser-bound OIDC login flows';
+
+CREATE TABLE IF NOT EXISTS catalog (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    uuid CHAR(36) NOT NULL,
+    `key` VARCHAR(750) NOT NULL COMMENT 'unique object key',
+    url VARCHAR(750) NOT NULL,
+    size BIGINT UNSIGNED NOT NULL,
+    format VARCHAR(255) NOT NULL,
+    uploaded BOOLEAN NOT NULL DEFAULT FALSE COMMENT 'object upload acknowledged',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_catalog_uuid (uuid),
+    UNIQUE KEY uk_catalog_key (`key`),
+    UNIQUE KEY uk_catalog_url (url)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT = 'physical object metadata';
+
+CREATE TABLE IF NOT EXISTS file (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    uuid CHAR(36) NOT NULL,
+    fullpath VARCHAR(512) NOT NULL,
+    filename VARCHAR(255) NOT NULL,
+    catalog_uuid CHAR(36) NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_file_uuid (uuid),
+    UNIQUE KEY uk_file_fullpath (fullpath),
+    KEY idx_file_catalog_uuid (catalog_uuid)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT = 'logical file names referencing catalog UUIDs';

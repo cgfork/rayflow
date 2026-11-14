@@ -7,8 +7,8 @@ self-registration, and password reset are not included. Restrict membership in
 the identity provider or LDAP search filter to the intended workspace users.
 
 Authentication is disabled by default for existing development installations.
-Set `auth.enabled: true`, run `./init-db.sh` to apply migration 7, and restart the
-server. The migration adds `auth_user`, `auth_session`, and `auth_login_flow`.
+Set `auth.enabled: true`, run `./init-db.sh` to apply the current migrations, and restart the
+server. Migration 7 adds `auth_user`, `auth_session`, and `auth_login_flow`.
 
 ## Company SSO
 
@@ -117,7 +117,12 @@ Restart after changing accounts. Existing sessions last until logout, revocation
 or expiry; account/password/directory changes do not revoke previous sessions.
 To revoke immediately, delete the user's `auth_session` rows by `user_id`.
 `auth_user.profile` records provider, subject, name, and email. Audit columns use
-the stable 64-character `auth_user.id`, derived from provider and subject.
+the stable 64-character `auth_user.user_id`, derived from provider and subject.
+Each `auth_*` table has a separate auto-incrementing `BIGINT UNSIGNED` primary
+`id`. User IDs, session token hashes, and login state hashes remain unique.
+Migrations 14–16 rename the former `auth_user.id` to `user_id`, assign numeric
+IDs, and align the tables with InnoDB, utf8mb4, and `DATETIME(6)`. Existing
+profiles, session references, credentials, and expiry timestamps are preserved.
 
 ## Agents and sessions
 
@@ -132,7 +137,8 @@ export RAYFLOW_AUTH__AGENT_TOKEN='your-random-fleet-token'
 export RAYFLOW_AGENT_AUTH_TOKEN='your-random-fleet-token'
 ```
 
-This bearer token permits polling, job actions, and published graph reads. It
+This bearer token permits polling, job actions, catalog prepare/commit/download,
+published graph reads, and individual run-state reads for input resolution. It
 cannot edit drafts, publish, read management lists, start runs, or emit arbitrary
 task events. Agents sharing the fleet token are mutually trusted; it does not
 identify individual agents. If omitted, only signed-in users can access the API.

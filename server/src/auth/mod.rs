@@ -4,7 +4,7 @@ mod oidc;
 mod password;
 mod store;
 
-pub use config::{AuthConfig, LdapConfig, LocalUser, OidcConfig};
+pub use config::{AuthConfig, AuthConfigError, LdapConfig, LocalUser, OidcConfig};
 pub use password::PasswordProvider;
 pub use store::{LoginFlow, Session, UserRecord};
 
@@ -63,7 +63,7 @@ pub enum AuthError {
     #[error("Too many sign-in attempts; try again in a minute")]
     RateLimited,
     #[error("invalid authentication configuration: {0}")]
-    Configuration(String),
+    Configuration(#[from] AuthConfigError),
 }
 
 impl IntoResponse for AuthError {
@@ -153,7 +153,7 @@ impl Auth {
             provider.id().is_empty() || provider.id() == "oidc" || !ids.insert(provider.id())
         }) {
             return Err(AuthError::Configuration(
-                "password provider IDs must be unique and cannot be oidc".into(),
+                AuthConfigError::InvalidPasswordProviderIds,
             ));
         }
         Ok(Self(Arc::new(Inner {
@@ -233,7 +233,7 @@ impl Auth {
             .await?
             .filter(|session| session.expires_at > Timestamp::now())
             .ok_or(AuthError::Unauthorized)?;
-        let user = UserRecord::filter_by_id(session.user_id)
+        let user = UserRecord::filter_by_user_id(session.user_id)
             .first()
             .exec(&mut db)
             .await?
@@ -262,7 +262,7 @@ impl Auth {
             .table(db.schema().mapping.model(UserRecord::id()).table)
             .name
             .replace('`', "``");
-        toasty::sql::statement(format!("INSERT INTO `{table}` (id, profile, updated_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE profile = VALUES(profile), updated_at = VALUES(updated_at)"))
+        toasty::sql::statement(format!("INSERT INTO `{table}` (user_id, profile, updated_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE profile = VALUES(profile), updated_at = VALUES(updated_at)"))
             .bind(user.id.clone()).bind(profile.to_string()).bind(now).exec(&mut db).await?;
         Session::filter(Session::fields().expires_at().le(now))
             .delete()
@@ -565,6 +565,9 @@ fn agent_route(method: &Method, path: &str) -> bool {
         return matches!(
             path,
             "/jobs/poll"
+                | "/catalog/prepare"
+                | "/catalog/commit"
+                | "/catalog/download"
                 | "/job/cancel"
                 | "/job/yield"
                 | "/job/succeed"
@@ -576,6 +579,9 @@ fn agent_route(method: &Method, path: &str) -> bool {
         && (path == "/graphs"
             || path
                 .strip_prefix("/graphs/")
+                .is_some_and(|id| Uuid::parse_str(id).is_ok())
+            || path
+                .strip_prefix("/runs/")
                 .is_some_and(|id| Uuid::parse_str(id).is_ok()))
 }
 

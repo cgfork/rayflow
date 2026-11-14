@@ -11,6 +11,7 @@ forward, deferred, resumed, and recovered across processes.
 - [Modules](doc/modules.md) — crate and binary responsibilities, APIs, and workspace layout.
 - [Usage](doc/usage.md) — configuration, web UI, HTTP endpoints, deployment, migrations, and development commands.
 - [Authentication](doc/authentication.md) — user login, company SSO, LDAP, and agent credentials.
+- [Catalog](doc/catalog.md) — object metadata, logical file names, and the storage signing contract.
 
 ## Quick Start
 

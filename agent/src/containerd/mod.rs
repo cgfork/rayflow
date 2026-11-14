@@ -1,7 +1,7 @@
 //! Container runtime access.
 //!
-//! This module deliberately knows nothing about Rayflow jobs or the local
-//! filesystem. It is the provider boundary used by `agentd`.
+//! Providers translate pinned job configurations and optional artifact mounts
+//! into container specifications. `agentd` owns lifecycle and persistence.
 
 use std::pin::Pin;
 
@@ -172,6 +172,19 @@ pub trait Containerd: Clone + Send + Sync + 'static {
     /// resources are created. It should not create a container or mutate the
     /// job filesystem; those actions belong to `prepare` and `create`.
     fn spec<'a>(&'a self, job: &'a Job) -> Result<Self::Spec<'a>, Error>;
+
+    /// Builds a specification exposing prepared inputs and writable outputs.
+    /// Providers that execute jobs with artifacts must implement this method.
+    fn spec_with_files<'a>(
+        &'a self,
+        _job: &'a Job,
+        _inputs: &std::path::Path,
+        _outputs: &std::path::Path,
+    ) -> Result<Self::Spec<'a>, Error> {
+        Err(Error::Provider(
+            "container provider does not support artifact directories".into(),
+        ))
+    }
 
     /// Makes the provider resources referenced by `spec` available.
     ///

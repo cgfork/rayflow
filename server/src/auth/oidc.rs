@@ -202,6 +202,7 @@ mod tests {
             .to_string()
         };
         let flow = || LoginFlow {
+            id: 0,
             state_hash: String::new(),
             browser_hash: String::new(),
             nonce: nonce.clone(),

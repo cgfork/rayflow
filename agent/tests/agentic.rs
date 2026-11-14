@@ -296,6 +296,16 @@ async fn recovered_result_is_retried_and_acknowledged() {
     let workdir = root.path().join("jobs");
     let task = Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 1);
     let job = Job::new(&task, Uuid::new_v4(), 1, 1);
+    let mut value = serde_json::to_value(&job).unwrap();
+    let now = Timestamp::now();
+    value["run"] = json!({"id":1,"uuid":job.run_id,"data_id":task.data_id,"graph_id":task.graph_id,"version":1,"revision":3,"created_at":now,"updated_at":now});
+    value["node_run"] = json!({"id":task.node_run_id,"run_id":job.run_id,"data_id":task.data_id,"graph_id":task.graph_id,"version":1,"node_id":task.node_id,"revision":3,"status":"Running","created_at":now,"updated_at":now});
+    let job: Job = serde_json::from_value(value).unwrap();
+    let file_fs = agent::filefs::FileFs::new(workdir.join("data"), job.run_id, task.node_id, 3);
+    file_fs.prepare().await.unwrap();
+    fs::write(file_fs.outputs_dir().join("result.txt"), "hello")
+        .await
+        .unwrap();
     let job_dir = workdir.join(job.uuid.to_string());
     fs::create_dir_all(&job_dir).await.unwrap();
     fs::write(job_dir.join("job.json"), serde_json::to_vec(&job).unwrap())
@@ -304,10 +314,69 @@ async fn recovered_result_is_retried_and_acknowledged() {
     fs::write(job_dir.join("result.json"), br#"{"exit_code":0}"#)
         .await
         .unwrap();
+    fs::write(
+        job_dir.join("node.json"),
+        serde_json::to_vec(&Node {
+            id: task.node_id,
+            name: "job node".into(),
+            node_type: "shell".into(),
+            settings: Default::default(),
+            inputs: vec![],
+            outputs: vec![graph::types::Output {
+                file_name: "result.txt".into(),
+                kind: graph::types::Kind::File,
+                multiple: false,
+            }],
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
 
     let (requests, mut received) = mpsc::unbounded_channel::<(String, Value)>();
     let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let object_url = format!("{url}/object");
+    let upload_requests = requests.clone();
+    let commit_requests = requests.clone();
+    let put_attempts = Arc::new(AtomicUsize::new(0));
+    let catalog_uuid = Uuid::new_v4();
+    let graph = DAG {
+        id: task.graph_id,
+        name: "flow".into(),
+        version: 1,
+        ..Default::default()
+    };
     let router = Router::new()
+        .route("/graphs/{id}", axum::routing::get(move || { let graph = graph.clone(); async move { Json(graph) } }))
+        .route("/catalog/prepare", post(move |Json(body): Json<Value>| {
+            let object_url = object_url.clone();
+            async move {
+                assert!(body.get("catalog_uuid").is_none());
+                Json(json!({
+                    "catalog": catalog::model::Catalog::new(catalog_uuid, "/result.txt", "s3://bucket/result.txt", 5, "txt"),
+                    "presigned": {"url":object_url,"operation":"upload","headers":{},"expires_at":Timestamp::now() + Duration::from_secs(60)}
+                }))
+            }
+        }))
+        .route("/object", axum::routing::put(move |bytes: axum::body::Bytes| {
+            let requests = upload_requests.clone();
+            let attempts = put_attempts.clone();
+            async move {
+                assert_eq!(bytes.as_ref(), b"hello");
+                requests.send(("put".into(), Value::Null)).unwrap();
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }
+            }
+        }))
+        .route("/catalog/commit", post(move |Json(body): Json<Value>| {
+            let requests = commit_requests.clone();
+            async move {
+                assert_eq!(body["catalog_uuid"], catalog_uuid.to_string());
+                requests.send(("commit".into(), body)).unwrap();
+                StatusCode::NO_CONTENT
+            }
+        }))
         .route(
             "/jobs/poll",
             post({
@@ -336,8 +405,6 @@ async fn recovered_result_is_retried_and_acknowledged() {
                 }
             }),
         );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let mut settings = Settings::new(
         Uuid::new_v4(),
@@ -357,6 +424,8 @@ async fn recovered_result_is_retried_and_acknowledged() {
     let running = agentic.start();
     tokio::pin!(running);
 
+    let mut puts = 0;
+    let mut committed = false;
     let mut reported = 0;
     let mut polled = false;
     let reports = timeout(Duration::from_secs(5), async {
@@ -371,7 +440,15 @@ async fn recovered_result_is_retried_and_acknowledged() {
                 );
                 polled = true;
             }
+            if action == "put" {
+                puts += 1;
+            }
+            if action == "commit" {
+                committed = true;
+            }
             if action == "succeed" {
+                assert!(committed, "outputs must be committed before success");
+                assert_eq!(puts, 2, "failed uploads must retry before reporting");
                 assert_eq!(body["job_id"], json!(job.uuid));
                 reported += 1;
                 if reported == 1 {
@@ -395,5 +472,11 @@ async fn recovered_result_is_retried_and_acknowledged() {
     })
     .await
     .unwrap();
+    assert_eq!(
+        fs::read(file_fs.outputs_dir().join("result.txt"))
+            .await
+            .unwrap(),
+        b"hello"
+    );
     server.abort();
 }

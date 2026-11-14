@@ -8,7 +8,7 @@
 use std::{
     collections::HashMap,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -102,6 +102,7 @@ struct Inner<C, R> {
     containerd: C,
     graph_store: R,
     workdir: PathBuf,
+    data_dir: PathBuf,
     containers: Mutex<HashMap<String, Uuid>>,
     results: Notify,
     shutdown: watch::Sender<bool>,
@@ -111,7 +112,7 @@ struct Inner<C, R> {
 /// The local job daemon.
 ///
 /// The daemon is cloneable so its watcher, polling loop, and request handlers
-/// can share one state owner. All mutations of `JobFs` are performed by this
+/// can share one state owner. All lifecycle mutations of `JobFs` are performed by this
 /// type; consumers only read results and acknowledge them after the remote
 /// service accepts the corresponding report.
 #[derive(Clone)]
@@ -132,13 +133,27 @@ where
         workdir: impl Into<PathBuf>,
     ) -> Result<Self, Error> {
         let workdir = workdir.into();
+        let data_dir = workdir.join("data");
+        Self::open_with_data_dir(containerd, graph_store, workdir, data_dir).await
+    }
+
+    pub async fn open_with_data_dir(
+        containerd: C,
+        graph_store: R,
+        workdir: impl Into<PathBuf>,
+        data_dir: impl Into<PathBuf>,
+    ) -> Result<Self, Error> {
+        let workdir = workdir.into();
+        let data_dir = data_dir.into();
         fs::create_dir_all(&workdir).await?;
+        fs::create_dir_all(&data_dir).await?;
         let (shutdown, _) = watch::channel(false);
         let agentd = Self {
             inner: Arc::new(Inner {
                 containerd,
                 graph_store,
                 workdir,
+                data_dir,
                 containers: Mutex::new(HashMap::new()),
                 results: Notify::new(),
                 shutdown,
@@ -147,6 +162,10 @@ where
         };
         agentd.reconcile_all().await?;
         Ok(agentd)
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.inner.data_dir
     }
 
     /// Persists a claimed job, loads its pinned graph version, and prepares
@@ -226,7 +245,7 @@ where
             .ok_or_else(|| Error::Agentd(format!("node is missing from graph: {node_id}")))?;
         job_fs.write_node(node).await?;
 
-        let spec = self.inner.containerd.spec(&job)?;
+        let spec = self.execution_spec(&job, job_fs).await?;
         self.inner.containerd.prepare(spec).await
     }
 
@@ -374,7 +393,7 @@ where
     }
 
     async fn create_container(&self, job_fs: &JobFs, job: &Job) -> Result<C::Container, Error> {
-        let spec = self.inner.containerd.spec(job)?;
+        let spec = self.execution_spec(job, job_fs).await?;
         let container = self.inner.containerd.create(spec).await?;
         job_fs
             .write_container(JobContainer {
@@ -385,6 +404,45 @@ where
         self.register_container(container.id().to_owned(), job.uuid)
             .await;
         Ok(container)
+    }
+
+    async fn execution_spec<'a>(
+        &'a self,
+        job: &'a Job,
+        job_fs: &JobFs,
+    ) -> Result<C::Spec<'a>, Error> {
+        let node = job_fs.node().await?;
+        if node.inputs.is_empty() && node.outputs.is_empty() {
+            return self.inner.containerd.spec(job);
+        }
+        let node_run = job.node_run.get();
+        let file_fs = crate::filefs::FileFs::new(
+            &self.inner.data_dir,
+            job.run_id,
+            node_run.node_id,
+            node_run.revision,
+        );
+        file_fs.prepare().await?;
+        let inputs = fs::canonicalize(file_fs.inputs_dir()).await?;
+        let outputs = fs::canonicalize(file_fs.outputs_dir()).await?;
+        self.inner
+            .containerd
+            .spec_with_files(job, &inputs, &outputs)
+    }
+
+    /// Persists output validation failure before reporting a failed job.
+    pub async fn fail_artifacts(&self, job_id: Uuid) -> Result<(), Error> {
+        let job_fs = self.job_fs(job_id);
+        job_fs.lock().await?;
+        let result = async {
+            let mut result = job_fs.job_result().await?;
+            result.outcome = Some(JobOutcome::Failed.as_str().into());
+            result.exit_code = 1;
+            job_fs.write_job_result(result).await
+        }
+        .await;
+        let unlock = job_fs.unlock().await;
+        result.and(unlock)
     }
 
     /// Runs the global provider event watcher and periodic recovery scan.
@@ -830,7 +888,8 @@ where
         })
     }
 
-    fn job_fs(&self, job_id: Uuid) -> JobFs {
+    /// Returns durable job metadata for orchestration.
+    pub fn job_fs(&self, job_id: Uuid) -> JobFs {
         JobFs::new(&self.inner.workdir, job_id)
     }
 

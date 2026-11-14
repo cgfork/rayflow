@@ -166,7 +166,10 @@ whose expiry is beyond the configured grace period. External implementations may
 submit jobs to systems such as Kubernetes or Volcano, but must use durable request
 records and reconcile retries after rollback.
 
-`RunConfig` stores the run configuration revision and graph version. Each graph
+`Run` stores the execution graph version and revision. `RunConfig` stores
+annotation snapshots without duplicating those fields. New jobs select the
+newest snapshot ID for their run; existing jobs retain their configuration ID.
+Each graph
 node carries JSON task configuration, resource requirements, and a duration
 timeout. Publishing snapshots these settings to `NodeConfig`, keyed by graph
 version; job creation selects the latest node configuration no newer than the

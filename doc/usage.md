@@ -213,6 +213,7 @@ The agent requires a stable, non-nil UUID. The other settings have defaults:
 id: 12345678-1234-4234-8234-123456789abc
 server_url: http://127.0.0.1:8080
 workdir: .rayflow/jobs
+data_dir: .rayflow/data
 batch: 64
 poll_interval: 1s
 request_timeout: 60s
@@ -234,7 +235,9 @@ RAYFLOW_AGENT_ID=12345678-1234-4234-8234-123456789abc \
   cargo run -p agent
 ```
 
-Each agent needs a unique stable ID and a persistent workdir. The agent uses
+Each agent needs a unique stable ID, a persistent workdir, and a persistent
+`data_dir` for artifacts. Set `RAYFLOW_AGENT_DATA_DIR` to override the latter.
+The agent uses
 Docker's standard environment variables, including `DOCKER_HOST`, when a
 non-default Docker endpoint is required.
 
@@ -576,12 +579,32 @@ an exclusive OS lock while a job is being coordinated. On startup, `Agentic`
 discovers existing directories, reconnects to containers by UUID, and retries
 unreported results. Keep this directory across agent restarts.
 
+## Agent inputs and outputs
+
+`FileFs` stores bytes separately from `JobFs` under
+`<data_dir>/<graph_run_uuid>/<node_id>/<revision>/`, with `inputs/`, `outputs/`,
+and internal transfer checkpoints. The graph run UUID isolates executions of
+the same graph. Job completion retains this data for downstream work; remove
+completed run directories when they are no longer needed.
+
+Declare outputs on the producer node and bind downstream inputs with
+`source: "producer.output_name"`. In containers, read from
+`$RAYFLOW_INPUT_DIR/<input.file_name>` and write to
+`$RAYFLOW_OUTPUT_DIR/<output.file_name>` (respectively `/data/inputs` and
+`/data/outputs`). Directory outputs include an internal `.rayflow-directory.json`
+manifest. The agent downloads inputs before execution and uploads outputs before
+reporting success, with durable checkpoints for retries.
+
+Configure the server's S3-compatible storage before running nodes with artifacts.
+See [Catalog and object storage](catalog.md#http-api-and-agent-transfers) for
+configuration, endpoints, key format, directory manifests, and local retention.
+
 ## Database changes
 
 For a new database, apply `rayflow.sql` directly. Existing deployments must be
 migrated before restarting binaries when schema changes are introduced. The
 current schema includes versioned graph rows, editable graph drafts,
-`run_config.version`, pinned node configuration, resource requirements, agent
+`run.version` and `run.revision`, pinned node configuration, resource requirements, agent
 claims, persisted job expiry, and `agent_instance` observations. Create the
 `agent_instance` table using its definition in `rayflow.sql` before running the
 updated server; polling now writes this table. No existing rows need backfilling.
@@ -589,3 +612,31 @@ updated server; polling now writes this table. No existing rows need backfilling
 If a migration is needed, inspect the current `rayflow.sql` and apply an
 equivalent `ALTER TABLE` using a backup and a maintenance window. Do not assume
 that an old table name or status value is compatible with the current models.
+
+Migration 9 removes `version` and `revision` from `run_config`, including its
+revision uniqueness index. Run annotation rows and job references are preserved.
+Apply it with `./init-db.sh` before using the updated binaries. New jobs use the
+newest annotation snapshot for their run; execution version and revision remain
+on `run`.
+
+Migration 10 adds the catalog `uploaded` acknowledgement, initially false for
+both new and existing records. Job upload commit sets it true; job downloads
+require it. See [upload acknowledgement](catalog.md#metadata-operations) for
+handling previously stored objects.
+
+Migration 11 changes catalog URLs to `VARCHAR(750)` and adds the unique
+`(url, deleted_at)` key. Before upgrading, resolve any URLs longer than 750
+characters or duplicate URL/deletion pairs while preserving catalog UUIDs and
+file references. The migration does not merge or delete records. Upload prepare
+now creates or reuses the catalog by URL; only commit requires the returned
+catalog UUID. Deploy matching server and agent binaries.
+
+Migrations 12 and 13 remove `deleted_at` from catalog and file metadata. URLs and
+full names become unique across all rows. Resolve historical duplicates before
+upgrading. Rows are preserved, and retained historical rows become readable.
+
+Migrations 14–16 align the authentication tables with the SQL conventions and
+add auto-incrementing numeric primary IDs. The former `auth_user.id` becomes
+unique `user_id`, preserving existing sessions and audit identities. Token and
+state hashes retain unique keys. Apply migrations before deploying matching
+server binaries.
