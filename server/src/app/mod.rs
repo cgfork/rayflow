@@ -1,4 +1,5 @@
 mod agent;
+mod catalog;
 mod graph_draft;
 #[path = "graph.rs"]
 mod graph_read;
@@ -102,6 +103,18 @@ impl<S> App<S> {
 /// Error returned by an app operation.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("object storage is not configured")]
+    StorageUnavailable,
+    #[error("artifact not found: {0}")]
+    ArtifactNotFound(String),
+    #[error(transparent)]
+    Catalog(#[from] ::catalog::Error),
+    #[error(transparent)]
+    Storage(#[from] ::catalog::s3::Error<::catalog::Error>),
+    #[error(transparent)]
+    StorageConfiguration(#[from] crate::storage::Error),
+    #[error(transparent)]
+    ArtifactPath(#[from] ::catalog::artifact::PathError),
     #[error("{0}")]
     InvalidRequest(String),
     #[error("run not found: {0}")]
@@ -135,7 +148,7 @@ pub enum AppError {
     GraphDraftNotFound(Uuid),
     /// The draft cannot be published because it is not a valid graph.
     #[error("invalid graph: {0}")]
-    InvalidGraph(String),
+    InvalidGraph(#[source] graph::validator::WorkflowValidationError),
     /// The graph store returned an error.
     #[error("graph: {0}")]
     Graph(Box<dyn std::error::Error + Send + Sync>),
@@ -173,7 +186,7 @@ impl From<graph::store::Error> for AppError {
     fn from(error: graph::store::Error) -> Self {
         match error {
             graph::store::Error::DraftNotFound(graph_id) => Self::GraphDraftNotFound(graph_id),
-            graph::store::Error::InvalidDraft(message) => Self::InvalidGraph(message),
+            graph::store::Error::InvalidDraft(error) => Self::InvalidGraph(error),
             error => Self::Graph(Box::new(error)),
         }
     }
@@ -182,6 +195,18 @@ impl From<graph::store::Error> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match self {
+            AppError::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::Catalog(ref error) => match error {
+                ::catalog::Error::InvalidUrl
+                | ::catalog::Error::InvalidField(_)
+                | ::catalog::Error::MissingField(_) => StatusCode::BAD_REQUEST,
+                ::catalog::Error::CatalogNotFound(_) | ::catalog::Error::FileNotFound(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                ::catalog::Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            },
+            AppError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::RunIdNotFound(_)
             | AppError::RunNotFound { .. }
             | AppError::NodeRunNotFound(_)
@@ -190,6 +215,8 @@ impl IntoResponse for AppError {
             | AppError::NodeNotFound(_)
             | AppError::GraphDraftNotFound(_) => StatusCode::NOT_FOUND,
             AppError::InvalidRequest(_)
+            | AppError::StorageConfiguration(_)
+            | AppError::ArtifactPath(_)
             | AppError::GraphIdMismatch { .. }
             | AppError::InvalidGraph(_) => StatusCode::BAD_REQUEST,
             AppError::JobConflict(_) => StatusCode::CONFLICT,
@@ -285,6 +312,40 @@ pub(crate) mod test {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_validation_retains_context_and_bad_request_status() {
+        use std::error::Error;
+
+        let cause = graph::validator::WorkflowValidationError::InvalidResources {
+            node: "build".into(),
+        };
+        let error = AppError::from(graph::store::Error::InvalidDraft(cause.clone()));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<graph::validator::WorkflowValidationError>(),
+            Some(&cause)
+        );
+        assert_eq!(
+            error.to_string(),
+            "invalid graph: build: CPU cores and memory must be positive"
+        );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn storage_validation_preserves_bad_request_status() {
+        let error = AppError::from(crate::storage::Error::InvalidBucket);
+        assert_eq!(
+            error.to_string(),
+            "storage.bucket must be an S3 bucket name"
+        );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        let error = AppError::from(::catalog::artifact::PathError);
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn run_not_found_maps_to_404() {

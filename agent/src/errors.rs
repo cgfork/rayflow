@@ -2,6 +2,8 @@ use std::io;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("artifact: {0}")]
+    Artifact(String),
     #[error(transparent)]
     Config(#[from] config::ConfigError),
     #[error(transparent)]

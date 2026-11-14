@@ -79,12 +79,15 @@ fn configuration_requires_secure_provider_connections_and_valid_secrets() {
     };
     assert!(config.validate().is_ok());
     config.public_url = "http://rayflow.example.com".into();
-    assert!(config.validate().is_err());
+    assert!(matches!(config.validate(), Err(AuthConfigError::UnsafeUrl)));
     config.public_url = "https://rayflow.example.com".into();
     config.oidc.as_mut().unwrap().issuer_url = "http://login.example.com".into();
-    assert!(config.validate().is_err());
+    assert!(matches!(config.validate(), Err(AuthConfigError::UnsafeUrl)));
     config.oidc = None;
-    assert!(config.validate().is_err());
+    assert!(matches!(
+        config.validate(),
+        Err(AuthConfigError::MissingProvider)
+    ));
     config.ldap = Some(LdapConfig {
         url: "ldap://directory.example.com".into(),
         bind_dn: "cn=rayflow,dc=example,dc=com".into(),
@@ -96,8 +99,37 @@ fn configuration_requires_secure_provider_connections_and_valid_secrets() {
     });
     assert!(config.validate().is_ok());
     config.ldap.as_mut().unwrap().user_filter = "(uid=*)".into();
-    assert!(config.validate().is_err());
+    assert!(matches!(
+        config.validate(),
+        Err(AuthConfigError::InvalidLdapConfiguration)
+    ));
     assert!(!format!("{config:?}").contains("secret"));
+}
+
+#[test]
+fn configuration_errors_retain_url_parse_causes_and_service_status() {
+    use std::error::Error;
+
+    let config = AuthConfig {
+        enabled: true,
+        public_url: "invalid-url".into(),
+        ..AuthConfig::default()
+    };
+    let error = AuthError::from(config.validate().unwrap_err());
+    let cause = error.source().unwrap();
+    assert!(matches!(
+        cause.downcast_ref::<AuthConfigError>(),
+        Some(AuthConfigError::InvalidUrl(_))
+    ));
+    assert!(cause.source().unwrap().is::<url::ParseError>());
+    assert_eq!(
+        error.to_string(),
+        "invalid authentication configuration: invalid authentication URL"
+    );
+    assert_eq!(
+        error.into_response().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]
@@ -195,4 +227,32 @@ async fn attempts_are_bounded_and_custom_providers_do_not_skip_configuration_val
             .await
             .is_err()
     );
+}
+#[test]
+fn fleet_catalog_routes_are_limited_to_transfer_operations() {
+    let run_path = format!("/runs/{}", uuid::Uuid::new_v4());
+    assert!(super::agent_route(&axum::http::Method::GET, &run_path));
+    assert!(!super::agent_route(&axum::http::Method::POST, &run_path));
+    assert!(!super::agent_route(&axum::http::Method::GET, "/runs"));
+    for action in ["prepare", "commit", "download"] {
+        assert!(super::agent_route(
+            &axum::http::Method::POST,
+            &format!("/catalog/{action}")
+        ));
+        assert!(!super::agent_route(
+            &axum::http::Method::GET,
+            &format!("/catalog/{action}")
+        ));
+    }
+    for path in [
+        "/catalog",
+        "/files",
+        "/catalog/complete",
+        "/catalog/remove",
+        "/jobs/not-a-uuid/artifacts/prepare",
+        "/jobs/00000000-0000-0000-0000-000000000000/artifacts/complete",
+        "/jobs/00000000-0000-0000-0000-000000000000/artifacts/remove",
+    ] {
+        assert!(!super::agent_route(&axum::http::Method::POST, path));
+    }
 }

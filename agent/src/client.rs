@@ -25,7 +25,101 @@ pub struct PollResponse {
     pub jobs: Vec<Job>,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct RunView {
+    pub state: RunState,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RunState {
+    pub uuid: Uuid,
+    pub nodes: Vec<NodeState>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NodeState {
+    pub node_id: Uuid,
+    pub version: u64,
+    pub revision: u64,
+    pub status: String,
+    pub ineffective: u32,
+}
+
 impl Client {
+    pub(crate) async fn run_state(&self, run_id: Uuid, revision: u64) -> Result<RunState, Error> {
+        let view: RunView = self
+            .http
+            .get(format!("{}/runs/{run_id}", self.server_url))
+            .query(&[("revision", revision)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if view.state.uuid != run_id {
+            return Err(Error::Artifact("server returned a different run".into()));
+        }
+        Ok(view.state)
+    }
+    /// Upserts pending catalog metadata and returns it with the presigned PUT URL.
+    pub async fn prepare_upload(
+        &self,
+        request: &catalog::artifact::PrepareUploadRequest,
+    ) -> Result<catalog::artifact::Transfer, Error> {
+        Ok(self
+            .artifact_request(request.job_id, "prepare", request)
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// Acknowledges the PUT and publishes the file through one server transaction.
+    pub async fn commit_upload(
+        &self,
+        request: &catalog::artifact::CommitUploadRequest,
+    ) -> Result<(), Error> {
+        self.artifact_request(request.job_id, "commit", request)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn download_input(
+        &self,
+        request: &catalog::artifact::DownloadRequest,
+    ) -> Result<Option<catalog::artifact::Transfer>, Error> {
+        let response = self
+            .http
+            .post(format!("{}/catalog/download", self.server_url))
+            .json(request)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(Error::ClaimLost(request.job_id));
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.json().await?))
+    }
+
+    async fn artifact_request(
+        &self,
+        job_id: Uuid,
+        action: &str,
+        request: &impl Serialize,
+    ) -> Result<reqwest::Response, Error> {
+        let response = self
+            .http
+            .post(format!("{}/catalog/{action}", self.server_url))
+            .json(request)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(Error::ClaimLost(job_id));
+        }
+        Ok(response.error_for_status()?)
+    }
+
     pub fn new(settings: &Settings) -> Result<Self, Error> {
         if settings.request_timeout.is_zero() {
             return Err(Error::Settings("request timeout must be positive"));

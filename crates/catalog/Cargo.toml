@@ -1,0 +1,24 @@
+[package]
+name = "catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+s3 = ["dep:aws-credential-types", "dep:aws-sigv4", "dep:http"]
+
+[dependencies]
+aws-credential-types = { version = "1", optional = true }
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"], optional = true }
+http = { version = "1", optional = true }
+percent-encoding = "2"
+jiff = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toasty = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

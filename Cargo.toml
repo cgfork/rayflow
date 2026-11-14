@@ -8,6 +8,7 @@ members = [
     "crates/runtime",
     "crates/scheduler",
     "crates/coordinator",
+    "crates/catalog",
 ]
 resolver = "2"
 
@@ -22,6 +23,7 @@ graph = {path = "crates/graph"}
 runtime = {path = "crates/runtime"}
 scheduler = {path = "crates/scheduler"}
 coordinator = {path = "crates/coordinator", default-features = false}
+catalog = {path = "crates/catalog"}
 axum = "0.8"
 fastrand = "2"
 futures-util = "0.3"

@@ -76,7 +76,7 @@ pub enum Error {
     #[error("graph draft JSON does not match row metadata: {0}")]
     DraftMetadataMismatch(Uuid),
     #[error("invalid graph draft: {0}")]
-    InvalidDraft(String),
+    InvalidDraft(#[source] validator::WorkflowValidationError),
     #[error("graph version overflow: {0}")]
     VersionOverflow(Uuid),
 }

@@ -6,6 +6,33 @@ those pieces into processes.
 
 ## Library crates
 
+### `catalog`
+
+`catalog` defines `Catalog` and `File` metadata traits; `model::Catalog` and
+`model::File` are their owned Toasty records, linked by `catalog_uuid`.
+The traits expose core metadata; database IDs and all lifecycle timestamps live
+on the persistence models. Catalog URLs and file full names are unique;
+deletion removes metadata rows directly.
+`CatalogSystem` owns `CatalogId<'a>`, `CatalogData<'a>`, and `CatalogOptionalData<'a>`.
+`FileSystem: CatalogSystem` adds `FileId<'a>`, `FileData<'a>`, and `FileOptionalData<'a>`,
+sharing the catalog system's error type. Stores can use their own identities and return
+owned records or borrowed views. Upserts accept data, resolve URL/full-name
+conflicts, and return IDs. Reads include loading a
+file with its catalog by ID or full name.
+The optional-data GATs let stores choose owned or borrowed write inputs. MySQL
+uses concrete `CatalogOptionalData` and `FileOptionalData<Uuid>` structs:
+omitted fields are preserved, URL/full name selects the row for upserts, and new
+rows require their other metadata. `update_catalog(id, data)` and
+`update_file(id, data)` apply partial data to existing identities without requiring
+URL/full name. Both stores use Toasty selects, updates, and inserts.
+The MySQL implementations use Toasty databases and transactions. `ObjectStorage`
+extends `FileSystem` with a provider signing contract for upload and download URLs.
+The optional `s3` feature provides `s3::S3<S>`, which delegates
+metadata to an existing filesystem and signs S3 PUT/GET URLs with AWS SigV4.
+Register `catalog::models()` and apply current migrations. See [Catalog and object
+storage](catalog.md) for deletion behavior, examples, and the adapter
+contract.
+
 ### `graph`
 
 The graph crate is the backend-independent graph model. It contains:
@@ -86,8 +113,10 @@ The scheduler crate connects logical tasks to executable jobs:
   schedulers.
 - `AgentScheduler` and `AgentRef` implement resource-aware polling and guarded
   job claims.
-- `RunConfig` and `NodeConfig` pin run and node configuration to jobs. The publish
-  API snapshots `Node.settings` into `NodeConfig` at the published graph version.
+- `RunConfig` holds annotation snapshots; jobs select the newest ID for their
+  run and retain that reference. Execution version and revision live on `Run`.
+  `NodeConfig` pins node configuration to jobs. The publish API snapshots
+  `Node.settings` into `NodeConfig` at the published graph version.
 
 The default `AgentScheduler` handles timeout recovery while agents claim jobs
 through the server API. External scheduler adapters must make submissions
@@ -107,7 +136,7 @@ drafts come from the database. The server library remains graph-store agnostic,
 so another `GraphStore` can be injected by an application.
 
 HTTP handlers and application operations are grouped by resource: `graph`,
-`graph_draft`, `run`/`state`, `job`, and `agent`. Collection operations share
+`graph_draft`, `run`/`state`, `job`, `agent`, and `catalog`. Collection operations share
 `app::pagination::{PageQuery, Page}`. Graph endpoints use `GraphStore` and
 `DraftGraphStore` and return complete DAGs without exposing persistence records.
 Draft writes/publishing, run commands, and job actions reuse their existing
@@ -129,14 +158,22 @@ calling the builder's `models()` repeatedly replaces the previous registration.
 
 ### `agent`
 
-The agent is the execution process. `Agentic` combines an execution `Agent`, an
+The agent is the execution process. `Agentic` combines an execution `Agentd`, an
 HTTP `Client`, and `Settings` to poll for jobs, run containers, persist job
 results, and report terminal task events. The current default execution
 provider is Docker through Bollard.
 
 `JobFs` gives each job a durable directory under the configured workdir. The
 filesystem and UUID-based container names allow an agent to recover jobs after
-restart.
+restart. `Filed` resolves artifact keys and producer versions, downloads declared
+inputs, and publishes outputs using `/catalog/prepare`, `/catalog/commit`, and
+`/catalog/download`. Each request supplies job/agent IDs, the key, and metadata
+in JSON. The server stores metadata and signs URLs within the claimed run.
+Transfers finish before execution and success reporting respectively. Its separate
+`FileFs` stores bytes under `data_dir/<run_uuid>/<node_id>/<revision>/`, retaining
+producer outputs after job acknowledgement. Docker mounts `inputs/` read-only
+and `outputs/` writable. Directory outputs use an internal JSON manifest. See
+[Catalog](catalog.md#http-api-and-agent-transfers) for configuration and protocol.
 
 ## Web UI
 

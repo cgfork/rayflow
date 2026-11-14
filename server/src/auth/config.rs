@@ -5,6 +5,40 @@ use argon2::PasswordHash;
 use serde::Deserialize;
 use url::Url;
 
+#[derive(Debug, thiserror::Error)]
+pub enum AuthConfigError {
+    #[error("invalid authentication URL")]
+    InvalidUrl(#[source] url::ParseError),
+    #[error(
+        "authentication URLs require HTTPS (HTTP is allowed only on loopback) and no credentials, query, or fragment"
+    )]
+    UnsafeUrl,
+    #[error("auth.public_url must be an origin without a path")]
+    PublicUrlPath,
+    #[error("auth.session_ttl must be between 1 minute and 7 days")]
+    InvalidSessionTtl,
+    #[error("authentication requires at least one login provider")]
+    MissingProvider,
+    #[error("local usernames must be unique and contain 1–128 bytes")]
+    InvalidLocalUsername,
+    #[error("invalid local password hash")]
+    InvalidPasswordHash(argon2::password_hash::Error),
+    #[error("local passwords require salted Argon2id PHC hashes")]
+    UnsupportedPasswordHash,
+    #[error("OIDC client_id and client_secret are required")]
+    MissingOidcCredentials,
+    #[error("invalid LDAP URL")]
+    InvalidLdapUrl(#[source] url::ParseError),
+    #[error(
+        "LDAP requires an ldap(s) host URL, search bind credentials, base_dn, attributes, and a filter with one {{username}}"
+    )]
+    InvalidLdapConfiguration,
+    #[error("auth.agent_token must contain at least 32 printable ASCII characters")]
+    InvalidAgentToken,
+    #[error("password provider IDs must be unique and cannot be oidc")]
+    InvalidPasswordProviderIds,
+}
+
 /// Authentication for one company/workspace. Secrets are omitted from Debug output.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -86,8 +120,8 @@ fn default_email_attribute() -> String {
 }
 
 /// HTTPS is required except for loopback development; never infer it from request headers.
-pub(super) fn web_url(value: &str) -> Result<Url, String> {
-    let url = Url::parse(value).map_err(|_| "invalid authentication URL")?;
+pub(super) fn web_url(value: &str) -> Result<Url, AuthConfigError> {
+    let url = Url::parse(value).map_err(AuthConfigError::InvalidUrl)?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if (url.scheme() != "https" && !(url.scheme() == "http" && local))
         || url.host_str().is_none()
@@ -96,32 +130,35 @@ pub(super) fn web_url(value: &str) -> Result<Url, String> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err("authentication URLs require HTTPS (HTTP is allowed only on loopback) and no credentials, query, or fragment".into());
+        return Err(AuthConfigError::UnsafeUrl);
     }
     Ok(url)
 }
 
 impl AuthConfig {
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), AuthConfigError> {
         self.validate_with_providers(false)
     }
 
-    pub(super) fn validate_with_providers(&self, custom_providers: bool) -> Result<(), String> {
+    pub(super) fn validate_with_providers(
+        &self,
+        custom_providers: bool,
+    ) -> Result<(), AuthConfigError> {
         if !self.enabled {
             return Ok(());
         }
         if web_url(&self.public_url)?.path() != "/" {
-            return Err("auth.public_url must be an origin without a path".into());
+            return Err(AuthConfigError::PublicUrlPath);
         }
         if !(Duration::from_secs(60)..=Duration::from_secs(7 * 86400)).contains(&self.session_ttl) {
-            return Err("auth.session_ttl must be between 1 minute and 7 days".into());
+            return Err(AuthConfigError::InvalidSessionTtl);
         }
         if !custom_providers
             && self.local_users.is_empty()
             && self.oidc.is_none()
             && self.ldap.is_none()
         {
-            return Err("authentication requires at least one login provider".into());
+            return Err(AuthConfigError::MissingProvider);
         }
         let mut names = HashSet::new();
         for user in &self.local_users {
@@ -129,22 +166,22 @@ impl AuthConfig {
                 || user.username.len() > 128
                 || !names.insert(&user.username)
             {
-                return Err("local usernames must be unique and contain 1–128 bytes".into());
+                return Err(AuthConfigError::InvalidLocalUsername);
             }
             let hash = PasswordHash::new(&user.password_hash)
-                .map_err(|_| "invalid local password hash")?;
+                .map_err(AuthConfigError::InvalidPasswordHash)?;
             if hash.algorithm.as_str() != "argon2id" || hash.hash.is_none() || hash.salt.is_none() {
-                return Err("local passwords require salted Argon2id PHC hashes".into());
+                return Err(AuthConfigError::UnsupportedPasswordHash);
             }
         }
         if let Some(oidc) = &self.oidc {
             web_url(&oidc.issuer_url)?;
             if oidc.client_id.is_empty() || oidc.client_secret.is_empty() {
-                return Err("OIDC client_id and client_secret are required".into());
+                return Err(AuthConfigError::MissingOidcCredentials);
             }
         }
         if let Some(ldap) = &self.ldap {
-            let url = Url::parse(&ldap.url).map_err(|_| "invalid LDAP URL")?;
+            let url = Url::parse(&ldap.url).map_err(AuthConfigError::InvalidLdapUrl)?;
             if !matches!(url.scheme(), "ldap" | "ldaps")
                 || url.host_str().is_none()
                 || !url.username().is_empty()
@@ -159,7 +196,7 @@ impl AuthConfig {
                 || ldap.name_attribute.is_empty()
                 || ldap.email_attribute.is_empty()
             {
-                return Err("LDAP requires an ldap(s) host URL, search bind credentials, base_dn, attributes, and a filter with one {username}".into());
+                return Err(AuthConfigError::InvalidLdapConfiguration);
             }
         }
         if self
@@ -167,9 +204,7 @@ impl AuthConfig {
             .as_ref()
             .is_some_and(|s| s.len() < 32 || !s.bytes().all(|b| b.is_ascii_graphic()))
         {
-            return Err(
-                "auth.agent_token must contain at least 32 printable ASCII characters".into(),
-            );
+            return Err(AuthConfigError::InvalidAgentToken);
         }
         Ok(())
     }

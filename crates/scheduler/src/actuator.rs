@@ -202,18 +202,16 @@ pub fn models() -> toasty::ModelSet {
     )
 }
 
-/// A run's annotation configuration at a given revision.
+/// A run's annotation snapshot, referenced by jobs through its ID.
+/// Execution version and revision belong to `Run`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, toasty::Model)]
 #[table = "run_config"]
-#[unique(run_id, revision)]
 pub struct RunConfig {
     #[key]
     #[auto]
     pub id: u64,
     #[index]
     pub run_id: Uuid,
-    pub version: u64,
-    pub revision: u64,
     #[column(type = json)]
     pub annotation: Json<HashMap<String, String>>,
     pub created_at: Timestamp,
@@ -391,8 +389,7 @@ impl Job {
         node_config.job_lease()?;
         let node_config_id = node_config.id;
         let run_config_id = RunConfig::filter_by_run_id(run.uuid)
-            .filter(RunConfig::fields().revision().le(run.revision))
-            .order_by(RunConfig::fields().revision().desc())
+            .order_by(RunConfig::fields().id().desc())
             .first()
             .exec(&mut *backend)
             .await?

@@ -86,39 +86,67 @@ pub fn validate<G: Graph>(graph: &G) -> Result<(), ValidationError<G::NodeId>> {
     Ok(())
 }
 
+/// A structural, configuration, or input binding error in a runnable workflow.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WorkflowValidationError {
+    #[error(transparent)]
+    Structure(#[from] ValidationError<Uuid>),
+    #[error("graph name must not be empty")]
+    EmptyGraphName,
+    #[error("node IDs and names must be unique and names must not be empty")]
+    InvalidNodeIdentity,
+    #[error("{node}: task type and a JSON configuration object are required")]
+    InvalidTaskConfig { node: String },
+    #[error("{node}: CPU cores and memory must be positive")]
+    InvalidResources { node: String },
+    #[error("{node}: memory exceeds the supported limit")]
+    MemoryLimit { node: String },
+    #[error("{node}: timeout must be positive whole milliseconds within timestamp range")]
+    InvalidTimeout { node: String },
+    #[error("{node}: Docker image is required")]
+    MissingDockerImage { node: String },
+    #[error("{node}: Docker {field} must be an array of strings")]
+    InvalidDockerArray { node: String, field: &'static str },
+    #[error("{node}: Docker working_dir must be a string")]
+    InvalidDockerWorkingDir { node: String },
+    #[error("{node}: {port} file names must be nonempty and unique")]
+    InvalidFileNames { node: String, port: &'static str },
+    #[error("{node}: input {input} must select an upstream output")]
+    InvalidInputSource { node: String, input: String },
+}
+
 /// Validates runnable settings and input bindings before publishing a DAG.
-pub fn validate_workflow(graph: &DAG) -> Result<(), String> {
-    validate(graph).map_err(|error| error.to_string())?;
+pub fn validate_workflow(graph: &DAG) -> Result<(), WorkflowValidationError> {
+    validate(graph)?;
     let mut ids = HashSet::new();
     let mut names = HashSet::new();
     if graph.name.trim().is_empty() {
-        return Err("graph name must not be empty".into());
+        return Err(WorkflowValidationError::EmptyGraphName);
     }
     for node in &graph.nodes {
         if !ids.insert(node.id) || node.name.trim().is_empty() || !names.insert(&node.name) {
-            return Err("node IDs and names must be unique and names must not be empty".into());
+            return Err(WorkflowValidationError::InvalidNodeIdentity);
         }
         let settings = &node.settings;
         if node.node_type.trim().is_empty() || !settings.config.is_object() {
-            return Err(format!(
-                "{}: task type and a JSON configuration object are required",
-                node.name
-            ));
+            return Err(WorkflowValidationError::InvalidTaskConfig {
+                node: node.name.clone(),
+            });
         }
         if settings.resource.cpu_cores == 0 || settings.resource.memory_bytes == 0 {
-            return Err(format!(
-                "{}: CPU cores and memory must be positive",
-                node.name
-            ));
+            return Err(WorkflowValidationError::InvalidResources {
+                node: node.name.clone(),
+            });
         }
         if settings.resource.memory_bytes > i64::MAX as u64 {
-            return Err(format!("{}: memory exceeds the supported limit", node.name));
+            return Err(WorkflowValidationError::MemoryLimit {
+                node: node.name.clone(),
+            });
         }
         if settings.timeout_ms().is_none() {
-            return Err(format!(
-                "{}: timeout must be positive whole milliseconds within timestamp range",
-                node.name
-            ));
+            return Err(WorkflowValidationError::InvalidTimeout {
+                node: node.name.clone(),
+            });
         }
         if node.node_type == "docker" {
             if !settings
@@ -127,7 +155,9 @@ pub fn validate_workflow(graph: &DAG) -> Result<(), String> {
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|image| !image.trim().is_empty())
             {
-                return Err(format!("{}: Docker image is required", node.name));
+                return Err(WorkflowValidationError::MissingDockerImage {
+                    node: node.name.clone(),
+                });
             }
             for field in ["command", "env"] {
                 if settings.config.get(field).is_some_and(|value| {
@@ -135,10 +165,10 @@ pub fn validate_workflow(graph: &DAG) -> Result<(), String> {
                         .as_array()
                         .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
                 }) {
-                    return Err(format!(
-                        "{}: Docker {field} must be an array of strings",
-                        node.name
-                    ));
+                    return Err(WorkflowValidationError::InvalidDockerArray {
+                        node: node.name.clone(),
+                        field,
+                    });
                 }
             }
             if settings
@@ -146,10 +176,9 @@ pub fn validate_workflow(graph: &DAG) -> Result<(), String> {
                 .get("working_dir")
                 .is_some_and(|value| !value.is_string())
             {
-                return Err(format!(
-                    "{}: Docker working_dir must be a string",
-                    node.name
-                ));
+                return Err(WorkflowValidationError::InvalidDockerWorkingDir {
+                    node: node.name.clone(),
+                });
             }
         }
         for (label, ports) in [
@@ -173,10 +202,10 @@ pub fn validate_workflow(graph: &DAG) -> Result<(), String> {
                 .iter()
                 .any(|file| file.trim().is_empty() || !files.insert(file))
             {
-                return Err(format!(
-                    "{}: {label} file names must be nonempty and unique",
-                    node.name
-                ));
+                return Err(WorkflowValidationError::InvalidFileNames {
+                    node: node.name.clone(),
+                    port: label,
+                });
             }
         }
         let mut upstream = HashSet::new();
@@ -199,10 +228,10 @@ pub fn validate_workflow(graph: &DAG) -> Result<(), String> {
                 })
                 .collect();
             if producers.len() != 1 || !upstream.contains(&producers[0].id) {
-                return Err(format!(
-                    "{}: input {} must select an upstream output",
-                    node.name, input.file_name
-                ));
+                return Err(WorkflowValidationError::InvalidInputSource {
+                    node: node.name.clone(),
+                    input: input.file_name.clone(),
+                });
             }
         }
     }
