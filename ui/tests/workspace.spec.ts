@@ -25,10 +25,10 @@ async function backend(page: BrowserPage, options: { empty?: boolean; historical
   const calls: { path: string; method: string; body: unknown }[] = [];
   const failures = new Map<string, number>();
   await page.route('https://fonts.googleapis.com/**', (route) => route.abort());
-  await page.route('**/api/**', async (route) => {
+  await page.route('**/api/v1/**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
-    const path = url.pathname.replace('/api', '');
+    const path = url.pathname.replace('/api/v1', '');
     const method = request.method();
     const body = request.postDataJSON() as Record<string, unknown> | null;
     calls.push({ path, method, body });
@@ -248,7 +248,7 @@ test('retries shared-node lookup failures before allowing an upgrade', async ({ 
 
 test('pages through upgrade versions without submitting a selected command', async ({ page }) => {
   const { calls } = await backend(page);
-  await page.route('**/api/graphs?**', async (route) => {
+  await page.route('**/api/v1/graphs?**', async (route) => {
     const url = new URL(route.request().url());
     expect(url.searchParams.get('graph_id')).toBe(graphId);
     const older = url.searchParams.get('before') === '50';

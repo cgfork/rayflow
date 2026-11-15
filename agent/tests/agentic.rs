@@ -213,7 +213,7 @@ async fn polled_job_persists_node_starts_and_reports() {
     let polled_job = job.clone();
     let router = Router::new()
         .route(
-            "/jobs/poll",
+            "/api/v1/jobs/poll",
             post({
                 let requests = requests.clone();
                 move |Json(body): Json<Value>| {
@@ -232,7 +232,7 @@ async fn polled_job_persists_node_starts_and_reports() {
             }),
         )
         .route(
-            "/job/succeed",
+            "/api/v1/job/succeed",
             post(move |Json(body): Json<Value>| {
                 let requests = requests.clone();
                 async move {
@@ -349,8 +349,8 @@ async fn recovered_result_is_retried_and_acknowledged() {
         ..Default::default()
     };
     let router = Router::new()
-        .route("/graphs/{id}", axum::routing::get(move || { let graph = graph.clone(); async move { Json(graph) } }))
-        .route("/catalog/prepare", post(move |Json(body): Json<Value>| {
+        .route("/api/v1/graphs/{id}", axum::routing::get(move || { let graph = graph.clone(); async move { Json(graph) } }))
+        .route("/api/v1/catalog/prepare", post(move |Json(body): Json<Value>| {
             let object_url = object_url.clone();
             async move {
                 assert!(body.get("catalog_uuid").is_none());
@@ -369,7 +369,7 @@ async fn recovered_result_is_retried_and_acknowledged() {
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }
             }
         }))
-        .route("/catalog/commit", post(move |Json(body): Json<Value>| {
+        .route("/api/v1/catalog/commit", post(move |Json(body): Json<Value>| {
             let requests = commit_requests.clone();
             async move {
                 assert_eq!(body["catalog_uuid"], catalog_uuid.to_string());
@@ -378,7 +378,7 @@ async fn recovered_result_is_retried_and_acknowledged() {
             }
         }))
         .route(
-            "/jobs/poll",
+            "/api/v1/jobs/poll",
             post({
                 let requests = requests.clone();
                 move |Json(body): Json<Value>| {
@@ -391,7 +391,7 @@ async fn recovered_result_is_retried_and_acknowledged() {
             }),
         )
         .route(
-            "/job/succeed",
+            "/api/v1/job/succeed",
             post(move |Json(body): Json<Value>| {
                 let requests = requests.clone();
                 let attempts = attempts.clone();

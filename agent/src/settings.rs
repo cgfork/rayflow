@@ -15,6 +15,7 @@ use crate::errors::Error;
 #[derive(Clone, Deserialize)]
 pub struct Settings {
     pub id: Uuid,
+    /// Server base URL; the client appends `/api/v1` to API requests.
     pub server_url: String,
     /// Fleet credential when server authentication is enabled.
     #[serde(default)]

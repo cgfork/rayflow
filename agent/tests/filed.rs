@@ -169,14 +169,14 @@ impl Fixture {
             data: Default::default(),
         };
         let router = Router::new()
-            .route("/catalog/prepare", post(prepare))
-            .route("/catalog/commit", post(commit))
-            .route("/catalog/download", post(download))
-            .route("/graphs/{id}", get(|State(api): State<Api>, Query(query): Query<HashMap<String, String>>| async move {
+            .route("/api/v1/catalog/prepare", post(prepare))
+            .route("/api/v1/catalog/commit", post(commit))
+            .route("/api/v1/catalog/download", post(download))
+            .route("/api/v1/graphs/{id}", get(|State(api): State<Api>, Query(query): Query<HashMap<String, String>>| async move {
                 let version: u64 = query["version"].parse().unwrap();
                 Json(api.data.lock().unwrap().graphs[&version].clone())
             }))
-            .route("/runs/{id}", get(|State(api): State<Api>, Path(id): Path<Uuid>, Query(query): Query<HashMap<String, String>>, headers: HeaderMap| async move {
+            .route("/api/v1/runs/{id}", get(|State(api): State<Api>, Path(id): Path<Uuid>, Query(query): Query<HashMap<String, String>>, headers: HeaderMap| async move {
                 fleet(&headers);
                 let revision: u64 = query["revision"].parse().unwrap();
                 let data = api.data.lock().unwrap();

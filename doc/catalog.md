@@ -280,7 +280,7 @@ signing dependencies.
 ## HTTP API and agent transfers
 
 The catalog HTTP API has three POST endpoints under
-`/catalog/prepare`, `/catalog/commit`, and `/catalog/download`. All request parameters
+`/api/v1/catalog/prepare`, `/api/v1/catalog/commit`, and `/api/v1/catalog/download`. All request parameters
 are in JSON bodies; these URLs have no path parameters.
 
 Configure storage on the **server**, using an existing S3-compatible bucket and
@@ -336,9 +336,9 @@ and filename, with no leading slash:
 
 | POST endpoint | Additional fields | Result |
 | --- | --- | --- |
-| `/catalog/prepare` | `size`, `format` | `{catalog, presigned}` for PUT; uploaded is false |
-| `/catalog/commit` | `catalog_uuid`, `size`, `format` | Published file; uploaded is true |
-| `/catalog/download` | None | `{catalog, presigned}` for GET |
+| `/api/v1/catalog/prepare` | `size`, `format` | `{catalog, presigned}` for PUT; uploaded is false |
+| `/api/v1/catalog/commit` | `catalog_uuid`, `size`, `format` | Published file; uploaded is true |
+| `/api/v1/catalog/download` | None | `{catalog, presigned}` for GET |
 
 The agent sends prepare, uploads the bytes using the returned URL and headers,
 then sends commit with the same key and metadata plus `catalog.uuid`. Prepare
@@ -355,7 +355,7 @@ have their own keys; the root directory uses a key ending in
 `.rayflow-directory.json`.
 
 For inputs, the agent resolves `source: "producer.output_name"` against its
-pinned graph. It reads `GET /runs/{run_id}?revision=<consumer_revision>` to find
+pinned graph. It reads `GET /api/v1/runs/{run_id}?revision=<consumer_revision>` to find
 the latest effective producer at or before the consumer revision, requires
 `Succeeded`, and uses the returned node's `version` to load the producer's
 original graph and names. This preserves input references after reruns and

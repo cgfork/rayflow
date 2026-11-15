@@ -851,7 +851,7 @@ async fn upgrade_accepts_the_root_and_indirect_ancestors_as_shared_nodes() {
         publish(&app, &changed).await;
         let response = server::router(app.clone())
             .oneshot(
-                Request::post("/runs/upgrade")
+                Request::post("/api/v1/runs/upgrade")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&json!({
                         "data_id": run.data_id, "graph_id": run.graph_id, "version": 2, "node": selected,
@@ -1035,7 +1035,7 @@ async fn shared_nodes_api_compares_exact_published_versions() {
         let response = server::router(app.clone())
             .oneshot(
                 Request::get(format!(
-                    "/graphs/{}/shared-nodes?from_version=1&version={version}",
+                    "/api/v1/graphs/{}/shared-nodes?from_version=1&version={version}",
                     previous.id
                 ))
                 .body(Body::empty())
@@ -1060,9 +1060,12 @@ async fn shared_nodes_api_compares_exact_published_versions() {
     ] {
         let response = server::router(app.clone())
             .oneshot(
-                Request::get(format!("/graphs/{}/shared-nodes?{query}", previous.id))
-                    .body(Body::empty())
-                    .unwrap(),
+                Request::get(format!(
+                    "/api/v1/graphs/{}/shared-nodes?{query}",
+                    previous.id
+                ))
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -1088,7 +1091,7 @@ async fn upgrade_api_emits_a_separate_command_and_preserves_the_run_identity() {
     ] {
         let response = server::router(app.clone())
             .oneshot(
-                Request::post("/runs/upgrade")
+                Request::post("/api/v1/runs/upgrade")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&invalid).unwrap()))
                     .unwrap(),
@@ -1100,7 +1103,7 @@ async fn upgrade_api_emits_a_separate_command_and_preserves_the_run_identity() {
     assert!(CommandEntry::all().exec(&mut db).await.unwrap().is_empty());
     let response = server::router(app.clone())
         .oneshot(
-            Request::post("/runs/upgrade")
+            Request::post("/api/v1/runs/upgrade")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(

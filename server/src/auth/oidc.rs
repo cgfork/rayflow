@@ -53,7 +53,7 @@ impl OidcProvider {
         )
         .set_redirect_uri(
             RedirectUrl::new(format!(
-                "{}/api/auth/oidc/callback",
+                "{}/api/v1/auth/oidc/callback",
                 config.public_url.trim_end_matches('/')
             ))
             .map_err(|_| AuthError::Unavailable)?,
@@ -184,7 +184,7 @@ mod tests {
         assert!(params["scope"].split(' ').any(|scope| scope == "openid"));
         assert_eq!(
             params["redirect_uri"],
-            "http://127.0.0.1:5173/api/auth/oidc/callback"
+            "http://127.0.0.1:5173/api/v1/auth/oidc/callback"
         );
         let now = jiff::Timestamp::now().as_second();
         let claims = json!({"iss": issuer, "aud": "rayflow-test", "sub": "alice-id", "name":"Alice",

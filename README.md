@@ -43,3 +43,52 @@ After configuring the database, start the local API, pilot, and web UI together:
 ```
 
 Use `./dev.sh --agent` to include a local Docker agent. Press Ctrl-C to stop.
+
+## Release binary with embedded UI
+
+Build the UI before enabling the server's optional `embed-ui` feature:
+
+```sh
+npm ci --prefix ui
+npm run build --prefix ui
+cargo build --release -p server --features embed-ui
+```
+
+The resulting `target/release/server` contains the UI assets and serves the
+console at `/`, with both browser and agent API requests under `/api/v1`.
+Node.js and `ui/dist` are not needed on the deployment host. Set `auth.public_url` in `rayflow.yaml` to
+the externally reachable server URL for authentication callbacks.
+
+Rebuild the UI and server after UI changes. Builds without `embed-ui` retain
+the API-only behavior and do not require UI assets or Node.js.
+
+## Docker images
+
+Build both images from the repository root:
+
+```sh
+docker build -f server/Dockerfile -t rayflow-server .
+docker build -f pilot/Dockerfile -t rayflow-pilot .
+```
+
+The server image includes the embedded UI and an `init-db` utility. The pilot
+image contains the consumer binary. Both run as UID/GID 10001 and read an
+optional `/app/rayflow.yaml`; configuration and credentials are not baked in.
+
+Initialize the database, then start the services with your configuration:
+
+```sh
+docker run --rm --entrypoint init-db \
+  -v "$PWD/rayflow.yaml:/app/rayflow.yaml:ro" rayflow-server
+docker run -d --name rayflow-server -p 8080:8080 \
+  -v "$PWD/rayflow.yaml:/app/rayflow.yaml:ro" rayflow-server
+docker run -d --name rayflow-pilot \
+  -v "$PWD/rayflow.yaml:/app/rayflow.yaml:ro" rayflow-pilot
+```
+
+Make the mounted configuration readable by UID 10001. Use database and storage
+addresses reachable from containers, and set `auth.public_url` to the browser's
+server URL. The API is served under `/api/v1`. Environment overrides such as
+`DATABASE_URL`, `RAYFLOW_STORAGE__ENDPOINT`, and `RAYFLOW_AUTH__PUBLIC_URL` also
+work with these images. The pilot receives SIGINT on `docker stop` for graceful
+shutdown.

@@ -27,11 +27,11 @@ auth:
 ```
 
 `public_url` is the browser-facing origin, without a path. Serve the console and
-proxy `/api/*` to the server on this origin, stripping `/api`. Register this
+proxy `/api/v1/*` to the server on this origin, preserving `/api/v1`. Register this
 exact callback URL in your company OIDC application:
 
 ```text
-https://rayflow.example.com/api/auth/oidc/callback
+https://rayflow.example.com/api/v1/auth/oidc/callback
 ```
 
 For local development use `http://127.0.0.1:5173` (or your UI port). HTTP is
@@ -152,12 +152,12 @@ Sign-out ends the Rayflow session, not the company identity provider's session.
 
 | Server endpoint | Behavior |
 | --- | --- |
-| `GET /auth/providers` | Public company name and login choices, without secrets |
-| `POST /auth/login` | JSON `provider` (`local`/`ldap`), `username`, `password` |
-| `GET /auth/oidc/login` | Redirect to company SSO |
-| `GET /auth/oidc/callback` | Consume state and complete SSO |
-| `GET /auth/me` | Current user, or HTTP 401 |
-| `POST /auth/logout` | Revoke the session and expire its cookie |
+| `GET /api/v1/auth/providers` | Public company name and login choices, without secrets |
+| `POST /api/v1/auth/login` | JSON `provider` (`local`/`ldap`), `username`, `password` |
+| `GET /api/v1/auth/oidc/login` | Redirect to company SSO |
+| `GET /api/v1/auth/oidc/callback` | Consume state and complete SSO |
+| `GET /api/v1/auth/me` | Current user, or HTTP 401 |
+| `POST /api/v1/auth/logout` | Revoke the session and expire its cookie |
 
 Cookie-authenticated writes, password login, and logout require
 `X-Rayflow-Request: 1`. If present, `Origin` must exactly match `public_url`.

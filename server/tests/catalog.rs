@@ -182,7 +182,7 @@ async fn request(f: &Fixture, method: &str, path: &str, body: Value) -> (StatusC
 
 async fn action(f: &Fixture, job: Uuid, action: &str, mut body: Value) -> (StatusCode, Value) {
     body["job_id"] = json!(job);
-    request(f, "POST", &format!("/catalog/{action}"), body).await
+    request(f, "POST", &format!("/api/v1/catalog/{action}"), body).await
 }
 
 #[tokio::test]
@@ -400,7 +400,7 @@ async fn run_inspection_exposes_producer_versions_at_the_requested_revision() {
     let (status, body) = request(
         &f,
         "GET",
-        &format!("/runs/{}?revision=3", f.run),
+        &format!("/api/v1/runs/{}?revision=3", f.run),
         Value::Null,
     )
     .await;
@@ -412,7 +412,7 @@ async fn run_inspection_exposes_producer_versions_at_the_requested_revision() {
     let (status, body) = request(
         &f,
         "GET",
-        &format!("/runs/{}?revision=5", f.run),
+        &format!("/api/v1/runs/{}?revision=5", f.run),
         Value::Null,
     )
     .await;
@@ -423,7 +423,7 @@ async fn run_inspection_exposes_producer_versions_at_the_requested_revision() {
         request(
             &f,
             "GET",
-            &format!("/runs/{}?revision=10", f.run),
+            &format!("/api/v1/runs/{}?revision=10", f.run),
             Value::Null
         )
         .await
@@ -442,7 +442,7 @@ async fn catalog_api_exposes_only_transfer_operations() {
             request(
                 &f,
                 "POST",
-                &format!("/catalog/{action}"),
+                &format!("/api/v1/catalog/{action}"),
                 json!({"agent_id":f.agent})
             )
             .await
@@ -450,7 +450,7 @@ async fn catalog_api_exposes_only_transfer_operations() {
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert_eq!(
-            request(&f, "GET", &format!("/catalog/{action}"), json!({}))
+            request(&f, "GET", &format!("/api/v1/catalog/{action}"), json!({}))
                 .await
                 .0,
             StatusCode::METHOD_NOT_ALLOWED
@@ -458,15 +458,15 @@ async fn catalog_api_exposes_only_transfer_operations() {
     }
     let id = Uuid::new_v4();
     for path in [
-        "/catalog".to_owned(),
-        format!("/catalog/{id}"),
+        "/api/v1/catalog".to_owned(),
+        format!("/api/v1/catalog/{id}"),
         "/files".to_owned(),
         "/files?fullpath=example".to_owned(),
         format!("/files/{id}"),
-        "/catalog/complete".into(),
-        format!("/jobs/{}/artifacts/prepare", f.producer.uuid),
-        format!("/jobs/{}/artifacts/commit", f.producer.uuid),
-        format!("/jobs/{}/artifacts/download", f.producer.uuid),
+        "/api/v1/catalog/complete".into(),
+        format!("/api/v1/jobs/{}/artifacts/prepare", f.producer.uuid),
+        format!("/api/v1/jobs/{}/artifacts/commit", f.producer.uuid),
+        format!("/api/v1/jobs/{}/artifacts/download", f.producer.uuid),
     ] {
         for method in ["GET", "POST", "PUT"] {
             assert_eq!(

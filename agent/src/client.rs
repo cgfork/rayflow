@@ -140,7 +140,7 @@ impl Client {
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(settings.request_timeout)
                 .build()?,
-            server_url: settings.server_url.trim_end_matches('/').to_owned(),
+            server_url: format!("{}/api/v1", settings.server_url.trim_end_matches('/')),
         })
     }
 

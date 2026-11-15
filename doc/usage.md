@@ -208,6 +208,7 @@ use compatible lease and poll settings.
 ### Agent
 
 The agent requires a stable, non-nil UUID. The other settings have defaults:
+`server_url` is the server base URL; the agent appends `/api/v1` automatically.
 
 ```yaml
 id: 12345678-1234-4234-8234-123456789abc
@@ -251,8 +252,8 @@ npm ci --prefix ui
 npm run dev --prefix ui
 ```
 
-Open `http://127.0.0.1:5173`. Vite forwards `/api/*` requests to
-`http://127.0.0.1:8080/*`. To use another API server:
+Open `http://127.0.0.1:5173`. Vite forwards `/api/v1/*` requests to
+`http://127.0.0.1:8080/api/v1/*`. To use another API server:
 
 ```sh
 RAYFLOW_API_URL=http://127.0.0.1:8081 npm run dev --prefix ui
@@ -331,8 +332,8 @@ and API behind your existing access controls.
 npm run build --prefix ui
 ```
 
-Serve `ui/dist/` at the site's root and proxy `/api/` to the Rayflow server,
-stripping the `/api` prefix. The Rust server does not serve the UI assets.
+Serve `ui/dist/` at the site's root and proxy `/api/v1/` to the Rayflow server,
+preserving the `/api/v1` prefix. Alternatively, build the server with `embed-ui` to serve the UI assets directly.
 `RAYFLOW_API_URL` configures only the Vite development proxy. For example, inside
 an nginx `server` block:
 
@@ -343,8 +344,8 @@ location / {
     try_files $uri $uri/ /index.html;
 }
 
-location /api/ {
-    proxy_pass http://127.0.0.1:8080/;
+location /api/v1/ {
+    proxy_pass http://127.0.0.1:8080;
     proxy_read_timeout 90s;
 }
 ```
@@ -381,39 +382,39 @@ The service endpoints are:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/` | Reports `rayflow`. |
-| `GET` | `/health` | Liveness probe; returns `ok`. |
-| `GET` | `/graphs` | List published graph versions; optional `graph_id` filter. |
-| `GET` | `/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
-| `GET` | `/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
-| `GET` | `/graph_drafts` | List editable DAGs. |
-| `GET` | `/runs` | List runs; optional `graph_id` filter. |
-| `GET` | `/runs/{run_id}` | Inspect the exact run UUID, its state, and its pinned graph. |
-| `POST` | `/runs/start` | Start a run; body has `data_id`, `graph_id`, and optional `nodes`. |
-| `POST` | `/runs/rerun` | Rerun one node; body has `data_id`, `graph_id`, and `node`. |
-| `POST` | `/runs/upgrade` | Upgrade an existing run; body has `data_id`, `graph_id`, the newer published `version`, and a `node` selected from the shared nodes. |
-| `POST` | `/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
-| `POST` | `/runs/dryrun` | Prepare targets while mocking predecessors; body has `data_id`, `graph_id`, and optional `nodes`. |
-| `GET` | `/runs/graph_state` | Read state with `data_id` and `graph_id` query parameters. |
-| `GET` | `/graphs/{graph_id}/draft` | Read the editable graph draft. |
-| `PUT` | `/graphs/{graph_id}/draft` | Create or replace the draft. |
-| `POST` | `/graphs/{graph_id}/publish` | Validate and publish the draft as the next graph version. |
-| `POST` | `/task_events` | Emit an event for an existing task; body has `task_id` and `event`. |
-| `GET` | `/jobs` | List jobs; optional `status`, `agent_id`, and `run_id` filters. |
-| `GET` | `/agents` | List agent instances; optional `online=true` or `online=false`. |
-| `POST` | `/jobs/poll` | Long-poll and claim jobs that fit an agent's resources. |
-| `POST` | `/job/cancel` | Cancel a claimed job. |
-| `POST` | `/job/yield` | Yield a claimed job and defer the node. |
-| `POST` | `/job/succeed` | Complete a claimed job successfully. |
-| `POST` | `/job/fail` | Report a claimed job failure. |
-| `POST` | `/job/terminate` | Terminate a claimed job. |
+| `GET` | `/` | Embedded UI, or `rayflow` without `embed-ui`. |
+| `GET` | `/health`, `/api/v1/health` | Liveness probe; returns `ok`. |
+| `GET` | `/api/v1/graphs` | List published graph versions; optional `graph_id` filter. |
+| `GET` | `/api/v1/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
+| `GET` | `/api/v1/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
+| `GET` | `/api/v1/graph_drafts` | List editable DAGs. |
+| `GET` | `/api/v1/runs` | List runs; optional `graph_id` filter. |
+| `GET` | `/api/v1/runs/{run_id}` | Inspect the exact run UUID, its state, and its pinned graph. |
+| `POST` | `/api/v1/runs/start` | Start a run; body has `data_id`, `graph_id`, and optional `nodes`. |
+| `POST` | `/api/v1/runs/rerun` | Rerun one node; body has `data_id`, `graph_id`, and `node`. |
+| `POST` | `/api/v1/runs/upgrade` | Upgrade an existing run; body has `data_id`, `graph_id`, the newer published `version`, and a `node` selected from the shared nodes. |
+| `POST` | `/api/v1/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
+| `POST` | `/api/v1/runs/dryrun` | Prepare targets while mocking predecessors; body has `data_id`, `graph_id`, and optional `nodes`. |
+| `GET` | `/api/v1/runs/graph_state` | Read state with `data_id` and `graph_id` query parameters. |
+| `GET` | `/api/v1/graphs/{graph_id}/draft` | Read the editable graph draft. |
+| `PUT` | `/api/v1/graphs/{graph_id}/draft` | Create or replace the draft. |
+| `POST` | `/api/v1/graphs/{graph_id}/publish` | Validate and publish the draft as the next graph version. |
+| `POST` | `/api/v1/task_events` | Emit an event for an existing task; body has `task_id` and `event`. |
+| `GET` | `/api/v1/jobs` | List jobs; optional `status`, `agent_id`, and `run_id` filters. |
+| `GET` | `/api/v1/agents` | List agent instances; optional `online=true` or `online=false`. |
+| `POST` | `/api/v1/jobs/poll` | Long-poll and claim jobs that fit an agent's resources. |
+| `POST` | `/api/v1/job/cancel` | Cancel a claimed job. |
+| `POST` | `/api/v1/job/yield` | Yield a claimed job and defer the node. |
+| `POST` | `/api/v1/job/succeed` | Complete a claimed job successfully. |
+| `POST` | `/api/v1/job/fail` | Report a claimed job failure. |
+| `POST` | `/api/v1/job/terminate` | Terminate a claimed job. |
 
 Run commands and task events return `202 Accepted` with the appended entry ID.
 In Runtime, click **Upgrade** on a run or its detail page. Select a newer
 published version and an eligible shared restart node, then confirm. The UI
 uses the graph's shared-node calculation and the same node-state rules as rerun.
 Shared nodes include all upstream ancestors of the fork point, including the root.
-To upgrade a run, send `POST /runs/upgrade` with a body such as:
+To upgrade a run, send `POST /api/v1/runs/upgrade` with a body such as:
 
 ```json
 {
@@ -433,7 +434,7 @@ plus the selected node's records from earlier revisions, are marked
 `ineffective = 1`. Their historical statuses remain available, but
 their results cannot satisfy dependencies until those nodes run again. New node
 runs default to `ineffective = 0`. Ancestors and other branches remain unchanged.
-`GET /runs/graph_state` and the state in `GET /runs/{run_id}` include only effective
+`GET /api/v1/runs/graph_state` and the state in `GET /api/v1/runs/{run_id}` include only effective
 node runs, choosing each node's latest effective revision at or before the run's
 current revision. Invalidated history remains stored but is omitted from graph state.
 `node_run.version`
@@ -463,7 +464,7 @@ whether the selected run is the latest version for its data/graph pair.
 Example start request:
 
 ```sh
-curl -X POST http://127.0.0.1:8080/runs/start \
+curl -X POST http://127.0.0.1:8080/api/v1/runs/start \
   -H 'content-type: application/json' \
   -d '{
     "data_id": "00000000-0000-0000-0000-000000000001",
@@ -477,10 +478,10 @@ revision, graph edges, and each node's current state.
 
 ### Graph drafts
 
-Write a complete draft with `PUT /graphs/{graph_id}/draft`:
+Write a complete draft with `PUT /api/v1/graphs/{graph_id}/draft`:
 
 ```sh
-curl -X PUT http://127.0.0.1:8080/graphs/00000001-0000-0000-0000-000000000000/draft \
+curl -X PUT http://127.0.0.1:8080/api/v1/graphs/00000001-0000-0000-0000-000000000000/draft \
   -H 'content-type: application/json' \
   -d '{
     "actor": "editor",
@@ -501,7 +502,7 @@ curl -X PUT http://127.0.0.1:8080/graphs/00000001-0000-0000-0000-000000000000/dr
 ```
 
 Draft reads and writes return the DAG directly. Drafts may be
-temporarily invalid while they are being edited. `POST /graphs/{graph_id}/publish`
+temporarily invalid while they are being edited. `POST /api/v1/graphs/{graph_id}/publish`
 accepts `{ "actor": "publisher" }`, validates the graph (including the cycle
 and single-root rules), assigns the next version, and returns the immutable
 published DAG directly. The version is the maximum published version for that
@@ -510,7 +511,7 @@ the published version. Publishing does not delete the draft.
 
 ## Long polling and claims
 
-`POST /jobs/poll` accepts this request shape:
+`POST /api/v1/jobs/poll` accepts this request shape:
 
 ```json
 {
@@ -542,7 +543,7 @@ server and pilot do not provide a fallback lease.
 Terminal job actions accept `{ "job_id": "...", "agent_id": "..." }` and append
 the corresponding task event. Repeating a terminal action does not append a
 duplicate event. A yielded job releases its claim and moves the node to
-`Pending`; `POST /runs/resume` creates the next task.
+`Pending`; `POST /api/v1/runs/resume` creates the next task.
 
 ### Agent instances
 

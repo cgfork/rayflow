@@ -182,7 +182,7 @@ and `outputs/` writable. Directory outputs use an internal JSON manifest. See
 four workspace sections. `FlowCanvas` is shared by the graph editor and run
 inspector; `api.ts` shares HTTP access, refresh, and pagination behavior.
 
-The UI calls the server's resource routes through a same-origin `/api` proxy.
+The UI calls the server's resource routes through a same-origin `/api/v1` prefix.
 It does not introduce a separate console API or duplicate workflow execution
 logic. See [Usage](usage.md#web-ui) for development, hosting, and integration
 test commands.

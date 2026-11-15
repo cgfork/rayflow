@@ -54,7 +54,7 @@ async fn main_polls_with_configured_identity_and_exits_on_shutdown_signals() {
             let sender = sender.clone();
             async move {
                 match uri.path() {
-                    "/jobs/poll" => {
+                    "/api/v1/jobs/poll" => {
                         sender
                             .send(serde_json::from_slice::<Value>(&body).unwrap())
                             .unwrap();
