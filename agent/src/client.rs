@@ -46,6 +46,16 @@ pub(crate) struct NodeState {
 }
 
 impl Client {
+    pub(crate) async fn multipart(
+        &self,
+        request: &catalog::artifact::MultipartRequest,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        Ok(self
+            .artifact_request(request.job_id, "multipart", request)
+            .await?
+            .json()
+            .await?)
+    }
     pub(crate) async fn run_state(&self, run_id: Uuid, revision: u64) -> Result<RunState, Error> {
         let view: RunView = self
             .http

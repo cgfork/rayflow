@@ -361,3 +361,47 @@ async fn s3_preserves_identity_data_and_optional_data_gats() {
         matches!(store.presign(8, PresignOperation::Download, Duration::from_secs(60)).await, Err(Error::CatalogNotFound(id)) if id == "8")
     );
 }
+
+#[cfg(feature = "s3")]
+#[test]
+fn object_storage_contract_signs_preloaded_records_and_multipart_operations() {
+    use catalog::{
+        ObjectStorage, PresignOperation,
+        artifact::MultipartAction,
+        s3::{Config, Credentials},
+    };
+    use std::time::Duration;
+    let mut data = CatalogInput::new("/a", "s3://bucket/a", 10, "bin");
+    let mut file = FileInput::new("/a", "a", 7);
+    let storage = Config::new(
+        "http://localhost:9000",
+        Credentials::new("access", "secret", None, None, "test"),
+    )
+    .build(BorrowingStore {
+        catalog: &mut data,
+        file: &mut file,
+        file_id: "file-seven",
+    })
+    .unwrap();
+    // The record is not persisted in this store: loaded-record signing must not
+    // attempt a lookup (prepare may still be inside an uncommitted transaction).
+    let record = CatalogInput::new("/uncommitted", "s3://bucket/uncommitted", 1024, "bin");
+    let signed = storage
+        .presign_catalog(&record, PresignOperation::Upload, Duration::from_secs(60))
+        .unwrap();
+    assert!(signed.url.contains("/bucket/uncommitted?"));
+    assert!(storage.supports_multipart());
+    let part = storage
+        .presign_multipart_catalog(
+            &record,
+            &MultipartAction::Part {
+                upload_id: "id+/part".into(),
+                part_number: 2,
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(part.operation, PresignOperation::UploadPart);
+    assert!(part.url.contains("partNumber=2"));
+}

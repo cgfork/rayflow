@@ -53,6 +53,7 @@ fn fleet(headers: &HeaderMap) {
 }
 fn transfer(api: &Api, catalog: Catalog, operation: PresignOperation) -> Transfer {
     Transfer {
+        multipart: false,
         presigned: PresignedUrl {
             url: format!("{}/objects/{}?signature=secret", api.base, catalog.uuid),
             operation,

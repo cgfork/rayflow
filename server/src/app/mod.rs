@@ -110,7 +110,7 @@ pub enum AppError {
     #[error(transparent)]
     Catalog(#[from] ::catalog::Error),
     #[error(transparent)]
-    Storage(#[from] ::catalog::s3::Error<::catalog::Error>),
+    Storage(Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     StorageConfiguration(#[from] crate::storage::Error),
     #[error(transparent)]

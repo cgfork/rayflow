@@ -56,7 +56,7 @@ impl Config {
         }
     }
 
-    fn validate(&mut self) -> Result<(), ConfigError> {
+    pub fn validate(&mut self) -> Result<(), ConfigError> {
         let endpoint = url::Url::parse(&self.endpoint)
             .map_err(|_| ConfigError("endpoint must be an absolute HTTP(S) origin"))?;
         if !matches!(endpoint.scheme(), "http" | "https")
@@ -94,6 +94,14 @@ impl Config {
         self.endpoint = endpoint.as_str().trim_end_matches('/').to_owned();
         Ok(())
     }
+
+    /// Construct the configured provider through the backend-independent contract.
+    pub fn build<S: FileSystem>(
+        self,
+        filesystem: S,
+    ) -> Result<impl ObjectStorage<Err = Error<S::Err>>, ConfigError> {
+        S3::new(filesystem, self)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +116,8 @@ pub enum Error<E> {
     CatalogNotFound(String),
     #[error("expected a s3://bucket/object-key URL without credentials, port, query, or fragment")]
     InvalidObjectUrl,
+    #[error("invalid multipart upload ID or part number")]
+    InvalidMultipart,
     #[error("presign lifetime must be a whole number of seconds from 1 to 604800")]
     InvalidExpiry,
     #[error("credentials have expired or have less than one signing second remaining")]
@@ -148,17 +158,41 @@ impl<S> S3<S> {
     }
 }
 
-impl<S: CatalogSystem> S3<S> {
-    /// Sign already-loaded object data without a second filesystem lookup.
-    pub fn presign_catalog(
-        &self,
-        catalog: &(impl Catalog + ?Sized),
-        operation: PresignOperation,
-        expires_in: Duration,
-    ) -> Result<PresignedUrl, Error<S::Err>> {
-        let uri = object_uri(&self.config.endpoint, catalog.url())?;
-        sign_request(&self.config, &uri, operation, expires_in, SystemTime::now())
+fn multipart_uri<E>(
+    endpoint: &str,
+    location: &str,
+    action: &crate::artifact::MultipartAction,
+) -> Result<(String, PresignOperation), Error<E>> {
+    use crate::artifact::MultipartAction;
+    if !action.is_valid() {
+        return Err(Error::InvalidMultipart);
     }
+    let uri = object_uri(endpoint, location)?;
+    let mut uri = url::Url::parse(&uri).map_err(|_| Error::InvalidObjectUrl)?;
+    let operation = match action {
+        MultipartAction::Create => {
+            uri.query_pairs_mut().append_pair("uploads", "");
+            PresignOperation::CreateMultipart
+        }
+        MultipartAction::Part {
+            upload_id,
+            part_number,
+        } => {
+            uri.query_pairs_mut()
+                .append_pair("partNumber", &part_number.to_string())
+                .append_pair("uploadId", upload_id);
+            PresignOperation::UploadPart
+        }
+        MultipartAction::Complete { upload_id } | MultipartAction::Abort { upload_id } => {
+            uri.query_pairs_mut().append_pair("uploadId", upload_id);
+            if matches!(action, MultipartAction::Complete { .. }) {
+                PresignOperation::CompleteMultipart
+            } else {
+                PresignOperation::AbortMultipart
+            }
+        }
+    };
+    Ok((uri.into(), operation))
 }
 
 impl<S: CatalogSystem> CatalogSystem for S3<S> {
@@ -273,6 +307,39 @@ impl<S: FileSystem> FileSystem for S3<S> {
 }
 
 impl<S: FileSystem> ObjectStorage for S3<S> {
+    fn supports_multipart(&self) -> bool {
+        true
+    }
+
+    /// Authorize exactly one multipart operation on an already-resolved object.
+    fn presign_multipart_catalog(
+        &self,
+        catalog: &(impl Catalog + ?Sized),
+        action: &crate::artifact::MultipartAction,
+        expires_in: Duration,
+    ) -> Result<Option<PresignedUrl>, Self::Err> {
+        let (uri, operation) = multipart_uri(&self.config.endpoint, catalog.url(), action)?;
+        sign_request(
+            &self.config,
+            uri.as_str(),
+            operation,
+            expires_in,
+            SystemTime::now(),
+        )
+        .map(Some)
+    }
+
+    /// Sign already-loaded object data without a second filesystem lookup.
+    fn presign_catalog(
+        &self,
+        catalog: &(impl Catalog + ?Sized),
+        operation: PresignOperation,
+        expires_in: Duration,
+    ) -> Result<PresignedUrl, Self::Err> {
+        let uri = object_uri(&self.config.endpoint, catalog.url())?;
+        sign_request(&self.config, &uri, operation, expires_in, SystemTime::now())
+    }
+
     /// Sign GET or PUT for a catalog. Lifetimes must be whole seconds
     /// in `1..=604800`; temporary credentials can shorten the effective lifetime.
     async fn presign<'a>(

@@ -234,7 +234,7 @@ fn fleet_catalog_routes_are_limited_to_transfer_operations() {
     assert!(super::agent_route(&axum::http::Method::GET, &run_path));
     assert!(!super::agent_route(&axum::http::Method::POST, &run_path));
     assert!(!super::agent_route(&axum::http::Method::GET, "/runs"));
-    for action in ["prepare", "commit", "download"] {
+    for action in ["prepare", "commit", "download", "multipart"] {
         assert!(super::agent_route(
             &axum::http::Method::POST,
             &format!("/catalog/{action}")

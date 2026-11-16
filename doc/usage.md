@@ -218,6 +218,12 @@ data_dir: .rayflow/data
 batch: 64
 poll_interval: 1s
 request_timeout: 60s
+transfer:
+  enabled: true
+  multipart_threshold: 67108864
+  part_size: 8388608
+  concurrency: 4
+  max_attempts: 3
 resources:
   cpu_cores: 4
   memory_bytes: 4294967296

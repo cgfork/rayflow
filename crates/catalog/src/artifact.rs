@@ -161,6 +161,46 @@ pub struct DownloadRequest {
 pub struct Transfer {
     pub catalog: Catalog,
     pub presigned: PresignedUrl,
+    /// The configured provider supports S3 multipart uploads and range downloads.
+    #[serde(default)]
+    pub multipart: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultipartRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub key: String,
+    pub catalog_uuid: Uuid,
+    pub action: MultipartAction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum MultipartAction {
+    Create,
+    Part { upload_id: String, part_number: u32 },
+    Complete { upload_id: String },
+    Abort { upload_id: String },
+}
+
+impl MultipartAction {
+    pub fn is_valid(&self) -> bool {
+        let id = match self {
+            Self::Create => return true,
+            Self::Part {
+                upload_id,
+                part_number,
+            } => {
+                if !(1..=10_000).contains(part_number) {
+                    return false;
+                }
+                upload_id
+            }
+            Self::Complete { upload_id } | Self::Abort { upload_id } => upload_id,
+        };
+        !id.is_empty() && id.len() <= 2048 && !id.chars().any(char::is_control)
+    }
 }
 
 #[cfg(test)]

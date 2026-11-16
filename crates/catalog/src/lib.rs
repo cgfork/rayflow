@@ -120,13 +120,19 @@ pub enum PresignOperation {
     Upload,
     /// Download an object's bytes with HTTP GET.
     Download,
+    CreateMultipart,
+    UploadPart,
+    CompleteMultipart,
+    AbortMultipart,
 }
 
 impl PresignOperation {
     pub const fn method(self) -> &'static str {
         match self {
-            Self::Upload => "PUT",
+            Self::Upload | Self::UploadPart => "PUT",
             Self::Download => "GET",
+            Self::CreateMultipart | Self::CompleteMultipart => "POST",
+            Self::AbortMultipart => "DELETE",
         }
     }
 }
@@ -150,6 +156,29 @@ pub struct PresignedUrl {
 /// including any limit imposed by temporary credentials.
 #[allow(async_fn_in_trait)]
 pub trait ObjectStorage: FileSystem {
+    /// Sign metadata that the caller has already loaded, including records in
+    /// an uncommitted transaction. This operation performs no persistence I/O.
+    fn presign_catalog(
+        &self,
+        catalog: &(impl Catalog + ?Sized),
+        operation: PresignOperation,
+        expires_in: Duration,
+    ) -> Result<PresignedUrl, Self::Err>;
+
+    fn supports_multipart(&self) -> bool {
+        false
+    }
+
+    /// Return None when the provider cannot authorize multipart operations.
+    fn presign_multipart_catalog(
+        &self,
+        _catalog: &(impl Catalog + ?Sized),
+        _action: &artifact::MultipartAction,
+        _expires_in: Duration,
+    ) -> Result<Option<PresignedUrl>, Self::Err> {
+        Ok(None)
+    }
+
     async fn presign<'a>(
         &'a mut self,
         catalog_id: Self::CatalogId<'a>,

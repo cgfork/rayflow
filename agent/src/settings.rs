@@ -24,6 +24,8 @@ pub struct Settings {
     /// Root for job input/output bytes, separate from durable job metadata.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    #[serde(default)]
+    pub transfer: crate::transfer::Config,
     pub resources: ResourceCapacity,
     pub batch: usize,
     #[serde(with = "jiff::fmt::serde::unsigned_duration::required")]
@@ -107,6 +109,7 @@ impl Settings {
             server_url: server_url.into(),
             auth_token: None,
             data_dir: workdir.join("data"),
+            transfer: Default::default(),
             workdir,
             resources,
             batch: 64,
@@ -116,6 +119,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
+        self.transfer.validate()?;
         if self.id.is_nil() {
             return Err(Error::Settings("id must be a non-nil UUID"));
         }

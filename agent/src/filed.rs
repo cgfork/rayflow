@@ -8,8 +8,8 @@ use catalog::{
     PresignOperation,
     artifact::{
         CommitUploadRequest, DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DirectoryEntry,
-        DirectoryManifest, DownloadRequest, EntryKind, MAX_MANIFEST_BYTES, PrepareUploadRequest,
-        Scope, Transfer, validate_relative_path,
+        DirectoryManifest, DownloadRequest, EntryKind, MAX_MANIFEST_BYTES, MultipartAction,
+        MultipartRequest, PrepareUploadRequest, Scope, Transfer, validate_relative_path,
     },
 };
 use graph::types::{DAG, Kind, Node, Output};
@@ -31,18 +31,23 @@ pub struct Filed {
     objects: reqwest::Client,
     agent_id: Uuid,
     data_dir: PathBuf,
+    s3: crate::transfer::S3TransferClient,
 }
 
 impl Filed {
     pub fn new(client: Client, settings: &Settings) -> Result<Self, Error> {
+        let objects = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(settings.request_timeout)
+            .build()?;
+        let s3 =
+            crate::transfer::S3TransferClient::new(objects.clone(), settings.transfer.clone())?;
         Ok(Self {
             client,
             data_dir: settings.data_dir.clone(),
             agent_id: settings.id,
-            objects: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(settings.request_timeout)
-                .build()?,
+            objects,
+            s3,
         })
     }
 
@@ -201,6 +206,7 @@ impl Filed {
                     if entry.kind == EntryKind::File {
                         let file_path = safe_existing(&path, &entry.path).await?;
                         self.upload_one(
+                            file_fs,
                             job_id,
                             &scope
                                 .key(&format!("{}/{}", output.file_name, entry.path))
@@ -215,6 +221,7 @@ impl Filed {
                 // Replace a previous internal manifest atomically, never follow it.
                 write_json(&manifest_path, &manifest).await?;
                 self.upload_one(
+                    file_fs,
                     job_id,
                     &output_key(&scope, output)?,
                     &manifest_path,
@@ -223,6 +230,7 @@ impl Filed {
                 .await?;
             } else {
                 self.upload_one(
+                    file_fs,
                     job_id,
                     &output_key(&scope, output)?,
                     &path,
@@ -236,6 +244,7 @@ impl Filed {
 
     async fn upload_one(
         &self,
+        file_fs: &FileFs,
         job_id: Uuid,
         key: &str,
         path: &Path,
@@ -256,21 +265,37 @@ impl Filed {
         if transfer.presigned.operation != PresignOperation::Upload {
             return Err(artifact("server returned the wrong upload operation"));
         }
-        let file = fs::File::open(path).await?;
-        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-        let mut put = self
-            .objects
-            .put(&transfer.presigned.url)
-            .header(reqwest::header::CONTENT_LENGTH, metadata.len())
-            .body(body);
-        for (name, value) in &transfer.presigned.headers {
-            put = put.header(name, value);
+        if self.s3.supports(&transfer) {
+            let multipart = MultipartRequest {
+                job_id,
+                agent_id: self.agent_id,
+                key: key.to_owned(),
+                catalog_uuid: transfer.catalog.uuid,
+                action: MultipartAction::Create,
+            };
+            let checkpoint = file_fs
+                .state_dir(job_id)
+                .join(format!("multipart-{}.json", transfer.catalog.uuid));
+            self.s3
+                .upload(&self.client, &multipart, &transfer, path, &checkpoint)
+                .await?;
+        } else {
+            let file = fs::File::open(path).await?;
+            let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+            let mut put = self
+                .objects
+                .put(&transfer.presigned.url)
+                .header(reqwest::header::CONTENT_LENGTH, metadata.len())
+                .body(body);
+            for (name, value) in &transfer.presigned.headers {
+                put = put.header(name, value);
+            }
+            put.send()
+                .await
+                .map_err(reqwest::Error::without_url)?
+                .error_for_status()
+                .map_err(reqwest::Error::without_url)?;
         }
-        put.send()
-            .await
-            .map_err(reqwest::Error::without_url)?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)?;
         self.client
             .commit_upload(&CommitUploadRequest {
                 job_id,
@@ -412,23 +437,27 @@ impl Filed {
             .open(&temporary)
             .await?;
         let result = async {
-            let mut response = self.response(transfer).await?;
-            let mut size = 0u64;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(reqwest::Error::without_url)?
-            {
-                size = size
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| artifact("input size overflow"))?;
-                if size > transfer.catalog.size {
-                    return Err(artifact("input exceeds catalog size"));
+            if self.s3.supports(transfer) {
+                self.s3.download(transfer, &temporary).await?;
+            } else {
+                let mut response = self.response(transfer).await?;
+                let mut size = 0u64;
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(reqwest::Error::without_url)?
+                {
+                    size = size
+                        .checked_add(chunk.len() as u64)
+                        .ok_or_else(|| artifact("input size overflow"))?;
+                    if size > transfer.catalog.size {
+                        return Err(artifact("input exceeds catalog size"));
+                    }
+                    file.write_all(&chunk).await?;
                 }
-                file.write_all(&chunk).await?;
-            }
-            if size != transfer.catalog.size {
-                return Err(artifact("incomplete input download"));
+                if size != transfer.catalog.size {
+                    return Err(artifact("incomplete input download"));
+                }
             }
             file.sync_all().await?;
             fs::rename(&temporary, destination).await?;

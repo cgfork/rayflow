@@ -1,12 +1,12 @@
 use catalog::{
     CatalogInput, CatalogOptionalData, CatalogSystem, FileInput, FileKey, FileSystem,
-    PresignOperation,
+    ObjectStorage, PresignOperation,
     artifact::{
         CommitUploadRequest, DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DownloadRequest,
-        MAX_MANIFEST_BYTES, PrepareUploadRequest, Transfer, validate_relative_path,
+        MAX_MANIFEST_BYTES, MultipartRequest, PrepareUploadRequest, Transfer,
+        validate_relative_path,
     },
     model::{Catalog, File},
-    s3::S3,
 };
 use jiff::Timestamp;
 use scheduler::{Job, actuator::Status};
@@ -16,6 +16,61 @@ use uuid::Uuid;
 use super::{App, AppError};
 
 impl<S> App<S> {
+    /// Sign one provider operation after rechecking the active claim and catalog identity.
+    pub async fn multipart_artifact(
+        &self,
+        request: MultipartRequest,
+    ) -> Result<catalog::PresignedUrl, AppError> {
+        if !request.action.is_valid() {
+            return Err(AppError::InvalidRequest(
+                "invalid multipart operation".into(),
+            ));
+        }
+        let mut db = self.db.clone();
+        let job = Job::filter_by_uuid(request.job_id)
+            .first()
+            .exec(&mut db)
+            .await?
+            .ok_or(AppError::JobNotFound(request.job_id))?;
+        check_claim(&job, request.agent_id)?;
+        let (fullpath, url) = self.artifact_location(&job, &request.key)?;
+        let catalog = db
+            .get_catalog(request.catalog_uuid)
+            .await?
+            .ok_or_else(|| AppError::ArtifactNotFound(request.catalog_uuid.to_string()))?;
+        if catalog.key != fullpath || catalog.url != url {
+            return Err(AppError::InvalidRequest(
+                "multipart catalog does not match the artifact key".into(),
+            ));
+        }
+        let config = self
+            .config
+            .storage
+            .as_ref()
+            .ok_or(AppError::StorageUnavailable)?;
+        if !config.multipart_enabled {
+            return Err(AppError::InvalidRequest(
+                "multipart transfers are disabled".into(),
+            ));
+        }
+        let remaining = job.expired_at.unwrap().as_second() - Timestamp::now().as_second();
+        if remaining < 1 {
+            return Err(AppError::JobConflict(job.uuid));
+        }
+        let ttl = config
+            .presign_ttl
+            .min(std::time::Duration::from_secs(remaining as u64));
+        config
+            .object_storage(self.db.clone())?
+            .presign_multipart_catalog(&catalog, &request.action, ttl)
+            .map_err(|error| AppError::Storage(Box::new(error)))?
+            .ok_or_else(|| {
+                AppError::InvalidRequest(
+                    "storage provider does not support multipart uploads".into(),
+                )
+            })
+    }
+
     /// Creates upload metadata for the key supplied by the agent.
     pub async fn prepare_artifact_upload(
         &self,
@@ -172,10 +227,15 @@ impl<S> App<S> {
         let ttl = config
             .presign_ttl
             .min(std::time::Duration::from_secs(remaining as u64));
-        let storage =
-            S3::new(self.db.clone(), config.signer()).map_err(crate::storage::Error::from)?;
-        let presigned = storage.presign_catalog(&catalog, operation, ttl)?;
-        Ok(Transfer { catalog, presigned })
+        let storage = config.object_storage(self.db.clone())?;
+        let presigned = storage
+            .presign_catalog(&catalog, operation, ttl)
+            .map_err(|error| AppError::Storage(Box::new(error)))?;
+        Ok(Transfer {
+            catalog,
+            presigned,
+            multipart: config.multipart_enabled && storage.supports_multipart(),
+        })
     }
 }
 

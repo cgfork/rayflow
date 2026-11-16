@@ -15,6 +15,85 @@ fn config() -> Config {
     )
 }
 
+#[test]
+fn multipart_signatures_bind_the_upload_id_part_and_method() {
+    use crate::artifact::MultipartAction;
+    let id = "upload+/=&? snow";
+    let mut signatures = std::collections::BTreeSet::new();
+    for (action, method) in [
+        (MultipartAction::Create, "POST"),
+        (
+            MultipartAction::Part {
+                upload_id: id.into(),
+                part_number: 1,
+            },
+            "PUT",
+        ),
+        (
+            MultipartAction::Part {
+                upload_id: id.into(),
+                part_number: 2,
+            },
+            "PUT",
+        ),
+        (
+            MultipartAction::Complete {
+                upload_id: id.into(),
+            },
+            "POST",
+        ),
+        (
+            MultipartAction::Abort {
+                upload_id: id.into(),
+            },
+            "DELETE",
+        ),
+    ] {
+        let config = config();
+        let (uri, operation) = multipart_uri::<Infallible>(
+            &config.endpoint,
+            "s3://bucket/key%20with%20space",
+            &action,
+        )
+        .unwrap();
+        assert_eq!(operation.method(), method);
+        let signed =
+            sign_request::<Infallible>(&config, &uri, operation, Duration::from_secs(60), now())
+                .unwrap();
+        let params = query(&signed);
+        assert!(signatures.insert(params["X-Amz-Signature"].clone()));
+        match action {
+            MultipartAction::Create => assert_eq!(params["uploads"], ""),
+            MultipartAction::Part { part_number, .. } => {
+                assert_eq!(params["uploadId"], id);
+                assert_eq!(params["partNumber"], part_number.to_string());
+            }
+            _ => assert_eq!(params["uploadId"], id),
+        }
+    }
+    for action in [
+        MultipartAction::Part {
+            upload_id: id.into(),
+            part_number: 0,
+        },
+        MultipartAction::Part {
+            upload_id: id.into(),
+            part_number: 10_001,
+        },
+        MultipartAction::Complete {
+            upload_id: "".into(),
+        },
+        MultipartAction::Abort {
+            upload_id: "id\nheader".into(),
+        },
+    ] {
+        assert!(matches!(
+            multipart_uri::<Infallible>(&config().endpoint, "s3://bucket/key", &action),
+            Err(Error::InvalidMultipart)
+        ));
+    }
+}
+
 fn now() -> SystemTime {
     SystemTime::from("2013-05-24T00:00:00Z".parse::<Timestamp>().unwrap())
 }

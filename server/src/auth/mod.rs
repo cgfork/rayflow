@@ -568,6 +568,7 @@ fn agent_route(method: &Method, path: &str) -> bool {
                 | "/catalog/prepare"
                 | "/catalog/commit"
                 | "/catalog/download"
+                | "/catalog/multipart"
                 | "/job/cancel"
                 | "/job/yield"
                 | "/job/succeed"

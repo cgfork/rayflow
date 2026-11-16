@@ -187,6 +187,12 @@ async fn presign<'a>(
 
 `PresignOperation::Upload` authorizes HTTP PUT; `Download` authorizes HTTP GET.
 The result contains the URL, operation, required headers, and actual expiry.
+The same trait provides synchronous `presign_catalog` for already-loaded data,
+`supports_multipart`, and optional `presign_multipart_catalog`. Unsupported
+providers return false/None for multipart support. Loaded-record signing performs
+no persistence I/O, so upload preparation can sign uncommitted catalog data
+without moving lookups outside its transaction. Server handlers use only this
+contract; provider construction is confined to storage configuration.
 Provider adapters implement this trait using their configured endpoints and
 credentials. Enable `s3` for the S3-compatible adapter below. OSS signing is not
 implemented. Adapters reject unsupported schemes (including `file://`), invalid
@@ -279,8 +285,9 @@ signing dependencies.
 
 ## HTTP API and agent transfers
 
-The catalog HTTP API has three POST endpoints under
-`/api/v1/catalog/prepare`, `/api/v1/catalog/commit`, and `/api/v1/catalog/download`. All request parameters
+The catalog HTTP API has four POST endpoints under
+`/api/v1/catalog/prepare`, `/api/v1/catalog/commit`, `/api/v1/catalog/download`,
+and `/api/v1/catalog/multipart`. All request parameters
 are in JSON bodies; these URLs have no path parameters.
 
 Configure storage on the **server**, using an existing S3-compatible bucket and
@@ -295,6 +302,7 @@ storage:
   access_key: deployment-access-key
   secret_key: deployment-secret-key
   presign_ttl: 15m
+  multipart_enabled: true
   # session_token: optional-temporary-token
   # credential_expiry: 2027-01-01T00:00:00Z
 ```
@@ -339,6 +347,7 @@ and filename, with no leading slash:
 | `/api/v1/catalog/prepare` | `size`, `format` | `{catalog, presigned}` for PUT; uploaded is false |
 | `/api/v1/catalog/commit` | `catalog_uuid`, `size`, `format` | Published file; uploaded is true |
 | `/api/v1/catalog/download` | None | `{catalog, presigned}` for GET |
+| `/api/v1/catalog/multipart` | `catalog_uuid`, `action` | A signed S3 multipart request |
 
 The agent sends prepare, uploads the bytes using the returned URL and headers,
 then sends commit with the same key and metadata plus `catalog.uuid`. Prepare
@@ -366,7 +375,7 @@ before startup.
 Each catalog request requires an active, unexpired claim owned by `agent_id`.
 Keys must stay within that claim's run; path traversal and absolute keys are
 rejected. Agents are responsible for declared input/output bindings within the
-run. With authentication enabled, fleet credentials can call the three POST
+run. With authentication enabled, fleet credentials can call the four POST
 routes and read graph definitions and individual run states. Browser writes
 also require `X-Rayflow-Request: 1`. Transfers return 503 when storage is absent,
 409 for a lost claim, and 404 for unavailable artifacts. Object requests use a
@@ -374,6 +383,65 @@ separate HTTP client without the fleet credential.
 
 Deploy matching server and agent binaries: the old `/jobs/{job_id}/artifacts/*`
 routes and `input`/`output`/`path` request fields have been removed.
+
+### Large files and multipart transfers
+
+When `storage.multipart_enabled` is true (the default), prepare and download
+responses advertise `multipart: true`. The agent's concrete `S3TransferClient`
+uses multipart uploads and ranged GETs for sufficiently large files. Other
+providers or older servers that omit this capability retain streamed PUT/GET.
+Storage credentials remain on the server; the agent never needs RustFS/S3 keys.
+
+Agent settings (sizes are bytes):
+
+```yaml
+transfer:
+  enabled: true
+  multipart_threshold: 67108864  # 64 MiB
+  part_size: 8388608             # 8 MiB
+  concurrency: 4
+  max_attempts: 3
+```
+
+Configure these with `RAYFLOW_AGENT_TRANSFER__MULTIPART_THRESHOLD`,
+`RAYFLOW_AGENT_TRANSFER__PART_SIZE`, `RAYFLOW_AGENT_TRANSFER__CONCURRENCY`, and
+matching nested overrides. Threshold must be at least 5 MiB, part size 5 MiB to
+5 GiB, concurrency 1–32, and attempts 1–5. Uploads automatically increase part
+size when needed to stay within 10,000 parts. `storage.multipart_enabled: false`
+(or `RAYFLOW_STORAGE__MULTIPART_ENABLED=false`) disables the provider capability;
+`transfer.enabled: false` disables it for one agent.
+
+For uploads, the agent asks `POST /api/v1/catalog/multipart` for each signed
+operation. Its JSON includes `job_id`, `agent_id`, `key`, `catalog_uuid`, and an
+`action` object:
+
+```json
+{"operation":"part","upload_id":"provider-upload-id","part_number":1}
+```
+
+Other actions are `{"operation":"create"}`, `{"operation":"complete", "upload_id":"..."}`,
+and `{"operation":"abort", "upload_id":"..."}`. Each request rechecks the
+active claim, run-scoped key, prepared catalog identity, and signing lifetime.
+Part bytes travel directly to storage. Completed ETags are persisted under the
+job's transfer checkpoint directory; after a process restart, an unchanged
+source resumes those parts. A changed size, modification time, or part size
+requires aborting the old session and starting again. Failed part/range requests
+are retried up to `max_attempts`; explicit upload failures attempt to abort the
+session. Configure the bucket's incomplete-multipart lifecycle policy to reclaim
+sessions left by lost claims or a crash before the upload ID was checkpointed.
+
+The agent validates completion XML, including errors returned with HTTP 200,
+before calling the existing catalog commit endpoint. Small files and directory
+manifests keep the single-request path. Large downloads stream bounded ranges
+into a temporary file, validate Content-Range and byte counts, and pin subsequent
+requests with If-Match to the first ETag. Ignored ranges or changing objects fail
+instead of publishing mixed contents. Only a complete download replaces the
+input file. A restarted input preparation currently restarts its download.
+
+Choose part size and `request_timeout` so each part and completion request can
+finish within the job claim and signed-URL lifetime; active jobs do not renew
+leases. Transfer concurrency is per file and bounds HTTP requests, not the
+agent's CPU/memory scheduling capacity.
 
 ### Directories
 

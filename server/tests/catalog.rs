@@ -329,6 +329,84 @@ async fn catalog_operations_use_agent_supplied_keys_and_acknowledge_publication(
 }
 
 #[tokio::test]
+async fn multipart_signing_requires_the_active_claim_and_matching_catalog() {
+    let Some(mut f) = setup(Kind::File).await else {
+        return;
+    };
+    let key = format!("{}/flow/2/producer/9/result", f.run);
+    let (status, transfer) = action(
+        &f,
+        f.producer.uuid,
+        "prepare",
+        json!({"agent_id": f.agent, "key": key, "size": 16_777_216, "format": "bin"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{transfer}");
+    assert_eq!(transfer["multipart"], true);
+    let mut request = json!({"agent_id": f.agent, "key": key, "catalog_uuid": transfer["catalog"]["uuid"], "action": {"operation": "part", "upload_id": "test+/id", "part_number": 2}});
+    let (status, signed) = action(&f, f.producer.uuid, "multipart", request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{signed}");
+    assert_eq!(signed["operation"], "upload_part");
+    let url = url::Url::parse(signed["url"].as_str().unwrap()).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    assert_eq!(params["uploadId"], "test+/id");
+    assert_eq!(params["partNumber"], "2");
+    request["key"] = json!(format!("{}/flow/2/producer/9/other", f.run));
+    assert_eq!(
+        action(&f, f.producer.uuid, "multipart", request.clone())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    request["key"] = json!(format!("{}/flow/2/producer/9/result", Uuid::new_v4()));
+    assert_eq!(
+        action(&f, f.producer.uuid, "multipart", request.clone())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    request["key"] = json!(key);
+    request["action"]["part_number"] = json!(0);
+    assert_eq!(
+        action(&f, f.producer.uuid, "multipart", request.clone())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    request["action"]["part_number"] = json!(2);
+    request["agent_id"] = json!(Uuid::new_v4());
+    assert_eq!(
+        action(&f, f.producer.uuid, "multipart", request.clone())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    request["agent_id"] = json!(f.agent);
+    let disabled = Config { storage: Some(serde_json::from_value(json!({"endpoint":"http://localhost:9000", "bucket":"artifacts", "prefix":"prefix", "access_key":"access", "secret_key":"secret", "multipart_enabled":false})).unwrap()), ..Default::default() };
+    let original = std::mem::replace(
+        &mut f.app,
+        App::new(f.db.clone(), disabled, Versions(vec![])),
+    );
+    assert_eq!(
+        action(&f, f.producer.uuid, "multipart", request.clone())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    f.app = original;
+    Job::filter_by_uuid(f.producer.uuid)
+        .update()
+        .agent_id(None::<Uuid>)
+        .exec(&mut f.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        action(&f, f.producer.uuid, "multipart", request).await.0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
 async fn directory_uploads_reject_escape_and_expired_claims() {
     let Some(mut f) = setup(Kind::Directory).await else {
         return;

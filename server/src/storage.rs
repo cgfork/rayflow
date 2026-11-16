@@ -1,8 +1,9 @@
 //! Server-owned S3 configuration. Agents only receive temporary signed URLs.
 
 use catalog::{
+    ObjectStorage,
     artifact::{PathError, validate_relative_path},
-    s3::{Config, Credentials, S3},
+    s3::{Config, Credentials},
 };
 use serde::Deserialize;
 use std::time::Duration;
@@ -37,6 +38,8 @@ pub struct StorageConfig {
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
+    #[serde(default = "default_multipart")]
+    pub multipart_enabled: bool,
     pub session_token: Option<String>,
     pub credential_expiry: Option<jiff::Timestamp>,
     #[serde(
@@ -48,6 +51,9 @@ pub struct StorageConfig {
 
 fn default_prefix() -> String {
     "artifacts".into()
+}
+fn default_multipart() -> bool {
+    true
 }
 fn default_region() -> String {
     "us-east-1".into()
@@ -64,11 +70,21 @@ impl std::fmt::Debug for StorageConfig {
             .field("prefix", &self.prefix)
             .field("region", &self.region)
             .field("presign_ttl", &self.presign_ttl)
+            .field("multipart_enabled", &self.multipart_enabled)
             .finish_non_exhaustive()
     }
 }
 
 impl StorageConfig {
+    /// Provider construction is confined to configuration; callers only receive
+    /// ObjectStorage, never a concrete signing client.
+    pub fn object_storage(
+        &self,
+        db: toasty::Db,
+    ) -> Result<impl ObjectStorage<Err: Send + Sync + 'static> + use<>, Error> {
+        Ok(self.signer().build(db)?)
+    }
+
     pub fn signer(&self) -> Config {
         let mut config = Config::new(
             &self.endpoint,
@@ -85,7 +101,7 @@ impl StorageConfig {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        S3::new((), self.signer())?;
+        self.signer().validate()?;
         if self.bucket.is_empty()
             || !self
                 .bucket
