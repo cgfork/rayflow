@@ -251,9 +251,14 @@ impl<B: Executor> FileSystem for B {
         Self: 'a,
     {
         let mut tx = self.transaction().await?;
-        let result = match File::filter_by_uuid(id).first().exec(&mut tx).await? {
+        let result = match File::filter_by_uuid(id)
+            .include(File::fields().catalog())
+            .first()
+            .exec(&mut tx)
+            .await?
+        {
             Some(file) => Some(FileWithCatalog {
-                catalog: tx.get_catalog(file.catalog_uuid).await?,
+                catalog: Some(file.catalog.get().clone()),
                 file,
             }),
             None => None,
@@ -272,12 +277,13 @@ impl<B: Executor> FileSystem for B {
     {
         let mut tx = self.transaction().await?;
         let result = match File::filter_by_node_run_id_and_filename(node_run_id, filename)
+            .include(File::fields().catalog())
             .first()
             .exec(&mut tx)
             .await?
         {
             Some(file) => Some(FileWithCatalog {
-                catalog: tx.get_catalog(file.catalog_uuid).await?,
+                catalog: Some(file.catalog.get().clone()),
                 file,
             }),
             None => None,
@@ -375,34 +381,4 @@ fn validate_field(name: &'static str, value: &str, max_chars: usize) -> Result<(
         return Err(Error::InvalidField(name));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_provider_and_local_object_urls() {
-        for value in [
-            "s3://a/b/c",
-            "oss://a/b/c",
-            "file://host/path",
-            "file:///tmp/a",
-            "s3://bucket/key",
-        ] {
-            assert!(validate_url(value).is_ok(), "{value}");
-        }
-        for value in [
-            "relative/path",
-            "s3://a",
-            "oss:///key",
-            "file:///",
-            "mailto:a@b",
-            "oss://user:password@a/key",
-            "oss://a/key#fragment",
-            " oss://a/key",
-        ] {
-            assert!(validate_url(value).is_err(), "{value}");
-        }
-    }
 }

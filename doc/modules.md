@@ -165,17 +165,12 @@ HTTP `Client`, and `Settings` to poll for jobs, run containers, persist job
 results, and report terminal task events. The current default execution
 provider is Docker through Bollard.
 
-`JobFs` gives each job a durable directory under the configured workdir. The
-filesystem and UUID-based container names allow an agent to recover jobs after
-restart. `Filed` resolves artifact keys and producer versions, downloads declared
-inputs, and publishes outputs using `/catalog/prepare`, `/catalog/commit`, and
-`/catalog/download`. Each request supplies job/agent IDs, the key, and metadata
-in JSON. The server stores metadata and signs URLs within the claimed run.
-Transfers finish before execution and success reporting respectively. Its separate
-`FileFs` stores bytes under `data_dir/<run_uuid>/<node_id>/<revision>/`, retaining
-producer outputs after job acknowledgement. Docker mounts `inputs/` read-only
-and `outputs/` writable. Directory outputs use an internal JSON manifest. See
-[Catalog](catalog.md#http-api-and-agent-transfers) for configuration and protocol.
+`JobFs` gives each job a durable metadata directory and a run/node/revision data
+directory under the configured workdir. It owns input and output directories,
+transfer markers, and recovery state. `JobTransfer` implements the transfer
+backend used by `JobFs::prepare_input` and `JobFs::complete_output`. Docker mounts
+`inputs/` read-only and `outputs/` writable. Directory outputs use an internal
+JSON manifest. See [Catalog](catalog.md#job-artifact-api) for the protocol.
 
 ## Web UI
 

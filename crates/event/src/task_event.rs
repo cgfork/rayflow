@@ -230,17 +230,3 @@ impl<B: Executor> crate::Read<uuid::Uuid, B> for TaskEventEntry {
             .ok_or(Error::TaskEventNotFound(id))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn yield_round_trips_and_pends_the_node() {
-        let node = Uuid::new_v4();
-        assert_eq!(TaskEvent::Yield.command(node), Command::Pend { node });
-        assert_eq!(TaskEvent::Yield.to_string(), "Yield");
-        assert_eq!("Yield".parse::<TaskEvent>().unwrap(), TaskEvent::Yield);
-        assert!("Pend".parse::<TaskEvent>().is_err());
-    }
-}

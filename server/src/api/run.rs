@@ -5,12 +5,13 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use catalog::{PresignedUrl, model::Catalog};
 use graph::GraphStore;
 use graph::types::DAG;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::app::{App, AppError, GraphState, Page, PageQuery, RunView};
+use crate::app::{App, AppError, Page, PageQuery, RunView};
 
 /// Builds the run routes.
 pub(super) fn routes<S>() -> Router<App<S>>
@@ -28,6 +29,7 @@ where
         .route("/runs/resume", post(resume_run::<S>))
         .route("/runs/dryrun", post(dryrun_run::<S>))
         .route("/runs/graph_state", get(get_graph_state::<S>))
+        .route("/runs/{run_id}/files/download", post(download_file::<S>))
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,7 +207,7 @@ pub struct GetGraphStateRequest {
 }
 
 /// Response returned by `GET /runs/graph_state`.
-pub type GetGraphStateResponse = GraphState;
+pub type GetGraphStateResponse = Vec<(runtime::command::NodeRun, graph::types::Node)>;
 
 /// Reads the current state of a run's graph.
 async fn get_graph_state<S>(
@@ -233,6 +235,14 @@ pub struct RunFileDownloadRequest {
     pub revision: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct Transfer {
+    pub catalog: Catalog,
+    pub presigned: PresignedUrl,
+    #[serde(default)]
+    pub multipart: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileDirection {
@@ -240,15 +250,15 @@ pub enum FileDirection {
     Output,
 }
 
-/* async fn download_file<S>(
+async fn download_file<S>(
     State(app): State<App<S>>,
     Path(run_id): Path<Uuid>,
     Json(request): Json<RunFileDownloadRequest>,
-) -> Result<Json<crate::api::catalog::Transfer>, AppError>
+) -> Result<Json<Transfer>, AppError>
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
     S::load(..): Send,
     S::Err: Send + Sync + 'static,
 {
     app.download_run_file(run_id, request).await.map(Json)
-} */
+}

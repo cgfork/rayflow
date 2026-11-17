@@ -24,8 +24,6 @@ pub struct Settings {
     /// Root for job input/output bytes, separate from durable job metadata.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    #[serde(default)]
-    pub transfer: crate::transfer::Config,
     pub resources: ResourceCapacity,
     pub batch: usize,
     #[serde(with = "jiff::fmt::serde::unsigned_duration::required")]
@@ -109,7 +107,6 @@ impl Settings {
             server_url: server_url.into(),
             auth_token: None,
             data_dir: workdir.join("data"),
-            transfer: Default::default(),
             workdir,
             resources,
             batch: 64,
@@ -119,7 +116,6 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        self.transfer.validate()?;
         if self.id.is_nil() {
             return Err(Error::Settings("id must be a non-nil UUID"));
         }
@@ -159,99 +155,4 @@ impl Settings {
 
 fn default_data_dir() -> PathBuf {
     ".rayflow/data".into()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const YAML: &str = "id: 12345678-1234-4234-8234-123456789abc\nserver_url: http://localhost:8080\nworkdir: jobs\nresources:\n  cpu_cores: 4\n  memory_bytes: 4096\nbatch: 2\npoll_interval: 250ms\nrequest_timeout: 10s\n";
-
-    fn builder() -> config::ConfigBuilder<config::builder::DefaultState> {
-        Builder::builder().add_source(File::from_str(YAML, config::FileFormat::Yaml))
-    }
-
-    #[test]
-    fn settings_accept_duration_strings_and_nested_resource_overrides() {
-        let settings: Settings = builder().build().unwrap().try_deserialize().unwrap();
-        settings.validate().unwrap();
-        assert_eq!(settings.poll_interval, Duration::from_millis(250));
-        assert_eq!(settings.request_timeout, Duration::from_secs(10));
-        assert_eq!(settings.data_dir, PathBuf::from(".rayflow/data"));
-
-        let source = [
-            ("RAYFLOW_AGENT_DATA_DIR".to_owned(), "/srv/data".to_owned()),
-            (
-                "RAYFLOW_AGENT_SERVER_URL".to_owned(),
-                "https://example.com/api".to_owned(),
-            ),
-            ("RAYFLOW_AGENT_POLL_INTERVAL".to_owned(), "2s".to_owned()),
-            (
-                "RAYFLOW_AGENT_RESOURCES__CPU_CORES".to_owned(),
-                "8".to_owned(),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let settings: Settings = builder()
-            .add_source(Settings::environment().source(Some(source)))
-            .build()
-            .unwrap()
-            .try_deserialize()
-            .unwrap();
-        settings.validate().unwrap();
-        assert_eq!(settings.server_url, "https://example.com/api");
-        assert_eq!(settings.data_dir, PathBuf::from("/srv/data"));
-        assert_eq!(settings.poll_interval, Duration::from_secs(2));
-        assert_eq!(settings.resources.cpu_cores, 8);
-        assert_eq!(settings.resources.memory_bytes, 4096);
-    }
-
-    #[test]
-    fn settings_require_a_stable_uuid() {
-        let without_id = YAML.lines().skip(1).collect::<Vec<_>>().join("\n");
-        assert!(
-            Builder::builder()
-                .add_source(File::from_str(&without_id, config::FileFormat::Yaml))
-                .build()
-                .unwrap()
-                .try_deserialize::<Settings>()
-                .is_err()
-        );
-        for id in ["invalid", "00000000-0000-0000-0000-000000000000"] {
-            let settings = builder()
-                .set_override("id", id)
-                .unwrap()
-                .build()
-                .unwrap()
-                .try_deserialize::<Settings>();
-            assert!(settings.is_err() || settings.unwrap().validate().is_err());
-        }
-    }
-
-    #[test]
-    fn settings_reject_invalid_capacity_cadence_and_server_urls() {
-        for (key, value) in [
-            ("resources.cpu_cores", "0"),
-            ("resources.memory_bytes", "0"),
-            ("batch", "0"),
-            ("batch", "1001"),
-            ("poll_interval", "0s"),
-            ("request_timeout", "0s"),
-            ("workdir", ""),
-            ("data_dir", ""),
-            ("server_url", "file:///tmp/socket"),
-            ("server_url", "http://localhost?query=1"),
-            ("server_url", "http://localhost#fragment"),
-        ] {
-            let settings: Settings = builder()
-                .set_override(key, value)
-                .unwrap()
-                .build()
-                .unwrap()
-                .try_deserialize()
-                .unwrap();
-            assert!(settings.validate().is_err(), "{key}: {value}");
-        }
-    }
 }

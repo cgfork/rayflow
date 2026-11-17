@@ -103,6 +103,11 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "file_catalog_key",
         include_str!("../migrations/0021_file_catalog_key.sql"),
     ),
+    MigrationFile::new(
+        22,
+        "uuid_references",
+        include_str!("../migrations/0022_uuid_references.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

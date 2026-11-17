@@ -1,20 +1,78 @@
 mod agent;
-mod catalog;
 mod error;
 mod graph;
-mod graph_draft;
 mod job;
-mod offset;
 mod operation;
-mod pagination;
 mod run;
-mod task_event;
 
 pub use agent::{AgentInstance, AgentView};
 pub use error::{AppError, ErrorBody};
-pub use offset::Offsets;
-pub use pagination::{Page, PageQuery};
-pub use run::{GraphState, NodeState, RunView};
+pub use run::RunView;
+
+use std::sync::Arc;
+
+use ::graph::PageRequest;
+use serde::Deserialize;
+use tokio::sync::watch;
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PageQuery {
+    pub before: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+impl PageQuery {
+    pub(crate) fn limit(&self) -> Result<usize, AppError> {
+        Ok(self.request()?.limit())
+    }
+
+    pub(crate) fn request(&self) -> Result<PageRequest, AppError> {
+        PageRequest::new(self.before, self.limit.unwrap_or(50))
+            .map_err(|error| AppError::InvalidRequest(error.to_string()))
+    }
+}
+
+pub use ::graph::Page;
+
+/// The consumed command offset, shared between the app and its waiters.
+#[derive(Clone)]
+pub struct Offsets {
+    sender: Arc<watch::Sender<u64>>,
+}
+
+impl Default for Offsets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Offsets {
+    pub fn new() -> Self {
+        Self {
+            sender: Arc::new(watch::channel(0).0),
+        }
+    }
+
+    pub fn get(&self) -> u64 {
+        *self.sender.borrow()
+    }
+
+    pub fn set(&self, offset: u64) {
+        self.sender.send_if_modified(|current| {
+            if offset > *current {
+                *current = offset;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub async fn wait(&self, offset: u64) {
+        let mut receiver = self.sender.subscribe();
+        let _ = receiver.wait_for(|current| *current >= offset).await;
+    }
+}
 
 use toasty::Db;
 use uuid::Uuid;
@@ -97,129 +155,6 @@ impl<S> App<S> {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test {
-    use std::convert::Infallible;
-
-    use graph::GraphStore;
-    use graph::types::DAG;
-    use toasty::Db;
-    use uuid::Uuid;
-
-    /// An in-memory [`GraphStore`] that serves a single [`DAG`].
-    #[derive(Clone)]
-    pub(crate) struct TestGraphStore(pub DAG);
-
-    impl Default for TestGraphStore {
-        fn default() -> Self {
-            Self(DAG {
-                id: Uuid::nil(),
-                name: String::new(),
-                version: 0,
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                ..DAG::default()
-            })
-        }
-    }
-
-    impl GraphStore<Uuid> for TestGraphStore {
-        type G = DAG;
-        type Err = Infallible;
-
-        async fn graphs(
-            &mut self,
-            page: graph::PageRequest,
-            graph_id: Option<Uuid>,
-        ) -> Result<graph::Page<DAG>, Infallible> {
-            Ok(page.select(
-                std::iter::once((1, self.0.clone()))
-                    .filter(|(_, graph)| graph_id.is_none_or(|id| graph.id == id)),
-            ))
-        }
-
-        async fn load(
-            &mut self,
-            _graph_id: Uuid,
-            _version: Option<u64>,
-        ) -> Result<DAG, Infallible> {
-            Ok(self.0.clone())
-        }
-    }
-
-    /// Connects and creates isolated tables from the Toasty models, or returns
-    /// `None` when no `DATABASE_URL` is configured.
-    pub(crate) async fn setup() -> Option<Db> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-
-        let mut builder = Db::builder();
-        builder.models(crate::models());
-        builder.table_name_prefix(&format!("server_{}_", Uuid::new_v4().simple()));
-        let db = builder
-            .connect(&url)
-            .await
-            .expect("connect to DATABASE_URL");
-
-        db.push_schema().await.expect("push schema");
-
-        Some(db)
-    }
-}
-
 /*
-#[cfg(test)]
-mod tests {
-    use axum::{http::StatusCode, response::IntoResponse};
 
-    use super::*;
-
-    #[test]
-    fn graph_validation_retains_context_and_bad_request_status() {
-        use std::error::Error;
-
-        let cause = graph::validator::WorkflowValidationError::InvalidResources {
-            node: "build".into(),
-        };
-        let error = AppError::from(graph::store::Error::InvalidDraft(cause.clone()));
-        assert_eq!(
-            error
-                .source()
-                .unwrap()
-                .downcast_ref::<graph::validator::WorkflowValidationError>(),
-            Some(&cause)
-        );
-        assert_eq!(
-            error.to_string(),
-            "invalid graph: build: CPU cores and memory must be positive"
-        );
-        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn storage_validation_preserves_bad_request_status() {
-        let error = AppError::from(crate::storage::Error::InvalidBucket);
-        assert_eq!(
-            error.to_string(),
-            "storage.bucket must be an S3 bucket name"
-        );
-        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
-        let error = AppError::from(::catalog::path::PathError);
-        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn run_not_found_maps_to_404() {
-        let error = AppError::RunNotFound {
-            data_id: Uuid::nil(),
-            graph_id: Uuid::nil(),
-        };
-        assert_eq!(error.into_response().status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn node_not_found_maps_to_404() {
-        let error = AppError::NodeNotFound(Uuid::nil());
-        assert_eq!(error.into_response().status(), StatusCode::NOT_FOUND);
-    }
-}
 */

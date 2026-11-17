@@ -1,20 +1,18 @@
-//! Downloads declared inputs and publishes outputs through the catalog API.
+//! Transfers declared inputs and outputs through the job filesystem.
 //!
 //! Metadata requests use the fleet client; object requests use a separate client
 //! without fleet credentials. Upload state survives restarts and success is
 //! reported only after every output and directory manifest has been published.
 
-use crate::{client::Transfer, transfer::UploadContext};
-use catalog::PresignOperation;
+use crate::client::Transfer as CatalogTransfer;
 use catalog::directory::{
     DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DirectoryEntry, DirectoryManifest, EntryKind,
     MAX_MANIFEST_BYTES,
 };
 use catalog::path::validate_relative_path;
-use graph::types::{DAG, Kind, Node, Output};
+use catalog::{PresignOperation, PresignedUrl};
+use graph::types::{DAG, Kind, Node};
 use scheduler::Job;
-mod scope;
-use scope::Scope;
 use std::{
     io,
     path::{Path, PathBuf},
@@ -23,57 +21,67 @@ use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::{
-    client::Client, errors::Error, filefs::FileFs, read_json, settings::Settings, write_json,
+    client::Client,
+    errors::Error,
+    fs::{GraphFs, JobFs as JobFsTrait, Transfer},
+    read_json, write_json,
 };
 
 #[derive(Clone)]
-pub struct Filed {
+pub struct JobTransfer {
     client: Client,
     objects: reqwest::Client,
     agent_id: Uuid,
-    data_dir: PathBuf,
-    s3: crate::transfer::S3TransferClient,
 }
 
-impl Filed {
-    pub fn new(client: Client, settings: &Settings) -> Result<Self, Error> {
+impl JobTransfer {
+    pub fn new(client: Client) -> Result<Self, Error> {
+        let request_timeout = client.settings().request_timeout;
+        let agent_id = client.settings().id;
         let objects = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(settings.request_timeout)
+            .timeout(request_timeout)
             .build()?;
-        let s3 =
-            crate::transfer::S3TransferClient::new(objects.clone(), settings.transfer.clone())?;
         Ok(Self {
             client,
-            data_dir: settings.data_dir.clone(),
-            agent_id: settings.id,
+            agent_id,
             objects,
-            s3,
         })
     }
 
-    pub fn file_fs(&self, job: &Job) -> FileFs {
+    pub async fn prepare_input<J: JobFsTrait, G: GraphFs + Clone>(
+        &self,
+        file_fs: &J,
+        graph_store: &G,
+    ) -> Result<(), Error> {
+        let job = file_fs.job().clone();
         let node_run = job.node_run.get();
-        FileFs::new(
-            &self.data_dir,
-            job.run_id,
-            node_run.node_id,
-            node_run.revision,
-        )
-    }
-
-    pub async fn download_inputs(&self, job: &Job, node: &Node) -> Result<(), Error> {
+        let graph = graph_store
+            .clone()
+            .load(node_run.graph_id, Some(node_run.version))
+            .await
+            .map_err(|error| artifact(format!("load graph: {error}")))?;
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_run.node_id)
+            .cloned()
+            .ok_or_else(|| artifact("job node is missing from graph"))?;
         if node.inputs.is_empty() {
             return Ok(());
         }
-        let file_fs = self.file_fs(job);
         file_fs.lock().await?;
-        let result = self.download_locked(&file_fs, job, node).await;
+        let result = self.download_locked(file_fs, &job, &node).await;
         let unlock = file_fs.unlock().await;
         result.and(unlock)
     }
 
-    async fn download_locked(&self, file_fs: &FileFs, job: &Job, node: &Node) -> Result<(), Error> {
+    async fn download_locked<J: JobFsTrait>(
+        &self,
+        file_fs: &J,
+        job: &Job,
+        node: &Node,
+    ) -> Result<(), Error> {
         validate_node_paths(node)?;
         let job_id = job.uuid;
         if node.inputs.is_empty() || read_marker(file_fs, job_id, "inputs-ready").await? {
@@ -81,7 +89,7 @@ impl Filed {
         }
         // Before startup, unfinished staging is disposable. Never follow a link
         // supplied in place of the input root.
-        let root = file_fs.inputs_dir();
+        let root = file_fs.input_dir();
         match fs::symlink_metadata(&root).await {
             Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&root).await?,
             Ok(_) => return Err(artifact("input root is not a directory")),
@@ -95,7 +103,10 @@ impl Filed {
             .run_state(job.run_id, job.node_run.get().revision)
             .await?;
         for input in &node.inputs {
-            let Some(key) = self.input_key(job, &graph, &state, &input.source).await? else {
+            let Some(_filename) = self
+                .input_filename(job, &graph, &state, &input.source)
+                .await?
+            else {
                 if input.required {
                     return Err(artifact(format!(
                         "required input is unavailable: {}",
@@ -106,7 +117,7 @@ impl Filed {
             };
             let Some(transfer) = self
                 .client
-                .download_input(job_id, self.agent_id, &key)
+                .download_input(job_id, self.agent_id, &input.file_name)
                 .await?
             else {
                 if input.required {
@@ -129,15 +140,10 @@ impl Filed {
                     match entry.kind {
                         EntryKind::Directory => fs::create_dir_all(&path).await?,
                         EntryKind::File => {
-                            let member_key = format!(
-                                "{}{path}",
-                                key.strip_suffix(DIRECTORY_MANIFEST)
-                                    .ok_or_else(|| artifact("directory manifest key is invalid"))?,
-                                path = entry.path
-                            );
+                            let member_filename = format!("{}/{}", input.file_name, entry.path);
                             let member = self
                                 .client
-                                .download_input(job_id, self.agent_id, &member_key)
+                                .download_input(job_id, self.agent_id, &member_filename)
                                 .await?
                                 .ok_or_else(|| {
                                     artifact(format!(
@@ -164,32 +170,45 @@ impl Filed {
         write_marker(file_fs, job_id, "inputs-ready").await
     }
 
-    pub async fn upload_outputs(&self, job: &Job, node: &Node) -> Result<(), Error> {
+    pub async fn complete_output<J: JobFsTrait, G: GraphFs + Clone>(
+        &self,
+        file_fs: &J,
+        graph_store: &G,
+    ) -> Result<(), Error> {
+        let job = file_fs.job().clone();
+        let node_run = job.node_run.get();
+        let graph = graph_store
+            .clone()
+            .load(node_run.graph_id, Some(node_run.version))
+            .await
+            .map_err(|error| artifact(format!("load graph: {error}")))?;
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_run.node_id)
+            .cloned()
+            .ok_or_else(|| artifact("job node is missing from graph"))?;
         if node.outputs.is_empty() {
             return Ok(());
         }
-        let file_fs = self.file_fs(job);
         file_fs.lock().await?;
-        let result = self.upload_locked(&file_fs, job, node).await;
+        let result = self.upload_locked(file_fs, &job, &node).await;
         let unlock = file_fs.unlock().await;
         result.and(unlock)
     }
 
-    async fn upload_locked(&self, file_fs: &FileFs, job: &Job, node: &Node) -> Result<(), Error> {
+    async fn upload_locked<J: JobFsTrait>(
+        &self,
+        file_fs: &J,
+        job: &Job,
+        node: &Node,
+    ) -> Result<(), Error> {
         validate_node_paths(node)?;
         let job_id = job.uuid;
         if node.outputs.is_empty() || read_marker(file_fs, job_id, "outputs-uploaded").await? {
             return Ok(());
         }
-        let root = file_fs.outputs_dir();
-        let graph = self.job_graph(job).await?;
-        let scope = Scope {
-            run_id: job.run_id,
-            graph_name: graph.name,
-            version: graph.version,
-            node_name: node.name.clone(),
-            revision: job.node_run.get().revision,
-        };
+        let root = file_fs.output_dir();
         for output in &node.outputs {
             let path = safe_existing(&root, &output.file_name).await?;
             if output.kind == Kind::Directory || output.multiple {
@@ -202,11 +221,8 @@ impl Filed {
                     if entry.kind == EntryKind::File {
                         let file_path = safe_existing(&path, &entry.path).await?;
                         self.upload_one(
-                            file_fs,
                             job_id,
-                            &scope
-                                .key(&format!("{}/{}", output.file_name, entry.path))
-                                .map_err(|e| artifact(e.to_string()))?,
+                            &format!("{}/{}", output.file_name, entry.path),
                             &file_path,
                             &format_for(&entry.path),
                         )
@@ -217,18 +233,16 @@ impl Filed {
                 // Replace a previous internal manifest atomically, never follow it.
                 write_json(&manifest_path, &manifest).await?;
                 self.upload_one(
-                    file_fs,
                     job_id,
-                    &output_key(&scope, output)?,
+                    &format!("{}/{}", output.file_name, DIRECTORY_MANIFEST),
                     &manifest_path,
                     DIRECTORY_FORMAT,
                 )
                 .await?;
             } else {
                 self.upload_one(
-                    file_fs,
                     job_id,
-                    &output_key(&scope, output)?,
+                    &output.file_name,
                     &path,
                     &format_for(&output.file_name),
                 )
@@ -240,9 +254,8 @@ impl Filed {
 
     async fn upload_one(
         &self,
-        file_fs: &FileFs,
         job_id: Uuid,
-        key: &str,
+        filename: &str,
         path: &Path,
         format: &str,
     ) -> Result<(), Error> {
@@ -252,46 +265,31 @@ impl Filed {
         }
         let transfer = self
             .client
-            .prepare_upload(job_id, self.agent_id, key, metadata.len(), format)
+            .prepare_upload(job_id, self.agent_id, filename, metadata.len(), format)
             .await?;
         if transfer.presigned.operation != PresignOperation::Upload {
             return Err(artifact("server returned the wrong upload operation"));
         }
-        if self.s3.supports(&transfer) {
-            let multipart = UploadContext {
-                job_id,
-                agent_id: self.agent_id,
-                key: key.to_owned(),
-                catalog_id: transfer.catalog.uuid,
-            };
-            let checkpoint = file_fs
-                .state_dir(job_id)
-                .join(format!("multipart-{}.json", transfer.catalog.uuid));
-            self.s3
-                .upload(&self.client, &multipart, &transfer, path, &checkpoint)
-                .await?;
-        } else {
-            let file = fs::File::open(path).await?;
-            let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-            let mut put = self
-                .objects
-                .put(&transfer.presigned.url)
-                .header(reqwest::header::CONTENT_LENGTH, metadata.len())
-                .body(body);
-            for (name, value) in &transfer.presigned.headers {
-                put = put.header(name, value);
-            }
-            put.send()
-                .await
-                .map_err(reqwest::Error::without_url)?
-                .error_for_status()
-                .map_err(reqwest::Error::without_url)?;
+        let file = fs::File::open(path).await?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        let mut put = self
+            .objects
+            .put(&transfer.presigned.url)
+            .header(reqwest::header::CONTENT_LENGTH, metadata.len())
+            .body(body);
+        for (name, value) in &transfer.presigned.headers {
+            put = put.header(name, value);
         }
+        put.send()
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
         self.client
             .commit_upload(
                 job_id,
                 self.agent_id,
-                key,
+                filename,
                 transfer.catalog.uuid,
                 metadata.len(),
                 format,
@@ -303,15 +301,18 @@ impl Filed {
         if job.run.is_unloaded() || job.node_run.is_unloaded() {
             return Err(artifact("job execution relations are not loaded"));
         }
-        let run = job.run.get();
-        let graph = self.client.graph(run.graph_id, Some(run.version)).await?;
-        if graph.id != run.graph_id || graph.version != run.version {
+        let node_run = job.node_run.get();
+        let graph = self
+            .client
+            .graph(node_run.graph_id, Some(node_run.version))
+            .await?;
+        if graph.id != node_run.graph_id || graph.version != node_run.version {
             return Err(artifact("graph does not match the job's run version"));
         }
         Ok(graph)
     }
 
-    async fn input_key(
+    async fn input_filename(
         &self,
         job: &Job,
         graph: &DAG,
@@ -368,17 +369,15 @@ impl Filed {
         else {
             return Ok(None);
         };
-        let scope = Scope {
-            run_id: job.run_id,
-            graph_name: producer_graph.name.clone(),
-            version: producer_graph.version,
-            node_name: producer_node.name.clone(),
-            revision: producer_run.revision,
+        let key = if output.kind == Kind::Directory || output.multiple {
+            format!("{}/{}", output.file_name, DIRECTORY_MANIFEST)
+        } else {
+            output.file_name.clone()
         };
-        output_key(&scope, output).map(Some)
+        Ok(Some(key))
     }
 
-    async fn response(&self, transfer: &Transfer) -> Result<reqwest::Response, Error> {
+    async fn response(&self, transfer: &CatalogTransfer) -> Result<reqwest::Response, Error> {
         if transfer.presigned.operation != PresignOperation::Download {
             return Err(artifact("server returned the wrong download operation"));
         }
@@ -394,7 +393,7 @@ impl Filed {
             .map_err(reqwest::Error::without_url)?)
     }
 
-    async fn manifest_bytes(&self, transfer: &Transfer) -> Result<Vec<u8>, Error> {
+    async fn manifest_bytes(&self, transfer: &CatalogTransfer) -> Result<Vec<u8>, Error> {
         if transfer.catalog.size > MAX_MANIFEST_BYTES {
             return Err(artifact("directory manifest is too large"));
         }
@@ -416,7 +415,11 @@ impl Filed {
         Ok(bytes)
     }
 
-    async fn download_file(&self, transfer: &Transfer, destination: &Path) -> Result<(), Error> {
+    async fn download_file(
+        &self,
+        transfer: &CatalogTransfer,
+        destination: &Path,
+    ) -> Result<(), Error> {
         let parent = destination
             .parent()
             .ok_or_else(|| artifact("input has no parent"))?;
@@ -428,27 +431,23 @@ impl Filed {
             .open(&temporary)
             .await?;
         let result = async {
-            if self.s3.supports(transfer) {
-                self.s3.download(transfer, &temporary).await?;
-            } else {
-                let mut response = self.response(transfer).await?;
-                let mut size = 0u64;
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(reqwest::Error::without_url)?
-                {
-                    size = size
-                        .checked_add(chunk.len() as u64)
-                        .ok_or_else(|| artifact("input size overflow"))?;
-                    if size > transfer.catalog.size {
-                        return Err(artifact("input exceeds catalog size"));
-                    }
-                    file.write_all(&chunk).await?;
+            let mut response = self.response(transfer).await?;
+            let mut size = 0u64;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(reqwest::Error::without_url)?
+            {
+                size = size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| artifact("input size overflow"))?;
+                if size > transfer.catalog.size {
+                    return Err(artifact("input exceeds catalog size"));
                 }
-                if size != transfer.catalog.size {
-                    return Err(artifact("incomplete input download"));
-                }
+                file.write_all(&chunk).await?;
+            }
+            if size != transfer.catalog.size {
+                return Err(artifact("incomplete input download"));
             }
             file.sync_all().await?;
             fs::rename(&temporary, destination).await?;
@@ -462,17 +461,56 @@ impl Filed {
     }
 }
 
-fn artifact(message: impl Into<String>) -> Error {
-    Error::Artifact(message.into())
+impl Transfer for JobTransfer {
+    type Err = Error;
+
+    async fn prepare_upload(&self, job: &Job, filename: &str) -> Result<Uuid, Self::Err> {
+        Ok(self
+            .client
+            .prepare_upload(job.uuid, self.agent_id, filename, 0, "")
+            .await?
+            .catalog
+            .uuid)
+    }
+
+    async fn commit_upload(
+        &self,
+        job: &Job,
+        filename: &str,
+        catalog_id: Uuid,
+    ) -> Result<(), Self::Err> {
+        self.client
+            .commit_upload(job.uuid, self.agent_id, filename, catalog_id, 0, "")
+            .await
+    }
+
+    async fn presign_download(&self, job: &Job, filename: &str) -> Result<PresignedUrl, Self::Err> {
+        self.client
+            .download_input(job.uuid, self.agent_id, filename)
+            .await?
+            .map(|transfer| transfer.presigned)
+            .ok_or_else(|| artifact("input is unavailable"))
+    }
+
+    async fn prepare_input<J: JobFsTrait, G: GraphFs + Clone>(
+        &self,
+        job_fs: &J,
+        graph: &G,
+    ) -> Result<(), Self::Err> {
+        JobTransfer::prepare_input(self, job_fs, graph).await
+    }
+
+    async fn complete_output<J: JobFsTrait, G: GraphFs + Clone>(
+        &self,
+        job_fs: &J,
+        graph: &G,
+    ) -> Result<(), Self::Err> {
+        JobTransfer::complete_output(self, job_fs, graph).await
+    }
 }
 
-fn output_key(scope: &Scope, output: &Output) -> Result<String, Error> {
-    let path = if output.kind == Kind::Directory || output.multiple {
-        format!("{}/{DIRECTORY_MANIFEST}", output.file_name)
-    } else {
-        output.file_name.clone()
-    };
-    scope.key(&path).map_err(|e| artifact(e.to_string()))
+fn artifact(message: impl Into<String>) -> Error {
+    Error::Artifact(message.into())
 }
 
 fn format_for(path: &str) -> String {
@@ -585,7 +623,7 @@ async fn directory_manifest(root: &Path) -> Result<DirectoryManifest, Error> {
     Ok(manifest)
 }
 
-async fn read_marker(file_fs: &FileFs, job_id: Uuid, name: &str) -> Result<bool, Error> {
+async fn read_marker<J: JobFsTrait>(file_fs: &J, job_id: Uuid, name: &str) -> Result<bool, Error> {
     match read_json(&file_fs.state_dir(job_id).join(format!("{name}.json"))).await {
         Ok(value) => Ok(value),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -593,7 +631,7 @@ async fn read_marker(file_fs: &FileFs, job_id: Uuid, name: &str) -> Result<bool,
     }
 }
 
-async fn write_marker(file_fs: &FileFs, job_id: Uuid, name: &str) -> Result<(), Error> {
+async fn write_marker<J: JobFsTrait>(file_fs: &J, job_id: Uuid, name: &str) -> Result<(), Error> {
     write_json(
         &file_fs.state_dir(job_id).join(format!("{name}.json")),
         &true,

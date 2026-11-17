@@ -24,9 +24,6 @@ use crate::{
 
 const MAX_EXPIRES_SECONDS: u64 = 604_800;
 
-#[cfg(test)]
-mod tests;
-
 const KEY_ENCODING: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')

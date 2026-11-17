@@ -218,12 +218,6 @@ data_dir: .rayflow/data
 batch: 64
 poll_interval: 1s
 request_timeout: 60s
-transfer:
-  enabled: true
-  multipart_threshold: 67108864
-  part_size: 8388608
-  concurrency: 4
-  max_attempts: 3
 resources:
   cpu_cores: 4
   memory_bytes: 4294967296
@@ -617,11 +611,9 @@ unreported results. Keep this directory across agent restarts.
 
 ## Agent inputs and outputs
 
-`FileFs` stores bytes separately from `JobFs` under
-`<data_dir>/<graph_run_uuid>/<node_id>/<revision>/`, with `inputs/`, `outputs/`,
-and internal transfer checkpoints. The graph run UUID isolates executions of
-the same graph. Job completion retains this data for downstream work; remove
-completed run directories when they are no longer needed.
+`JobFs` stores metadata and artifact bytes together. Its data directory is scoped by
+`<run_uuid>/<node_id>/<revision>`, with `inputs/`, `outputs/`, and transfer
+markers. Job completion retains this data for downstream work.
 
 Declare outputs on the producer node and bind downstream inputs with
 `source: "producer.output_name"`. In containers, read from
@@ -632,7 +624,7 @@ manifest. The agent downloads inputs before execution and uploads outputs before
 reporting success, with durable checkpoints for retries.
 
 Configure the server's S3-compatible storage before running nodes with artifacts.
-See [Catalog and object storage](catalog.md#http-api-and-agent-transfers) for
+See [Catalog and object storage](catalog.md#job-artifact-api) for
 configuration, endpoints, key format, directory manifests, and local retention.
 
 ## Database changes

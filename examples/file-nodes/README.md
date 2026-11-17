@@ -24,7 +24,7 @@ not receive those declarations automatically.
 | `rayflow-file-rename:local` | `INPUT OUTPUT [INPUT OUTPUT ...]` | Copy each read-only input to its new output name, preserving bytes. |
 | `rayflow-file-verify:local` | `INPUT INPUT` | Compare exactly two files byte for byte. No output file. |
 
-Generate node `settings.config` (12 MiB per file to exercise multipart transfers):
+Generate node `settings.config` (12 MiB per file to exercise large artifact transfers):
 
 ```json
 {

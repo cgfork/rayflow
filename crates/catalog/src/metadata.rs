@@ -27,55 +27,6 @@ pub trait File {
     fn catalog_id(&self) -> Self::CatalogId;
 }
 
-/// An object payload without an identity or persistence fields.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct CatalogInput {
-    pub key: String,
-    pub url: String,
-    pub size: u64,
-    pub format: String,
-    /// Whether the object upload has been acknowledged.
-    #[serde(default)]
-    pub uploaded: bool,
-}
-
-impl CatalogInput {
-    /// Constructs metadata for an upload that has not yet been acknowledged.
-    pub fn new(
-        key: impl Into<String>,
-        url: impl Into<String>,
-        size: u64,
-        format: impl Into<String>,
-    ) -> Self {
-        Self {
-            key: key.into(),
-            url: url.into(),
-            size,
-            format: format.into(),
-            uploaded: false,
-        }
-    }
-}
-
-impl Catalog for CatalogInput {
-    fn key(&self) -> &str {
-        &self.key
-    }
-
-    fn url(&self) -> &str {
-        &self.url
-    }
-    fn size(&self) -> u64 {
-        self.size
-    }
-    fn format(&self) -> &str {
-        &self.format
-    }
-    fn uploaded(&self) -> bool {
-        self.uploaded
-    }
-}
-
 /// Sparse catalog data. `None` leaves an existing field unchanged.
 /// Upserts require a key; new rows also require URL, size, and format.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]

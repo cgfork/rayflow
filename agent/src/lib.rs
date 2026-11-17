@@ -7,7 +7,7 @@ use std::{io, path::Path};
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
-    fs::{self, OpenOptions},
+    fs::{self as tokio_fs, OpenOptions},
     io::AsyncWriteExt,
 };
 use uuid::Uuid;
@@ -17,18 +17,16 @@ pub mod agentic;
 pub mod client;
 pub mod containerd;
 pub mod errors;
-pub mod filed;
-pub mod filefs;
-pub mod graphfs;
-pub mod jobfs;
+pub mod fs;
 pub mod settings;
-pub mod transfer;
+
+pub use fs::{AgentFs, GraphFs, JobFs as JobFsProvider};
 
 pub use agentd::{AgentResult, Agentd, JobOutcome, StopReason};
 pub use agentic::Agentic;
 
 pub(crate) async fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, errors::Error> {
-    let contents = fs::read(path).await?;
+    let contents = tokio_fs::read(path).await?;
     serde_json::from_slice(&contents)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
 }
@@ -38,7 +36,7 @@ pub(crate) async fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("JSON path has no parent"))?;
-    fs::create_dir_all(dir).await?;
+    tokio_fs::create_dir_all(dir).await?;
 
     let name = path
         .file_name()
@@ -55,11 +53,11 @@ pub(crate) async fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(
         file.flush().await?;
         file.sync_all().await?;
         drop(file);
-        fs::rename(&temporary, path).await
+        tokio_fs::rename(&temporary, path).await
     }
     .await;
     if result.is_err() {
-        let _ = fs::remove_file(&temporary).await;
+        let _ = tokio_fs::remove_file(&temporary).await;
     }
     result.map_err(Into::into)
 }

@@ -10,7 +10,7 @@ catalog's key for the path. Catalog keys and URLs have separate unique
 
 Register `catalog::models()` or use `server::models()`. Run `./init-db.sh` before
 starting updated binaries. `rayflow.sql` contains the schema for fresh installs.
-Migrations 19–21 add stable node-run UUIDs, backfill file ownership, and remove
+Migrations 19–22 add stable node-run and configuration UUIDs, backfill file ownership, and remove
 `file.fullpath`. Numeric node-run primary keys and task/job references remain
 unchanged. Each new node-run revision gets a new UUID; Pend/Resume keeps the same
 UUID. Run inspection exposes each node run's UUID as `state.nodes[].uuid`.
@@ -52,7 +52,7 @@ Identities implement `Id` (`Clone`, `Eq`, `Hash`, `Debug`, and `Display`).
 `node_run_id()`, `filename()`, and `catalog_id()` using its associated catalog ID
 type. Neither data trait exposes the object's own identity. Database IDs and
 audit timestamps remain on the persistence models.
-`CatalogInput` and `FileInput<I>` are convenient write payloads without their
+`CatalogOptionalData` and `FileInput<I>` are convenient write payloads without their
 own identities or audit fields; custom types and trait objects also work.
 
 `CatalogOptionalData` has optional `key`, `url`, `size`, `format`, and `uploaded` fields.
@@ -98,11 +98,15 @@ subject to the existing unique constraints. Constraint failures remain database
 errors and roll back the write.
 
 ```rust,ignore
-use catalog::{CatalogInput, CatalogSystem, FileInput, FileKey, FileSystem};
+use catalog::{CatalogOptionalData, CatalogSystem, FileInput, FileKey, FileSystem};
 
-let catalog_id = db.upsert_catalog(&CatalogInput::new(
-    "/run-1/results.csv", "s3://artifacts/run-1/results.csv", 1024, "text/csv",
-)).await?;
+let catalog_id = db.upsert_catalog(&CatalogOptionalData {
+    key: Some("/run-1/results.csv".into()),
+    url: Some("s3://artifacts/run-1/results.csv".into()),
+    size: Some(1024),
+    format: Some("text/csv".into()),
+    uploaded: Some(false),
+}).await?;
 let file_id = db.upsert_file(&FileInput::new(
     node_run.uuid, "results.csv", catalog_id,
 )).await?;
@@ -123,8 +127,8 @@ and replaces them with ORM updates inside the same transaction. Uniquely generat
 temporary keys are never committed. Character limits and the SQL schema remain
 unchanged.
 
-`CatalogInput` includes `uploaded: bool`. Its constructor and JSON payloads that
-omit the field default to `false`. Catalog upserts persist the supplied
+`CatalogOptionalData` includes `uploaded: bool`. JSON payloads that omit the field
+default to `false`. Catalog upserts persist the supplied
 flag, including when the size or format changes. Callers set it to `false`
 before uploading and `true` after a successful upload. Metadata reads include
 unacknowledged records so their status remains inspectable.
@@ -176,9 +180,9 @@ rows become readable. Duplicate URLs or full paths across historical rows must
 be resolved before upgrading; the migrations fail instead of merging identities
 or discarding records.
 
-The agent constructs job-specific keys with its private `Scope` helper. Directory
-manifest types live in `catalog::directory`, and claim-scoped HTTP request/response
-types live in `server::api::catalog`. The catalog crate contains metadata,
+The server constructs job-specific keys from the claimed job and filename. Directory
+manifest types live in `catalog::directory`, and job artifact request/response
+types live in `server::api::job`. The catalog crate contains metadata,
 provider signing contracts, and generic relative-path validation in
 `catalog::path`; it does not depend on job transfer payloads.
 
@@ -198,7 +202,7 @@ async fn presign<'a>(
 `PresignOperation::Upload` authorizes HTTP PUT; `Download` authorizes HTTP GET.
 The result contains the URL, operation, required headers, and actual expiry.
 The same trait provides synchronous `presign_catalog` for already-loaded data
-and `supports_multipart`. Loaded-record signing performs no persistence I/O, so
+and `supports_whole-object`. Loaded-record signing performs no persistence I/O, so
 upload preparation can sign uncommitted catalog data without moving lookups
 outside its transaction. Server handlers use only this contract; provider
 construction is confined to storage configuration.
@@ -212,8 +216,8 @@ CompleteMultipart { upload_id: String },
 AbortMultipart { upload_id: String },
 ```
 
-The same signing methods handle whole objects and multipart operations. The
-server selects this enum from the multipart endpoint and its request fields;
+The same signing methods handle whole objects and whole-object operations. The
+server selects this enum from the whole-object endpoint and its request fields;
 HTTP payload types are not part of `ObjectStorage`. Whole-object operation JSON remains
 `"upload"` or `"download"`; a signed part operation includes its parameters, for
 example `{"upload_part":{"upload_id":"...","part_number":1}}`. Agents verify
@@ -246,7 +250,7 @@ endpoint, region, and credentials; catalog locations use the common `s3` scheme.
 
 ```rust,ignore
 use std::{env, time::Duration};
-use catalog::{CatalogInput, CatalogSystem, ObjectStorage, PresignOperation};
+use catalog::{CatalogOptionalData, CatalogSystem, ObjectStorage, PresignOperation};
 use catalog::s3::{Config, Credentials, S3};
 
 // db already has catalog::models() registered and current migrations applied.
@@ -260,9 +264,13 @@ let credentials = Credentials::new(
 let mut config = Config::new(env::var("S3_ENDPOINT")?, credentials);
 config.region = env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
 let mut storage = S3::new(db, config)?;
-let catalog_id = storage.upsert_catalog(&CatalogInput::new(
-    "/run-1/results.csv", "s3://artifacts/run-1/results.csv", 1024, "text/csv",
-)).await?;
+let catalog_id = storage.upsert_catalog(&CatalogOptionalData {
+    key: Some("/run-1/results.csv".into()),
+    url: Some("s3://artifacts/run-1/results.csv".into()),
+    size: Some(1024),
+    format: Some("text/csv".into()),
+    uploaded: Some(false),
+}).await?;
 
 let upload = storage.presign(
     catalog_id, PresignOperation::Upload, Duration::from_secs(900),
@@ -309,268 +317,36 @@ The feature is disabled by default, so default builds do not include the AWS
 signing dependencies.
 
 
-## HTTP API and agent transfers
+## Job artifact API
 
-The catalog HTTP API has seven POST endpoints: prepare, commit, and download
-under `/api/v1/catalog`, plus create, upload, complete, and abort under
-`/api/v1/catalog/multipart`. All request parameters
-are in JSON bodies; these URLs have no path parameters.
+Agents use job-scoped endpoints. The server constructs catalog keys from the
+claimed job, its pinned node run, revision, and the supplied relative filename.
+Agents do not submit storage keys.
 
-Configure storage on the **server**, using an existing S3-compatible bucket and
-an endpoint reachable from agents:
-
-```yaml
-storage:
-  endpoint: http://localhost:9000
-  bucket: rayflow-artifacts
-  prefix: artifacts
-  region: us-east-1
-  access_key: deployment-access-key
-  secret_key: deployment-secret-key
-  presign_ttl: 15m
-  multipart_enabled: true
-  # session_token: optional-temporary-token
-  # credential_expiry: 2027-01-01T00:00:00Z
-```
-
-Nested overrides use `RAYFLOW_STORAGE__ENDPOINT`, `RAYFLOW_STORAGE__BUCKET`,
-`RAYFLOW_STORAGE__PREFIX`, `RAYFLOW_STORAGE__ACCESS_KEY`,
-`RAYFLOW_STORAGE__SECRET_KEY`, and the same convention for the other fields.
-Keep credentials in deployment configuration; agents only receive temporary
-signed URLs. Signatures are limited by `presign_ttl`, the remaining job claim,
-and credential expiry. Uploads and downloads must finish within the job lease;
-set the lease and agent `request_timeout` to accommodate large transfers.
-
-Logical names follow:
-
-```text
-/<prefix>/<run_uuid>/<graph_name>/<version>/<node_name>/<revision>/<filename>
-```
-
-Graph and node names are encoded as single path components, preserving names
-containing spaces or slashes without adding directory levels. The catalog URL
-is `s3://<bucket>/<prefix>/<key>` with URL escaping applied. `version` comes from the owning `Run.version` for current transfers, and
-`revision` is the producing node run's revision. Historical output lookup uses
-`NodeRun.version` to find the graph and node names used by that producer.
-
-`Filed` resolves output locations and input sources on the agent. Every request
-includes `job_id`, `agent_id`, and a `key` relative to the server's configured
-prefix. The key contains the run UUID, graph name/version, node name/revision,
-and filename, with no leading slash:
-
-```json
-{
-  "job_id": "00000000-0000-0000-0000-000000000001",
-  "agent_id": "00000000-0000-0000-0000-000000000002",
-  "key": "00000000-0000-0000-0000-000000000003/flow/1/producer/0/result.csv",
-  "size": 1024,
-  "format": "csv"
-}
-```
-
-| POST endpoint | Additional fields | Result |
+| Endpoint | Request | Result |
 | --- | --- | --- |
-| `/api/v1/catalog/prepare` | `size`, `format` | `{catalog, presigned}` for PUT; uploaded is false |
-| `/api/v1/catalog/commit` | `catalog_uuid`, `size`, `format` | Published file; uploaded is true |
-| `/api/v1/catalog/download` | None | `{catalog, presigned}` for GET |
-| `/api/v1/catalog/multipart/create` | `catalog_uuid` | Signed initiation request |
-| `/api/v1/catalog/multipart/upload` | `catalog_uuid`, `upload_id`, `part_number` | Signed part upload request |
-| `/api/v1/catalog/multipart/complete` | `catalog_uuid`, `upload_id` | Signed completion request |
-| `/api/v1/catalog/multipart/abort` | `catalog_uuid`, `upload_id` | Signed abort request |
+| `POST /api/v1/job/output/prepare` | `job_id`, `agent_id`, `filename`, `size`, `format` | Catalog UUID and ordinary upload signature |
+| `POST /api/v1/job/output/commit` | `job_id`, `agent_id`, `filename`, `catalog_uuid` | Marks the catalog uploaded and publishes the file |
+| `POST /api/v1/job/input/presign` | `job_id`, `agent_id`, `filename` | Download signature and catalog metadata |
 
-The agent sends prepare, uploads the bytes using the returned URL and headers,
-then sends commit with the same key and metadata plus `catalog.uuid`. Prepare
-upserts by catalog key, so retries reuse the catalog UUID; commit verifies the prepared
-metadata and atomically acknowledges the upload and publishes its logical file.
-The server trusts the agent's completed PUT; it does not HEAD the object.
-The agent reports success only after all outputs are committed.
-
-The server adds its configured prefix to the supplied relative key to form the
-catalog key `/prefix/<key>`; files reference that catalog and their producing node run. It adds the bucket to form
-the object URL used for signing. Catalog handlers do not load graph definitions,
-interpret input/output names, or choose producer revisions. Directory members
-have their own keys; the root directory uses a key ending in
-`.rayflow-directory.json`.
-
-For inputs, the agent resolves `source: "producer.output_name"` against its
-pinned graph. It reads `GET /api/v1/runs/{run_id}?revision=<consumer_revision>` to find
-the latest effective producer at or before the consumer revision, requires
-`Succeeded`, and uses the returned node's `version` to load the producer's
-original graph and names. This preserves input references after reruns and
-graph upgrades. The agent sends the resulting key to download, then fetches the
-signed URL. Optional missing inputs are skipped; required missing inputs fail
-before startup.
-
-Each catalog request requires an active, unexpired claim owned by `agent_id`.
-Keys must stay within that claim's run; path traversal and absolute keys are
-rejected. Agents are responsible for declared input/output bindings within the
-run. With authentication enabled, fleet credentials can call the seven POST
-routes and read graph definitions and individual run states. Browser writes
-also require `X-Rayflow-Request: 1`. Transfers return 503 when storage is absent,
-409 for a lost claim, and 404 for unavailable artifacts. Object requests use a
-separate HTTP client without the fleet credential.
-
-Deploy matching server and agent binaries: the old `/jobs/{job_id}/artifacts/*`
-routes and `input`/`output`/`path` request fields have been removed.
-
-### Large files and multipart transfers
-
-When `storage.multipart_enabled` is true (the default), prepare and download
-responses advertise `multipart: true`. The agent's concrete `S3TransferClient`
-uses multipart uploads and ranged GETs for sufficiently large files. Other
-providers or older servers that omit this capability retain streamed PUT/GET.
-Storage credentials remain on the server; the agent never needs RustFS/S3 keys.
-
-Agent settings (sizes are bytes):
-
-```yaml
-transfer:
-  enabled: true
-  multipart_threshold: 67108864  # 64 MiB
-  part_size: 8388608             # 8 MiB
-  concurrency: 4
-  max_attempts: 3
-```
-
-Configure these with `RAYFLOW_AGENT_TRANSFER__MULTIPART_THRESHOLD`,
-`RAYFLOW_AGENT_TRANSFER__PART_SIZE`, `RAYFLOW_AGENT_TRANSFER__CONCURRENCY`, and
-matching nested overrides. Threshold must be at least 5 MiB, part size 5 MiB to
-5 GiB, concurrency 1–32, and attempts 1–5. Uploads automatically increase part
-size when needed to stay within 10,000 parts. `storage.multipart_enabled: false`
-(or `RAYFLOW_STORAGE__MULTIPART_ENABLED=false`) disables the provider capability;
-`transfer.enabled: false` disables it for one agent.
-
-For uploads, the agent uses four separate POST endpoints. Every body includes
-`job_id`, `agent_id`, `key`, and `catalog_uuid`:
-
-- `/api/v1/catalog/multipart/create` needs no additional fields.
-- `/api/v1/catalog/multipart/upload` adds `upload_id` and `part_number`.
-- `/api/v1/catalog/multipart/complete` adds `upload_id`.
-- `/api/v1/catalog/multipart/abort` adds `upload_id`.
-
-For example, a part authorization request has this flat JSON body:
-
-```json
-{
-  "job_id": "<job UUID>",
-  "agent_id": "<agent UUID>",
-  "key": "<run-scoped file key>",
-  "catalog_uuid": "<UUID returned by prepare>",
-  "upload_id": "<ID returned by storage initiation>",
-  "part_number": 1
-}
-```
-
-The endpoint selects the operation; there is no `action` field. The former
-`POST /api/v1/catalog/multipart` endpoint is removed. Each endpoint returns a
-signed provider request and rechecks the active claim, run-scoped key, prepared
-catalog identity, and signing lifetime. Provider completion is followed by the
-separate catalog commit that publishes the file atomically.
-Part bytes travel directly to storage. Completed ETags are persisted under the
-job's transfer checkpoint directory; after a process restart, an unchanged
-source resumes those parts. A changed size, modification time, or part size
-requires aborting the old session and starting again. Failed part/range requests
-are retried up to `max_attempts`; explicit upload failures attempt to abort the
-session. Configure the bucket's incomplete-multipart lifecycle policy to reclaim
-sessions left by lost claims or a crash before the upload ID was checkpointed.
-
-The agent validates completion XML, including errors returned with HTTP 200,
-before calling the existing catalog commit endpoint. Small files and directory
-manifests keep the single-request path. Large downloads stream bounded ranges
-into a temporary file, validate Content-Range and byte counts, and pin subsequent
-requests with If-Match to the first ETag. Ignored ranges or changing objects fail
-instead of publishing mixed contents. Only a complete download replaces the
-input file. A restarted input preparation currently restarts its download.
-
-Choose part size and `request_timeout` so each part and completion request can
-finish within the job claim and signed-URL lifetime; active jobs do not renew
-leases. Transfer concurrency is per file and bounds HTTP requests, not the
-agent's CPU/memory scheduling capacity.
-
-### Directories
-
-A `Directory` output, or an output with `multiple: true`, is a directory beneath
-the output root. Its files are uploaded individually; then Filed writes and
-uploads `.rayflow-directory.json` last, using format
-`application/vnd.rayflow.directory+json`. Its structure is:
-
-```json
-{
-  "version": 1,
-  "entries": [
-    { "path": "empty", "kind": "directory", "size": 0 },
-    { "path": "results.csv", "kind": "file", "size": 123 }
-  ]
-}
-```
-
-Entries are relative to the declared directory. Nested and empty directories
-are preserved. Downloads validate the manifest and check each file's byte size
-against catalog metadata. Manifests are limited to 2 MiB and 10,000 entries.
-Traversal, absolute paths, duplicate entries, symlinks, and reserved manifest
-names inside user content are rejected. The root internal manifest is managed
-by Filed and must not be used as a declared file name.
+The server validates the active job claim, checks the declared input or output,
+and derives the producer node run for input downloads. Upload state and transfer
+markers are persisted in the job filesystem. The agent uses ordinary presigned
+HTTP PUT and GET requests.
 
 ### Local data layout
 
-Configure the agent's `data_dir` (default `.rayflow/data` when loading settings),
-or `RAYFLOW_AGENT_DATA_DIR`. `FileFs` manages artifacts independently of `JobFs`:
+`JobFs` stores metadata under the job UUID and artifact data under the pinned
+run/node/revision directory:
 
 ```text
-<data_dir>/<graph_run_uuid>/<node_id>/<revision>/inputs/<input.file_name>
-<data_dir>/<graph_run_uuid>/<node_id>/<revision>/outputs/<output.file_name>
-<data_dir>/<graph_run_uuid>/<node_id>/<revision>/.rayflow/<job_uuid>/...
+<metadata_dir>/<job_uuid>/job.json
+<metadata_dir>/<job_uuid>/container.json
+<data_dir>/<run_uuid>/<node_id>/<revision>/inputs/<filename>
+<data_dir>/<run_uuid>/<node_id>/<revision>/outputs/<filename>
+<data_dir>/<run_uuid>/<node_id>/<revision>/.rayflow/<job_uuid>/...
 ```
 
-`graph_run_uuid` is the execution UUID, not the graph definition UUID. Nodes in
-one run share the run directory, while separate executions remain isolated.
-Transfer checkpoints are job-specific so resumed jobs can reuse the node's data
-without inheriting an earlier job's completed-upload marker. Outputs and
-checkpoints survive job acknowledgement. Retain the run directory until its
-downstream nodes and any planned reruns have finished; cleanup is explicit
-(`FileFs::clear` for a node revision), with no automatic retention policy.
-
-Docker mounts the node's inputs read-only at `/data/inputs` and outputs writable
-at `/data/outputs`, also available as `RAYFLOW_INPUT_DIR` and
-`RAYFLOW_OUTPUT_DIR`. Commands should write declared outputs there. Downstream
-inputs are resolved through the catalog and staged in the consumer's input
-directory, including when the producer ran on another agent.
-
-Library users can supply separate roots through `Agentd::open_with_data_dir`
-and matching `Settings.data_dir`. The convenience `Agentd::open` and
-`Settings::new` use `workdir/data`; set an explicit root for deployments.
-
-## Browser downloads from Runtime
-
-The Runtime node inspector always shows download actions for declared inputs.
-It shows output download actions only when that node has succeeded. An input
-whose producer has not published a file returns a not-found error.
-
-`POST /api/v1/runs/{run_id}/files/download` returns catalog metadata and a signed
-GET URL through `ObjectStorage`. Unlike the agent catalog endpoint, it does not
-require an active job claim. It requires a browser session when auth is enabled;
-fleet bearer credentials cannot access this route. The normal browser write
-header (`X-Rayflow-Request: 1`) and origin checks apply.
-
-```json
-{
-  "node_id": "b7c91d28-4a26-482b-95b9-fd4caabfa945",
-  "direction": "output",
-  "file_name": "x.json",
-  "revision": 2
-}
-```
-
-`direction` is `input` or `output`. `revision` may be omitted to select the
-current run revision. The server validates the declared port and resolves its
-producer's pinned graph version and node revision. Outputs require a succeeded
-node; all downloads require committed, uploaded catalog metadata. Requesters
-cannot supply arbitrary catalog keys or storage URLs.
-
-`GET /api/v1/runs/{run_id}/files/content` accepts the same fields as query
-parameters and streams the object through the server with
-`Content-Disposition: attachment` and `application/octet-stream`. The Runtime
-button checks availability via POST, then uses this same-origin GET so the
-browser saves the file regardless of its storage content type. Large objects
-are streamed without buffering the entire object. No RustFS CORS setup is needed.
-Directory outputs download their `.rayflow-directory.json` manifest.
+The agent keeps input readiness, output completion, and transfer state in jobfs.
+Outputs remain available after acknowledgement for downstream jobs. Docker mounts
+inputs read-only at `/data/inputs` and outputs writable at `/data/outputs`.

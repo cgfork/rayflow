@@ -93,6 +93,9 @@ pub struct File {
     pub catalog_uuid: Uuid,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    #[belongs_to(key = catalog_uuid, references = uuid)]
+    #[serde(default, skip_serializing_if = "toasty::Deferred::is_unloaded")]
+    pub catalog: toasty::Deferred<Catalog>,
 }
 
 impl File {
@@ -111,6 +114,7 @@ impl File {
             catalog_uuid,
             created_at: Timestamp::UNIX_EPOCH,
             updated_at: Timestamp::UNIX_EPOCH,
+            catalog: toasty::Deferred::default(),
         }
     }
 }

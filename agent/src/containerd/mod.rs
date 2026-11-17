@@ -195,7 +195,7 @@ pub trait Containerd: Clone + Send + Sync + 'static {
 
     /// Creates or reconnects to the provider container described by `spec`.
     ///
-    /// The returned handle must be suitable for persisting in `JobFs` before
+    /// The returned handle must be suitable for persisting in `fs::job::JobFs` before
     /// the caller starts the container. If creation races with recovery, an
     /// implementation may return a handle to an already-existing container
     /// with the same deterministic identity.

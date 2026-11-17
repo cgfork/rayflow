@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use event::task_event::TaskEvent;
+use graph::{GraphStore, types::DAG};
 use scheduler::{AgentRef, ResourceCapacity};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -47,6 +48,37 @@ pub struct JobActionRequest {
     pub agent_id: Uuid,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PrepareOutputRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub filename: String,
+    pub size: Option<u64>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrepareOutputResponse {
+    pub catalog_uuid: Uuid,
+    #[serde(flatten)]
+    pub transfer: crate::api::run::Transfer,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitOutputRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub filename: String,
+    pub catalog_uuid: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PresignInputRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub filename: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PollJobsResponse {
     pub jobs: Vec<scheduler::Job>,
@@ -54,7 +86,9 @@ pub struct PollJobsResponse {
 
 pub(super) fn routes<S>() -> Router<App<S>>
 where
-    S: Clone + Send + Sync + 'static,
+    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
 {
     Router::new()
         .route("/jobs", get(list_jobs::<S>))
@@ -65,6 +99,67 @@ where
         .route("/job/succeed", post(succeed_job::<S>))
         .route("/job/fail", post(fail_job::<S>))
         .route("/job/terminate", post(terminate_job::<S>))
+        .route("/job/output/prepare", post(prepare_output::<S>))
+        .route("/job/output/commit", post(commit_output::<S>))
+        .route("/job/input/presign", post(presign_input::<S>))
+}
+
+async fn prepare_output<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<PrepareOutputRequest>,
+) -> Result<Json<PrepareOutputResponse>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.prepare_output(
+        request.job_id,
+        request.agent_id,
+        request.filename,
+        request.size,
+        request.format,
+    )
+    .await
+    .map(|transfer| {
+        Json(PrepareOutputResponse {
+            catalog_uuid: transfer.catalog.uuid,
+            transfer,
+        })
+    })
+}
+
+async fn commit_output<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<CommitOutputRequest>,
+) -> Result<Json<Uuid>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.commit_output(
+        request.job_id,
+        request.agent_id,
+        request.filename,
+        request.catalog_uuid,
+    )
+    .await
+    .map(Json)
+}
+
+async fn presign_input<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<PresignInputRequest>,
+) -> Result<Json<crate::api::run::Transfer>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.presign_input(request.job_id, request.agent_id, request.filename)
+        .await
+        .map(Json)
 }
 
 #[derive(Debug, Deserialize)]

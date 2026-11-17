@@ -566,18 +566,14 @@ fn agent_route(method: &Method, path: &str) -> bool {
         return matches!(
             path,
             "/jobs/poll"
-                | "/catalog/prepare"
-                | "/catalog/commit"
-                | "/catalog/download"
-                | "/catalog/multipart/create"
-                | "/catalog/multipart/upload"
-                | "/catalog/multipart/complete"
-                | "/catalog/multipart/abort"
                 | "/job/cancel"
                 | "/job/yield"
                 | "/job/succeed"
                 | "/job/fail"
                 | "/job/terminate"
+                | "/job/output/prepare"
+                | "/job/output/commit"
+                | "/job/input/presign"
         );
     }
     *method == Method::GET

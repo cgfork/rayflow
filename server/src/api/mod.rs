@@ -15,9 +15,6 @@
 //! * `POST /graphs/{graph_id}/publish` — validate and publish the draft.
 //! * `POST /task_events` — emit a `TaskEvent` for a task.
 //! * `POST /jobs/poll` — claim jobs matching the agent's capacity, optionally long-polling.
-//! * `POST /catalog/prepare` — prepare metadata and a signed upload URL.
-//! * `POST /catalog/commit` — acknowledge an upload and publish its file.
-//! * `POST /catalog/download` — sign the download URL for an agent-supplied key.
 //! * `POST /job/cancel` — cancel a job and emit `TaskEvent::Cancel`.
 //! * `POST /job/yield` — yield a job and emit `TaskEvent::Yield`.
 //! * `POST /job/succeed` — complete a job and emit `TaskEvent::Succeed`.
@@ -32,7 +29,6 @@
 //! and `error` (the human-readable message).
 
 pub mod agent;
-pub mod catalog;
 pub mod graph;
 pub mod job;
 pub mod run;
@@ -68,7 +64,6 @@ where
         enabled: state.config.auth.enabled,
     };
     graph::routes::<S>()
-        .merge(catalog::routes::<S>())
         .merge(agent::routes::<S>())
         .merge(run::routes::<S>())
         .merge(job::routes::<S>())

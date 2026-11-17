@@ -17,8 +17,7 @@ use std::{collections::BTreeMap, time::Duration};
 use jiff::Timestamp;
 
 pub use metadata::{
-    Catalog, CatalogInput, CatalogOptionalData, File, FileInput, FileOptionalData, FileWithCatalog,
-    Id,
+    Catalog, CatalogOptionalData, File, FileInput, FileOptionalData, FileWithCatalog, Id,
 };
 pub use model::models;
 pub use store::Error;

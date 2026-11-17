@@ -2,47 +2,143 @@
 
 //! Read-side state of a run: node runs joined with their graph node.
 
-use std::collections::HashMap;
-
 use graph::Graph;
 use graph::GraphStore;
-use graph::types::{DAG, Input, Kind, Node, Output};
-use jiff::Timestamp;
+use graph::types::DAG;
 use runtime::command::{NodeRun, Run};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::api::catalog::{
-    CommitUploadRequest, DownloadRequest, MultipartRequest, PrepareUploadRequest, Transfer,
-};
-use crate::api::run::{FileDirection, RunFileDownloadRequest};
+use crate::api::run::{FileDirection, RunFileDownloadRequest, Transfer};
 use crate::app::{App, AppError, Page, PageQuery, RunApp};
-use catalog::{
-    CatalogInput, CatalogOptionalData, CatalogSystem, FileInput, FileSystem, FileWithCatalog,
-    ObjectStorage, PresignOperation,
-};
-use event::{
-    Emit as TaskEventWrite, Read as TaskRead,
-    task::Task,
-    task_event::{TaskEvent, TaskEventEntry},
-};
-use graph::{DraftGraphStore, ForkPoint};
-use scheduler::{
-    AgentRef, Job, JobPoll,
-    actuator::{NodeConfig, Status},
-    cancel_job, fail_job, succeed_job, terminate_job, yield_job,
-};
-use std::time::Duration;
-use toasty::{Executor, Transaction};
+use catalog::{FileSystem, ObjectStorage, PresignOperation};
+use event::task::Task;
+use event::task_event::{TaskEvent, TaskEventEntry};
+use event::{Emit as TaskEventWrite, Read as TaskRead};
 
 #[derive(Debug, Serialize)]
 pub struct RunView {
-    pub state: GraphState,
+    pub run: Run,
     pub graph: DAG,
-    pub current: bool,
+    pub node_runs: Vec<(NodeRun, graph::types::Node)>,
 }
 
 impl<S> App<S> {
+    /// Emits an event for a task after resolving its run and node references.
+    pub async fn emit_task_event(
+        &self,
+        task_id: Uuid,
+        event: TaskEvent,
+    ) -> Result<TaskEventEntry, AppError> {
+        let mut db = self.db.clone();
+        let task = Task::read(&mut db, task_id)
+            .await
+            .map_err(|error| match error {
+                event::Error::TaskNotFound(task_id) => AppError::TaskNotFound(task_id),
+                error => AppError::from(error),
+            })?;
+        let entry = TaskEventEntry::new(&task, event);
+        entry.emit(&mut db).await?;
+        Ok(entry)
+    }
+
+    pub async fn download_run_file(
+        &self,
+        run_id: Uuid,
+        request: RunFileDownloadRequest,
+    ) -> Result<Transfer, AppError>
+    where
+        S: GraphStore<Uuid, G = DAG> + Clone,
+        S::Err: Send + Sync + 'static,
+    {
+        let run = self.read_run_at(run_id, request.revision).await?;
+        let graph = self.read_graph(run.graph_id, Some(run.version)).await?;
+        let node = graph
+            .node(request.node_id)
+            .ok_or(AppError::NodeNotFound(request.node_id))?;
+        let mut filename = request.file_name.as_str();
+        let producer = match request.direction {
+            FileDirection::Output => {
+                if !node
+                    .data
+                    .outputs
+                    .iter()
+                    .any(|output| output.file_name == filename)
+                {
+                    return Err(AppError::InvalidRequest(
+                        "file is not a declared output".into(),
+                    ));
+                }
+                request.node_id
+            }
+            FileDirection::Input => {
+                let input = node
+                    .data
+                    .inputs
+                    .iter()
+                    .find(|input| input.file_name == filename)
+                    .ok_or_else(|| {
+                        AppError::InvalidRequest("file is not a declared input".into())
+                    })?;
+                let (producer_name, producer_file) = input
+                    .source
+                    .split_once('.')
+                    .ok_or_else(|| AppError::InvalidRequest("input source is invalid".into()))?;
+                let producer = graph
+                    .nodes()
+                    .find(|candidate| candidate.data.name == producer_name)
+                    .ok_or_else(|| {
+                        AppError::InvalidRequest("input producer is not in the graph".into())
+                    })?;
+                if !producer
+                    .data
+                    .outputs
+                    .iter()
+                    .any(|output| output.file_name == producer_file)
+                {
+                    return Err(AppError::InvalidRequest(
+                        "input producer output is not declared".into(),
+                    ));
+                }
+                filename = producer_file;
+                producer.id
+            }
+        };
+        let mut db = self.db.clone();
+        let node_run = node_run_at(&mut db, run.uuid, producer, run.revision)
+            .await?
+            .ok_or(AppError::NodeNotFound(producer))?;
+        if node_run.status != "Succeeded" {
+            return Err(AppError::InvalidRequest(
+                "file producer has not succeeded".into(),
+            ));
+        }
+        let file = db
+            .get_file_by_node_run_filename(node_run.uuid, filename)
+            .await?
+            .ok_or_else(|| AppError::ArtifactNotFound(filename.to_owned()))?;
+        let catalog = file
+            .catalog
+            .ok_or_else(|| AppError::ArtifactNotFound(filename.to_owned()))?;
+        if !catalog.uploaded {
+            return Err(AppError::ArtifactNotFound(catalog.uuid.to_string()));
+        }
+        let config = self
+            .config
+            .storage
+            .as_ref()
+            .ok_or(AppError::StorageUnavailable)?;
+        let storage = config.object_storage(self.db.clone())?;
+        let presigned = storage
+            .presign_catalog(&catalog, PresignOperation::Download, config.presign_ttl)
+            .map_err(|error| AppError::Storage(Box::new(error)))?;
+        Ok(Transfer {
+            catalog,
+            presigned,
+            multipart: config.multipart_enabled && storage.supports_multipart(),
+        })
+    }
+
     pub async fn list_runs(
         &self,
         page: PageQuery,
@@ -103,93 +199,16 @@ impl<S> App<S> {
         // Run is unique by (data_id, graph_id); upgrades and reruns preserve its UUID.
         // Keep `current` in the response for compatibility without reloading the same row.
         let graph = self.read_graph(run.graph_id, Some(run.version)).await?;
-        let state = self
+        let node_runs = self
             .run_with(run.data_id, run.graph_id)
-            .graph_state_at(run, &graph)
+            .graph_state_at(run.clone(), &graph)
             .await?;
         Ok(RunView {
-            state,
+            run,
             graph,
-            current: true,
+            node_runs,
         })
     }
-}
-
-/// The state of a single node, combining its node run and its graph definition.
-///
-/// The fields of the node run row and of the graph's [`Node`] are embedded flat,
-/// so a state read is one object rather than two nested ones. The node run's
-/// internal primary key and run id are omitted; `node_id` is the graph node's id.
-#[derive(Debug, Clone, Serialize)]
-pub struct NodeState {
-    /// Stable public identity of this node run (distinct for each revision).
-    pub uuid: Uuid,
-    /// Data identifier of the run.
-    pub data_id: Uuid,
-    /// Graph identifier of the run.
-    pub graph_id: Uuid,
-    /// Node identifier from the node run.
-    pub node_id: Uuid,
-    /// Graph version recorded when this node run was created.
-    pub version: u64,
-    /// Revision the node run was read at.
-    pub revision: u64,
-    /// Node status, e.g. `Succeeded`.
-    pub status: String,
-    pub ineffective: u32,
-    /// When the node run row was created.
-    pub created_at: Timestamp,
-    /// When the node run row was last updated.
-    pub updated_at: Timestamp,
-    /// Node name from the graph.
-    pub name: String,
-    /// Node type from the graph.
-    pub node_type: String,
-    /// Node inputs from the graph.
-    pub inputs: Vec<Input>,
-    /// Node outputs from the graph.
-    pub outputs: Vec<Output>,
-}
-
-impl NodeState {
-    /// Combines a node run row with the graph's node.
-    fn join(node_run: NodeRun, node: Node) -> Self {
-        Self {
-            uuid: node_run.uuid,
-            data_id: node_run.data_id,
-            graph_id: node_run.graph_id,
-            node_id: node_run.node_id,
-            version: node_run.version,
-            revision: node_run.revision,
-            status: node_run.status,
-            ineffective: node_run.ineffective,
-            created_at: node_run.created_at,
-            updated_at: node_run.updated_at,
-            name: node.name,
-            node_type: node.node_type,
-            inputs: node.inputs,
-            outputs: node.outputs,
-        }
-    }
-}
-
-/// The effective node states of a run at its current revision.
-#[derive(Debug, Clone, Serialize)]
-pub struct GraphState {
-    /// Unique identifier of the run.
-    pub uuid: Uuid,
-    /// Data identifier of the run.
-    pub data_id: Uuid,
-    /// Graph identifier of the run.
-    pub graph_id: Uuid,
-    /// The graph version the run executes.
-    pub version: u64,
-    /// The revision the states were read at.
-    pub revision: u64,
-    /// Directed edges of the graph as `(from, to)` node-id pairs.
-    pub edges: Vec<(Uuid, Uuid)>,
-    /// The node states at `revision`.
-    pub nodes: Vec<NodeState>,
 }
 
 impl<S> RunApp<S>
@@ -198,7 +217,10 @@ where
     <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
 {
     /// Returns the state of `node_id`: its node run combined with the graph node.
-    pub async fn node_state(&self, node_id: Uuid) -> Result<NodeState, AppError> {
+    pub async fn node_state(
+        &self,
+        node_id: Uuid,
+    ) -> Result<(NodeRun, graph::types::Node), AppError> {
         let run = self.run().await?;
         // Load the graph before the node run so no node run row is held across an
         // await (it keeps this future `Send`, so it can be used as a handler).
@@ -215,11 +237,11 @@ where
             .map(|node| node.data.clone())
             .ok_or(AppError::NodeNotFound(node_id))?;
 
-        Ok(NodeState::join(node_run, node_info))
+        Ok((node_run, node_info))
     }
 
     /// Returns effective node states at or before the run's current revision.
-    pub async fn graph_state(&self) -> Result<GraphState, AppError> {
+    pub async fn graph_state(&self) -> Result<Vec<(NodeRun, graph::types::Node)>, AppError> {
         let run = self.run().await?;
         // Load the graph before the node runs so no node run row is held across
         // an await (it keeps this future `Send`, so it can be used as a handler).
@@ -227,7 +249,11 @@ where
         self.graph_state_at(run, &graph).await
     }
 
-    async fn graph_state_at(&self, run: Run, graph: &DAG) -> Result<GraphState, AppError> {
+    async fn graph_state_at(
+        &self,
+        run: Run,
+        graph: &DAG,
+    ) -> Result<Vec<(NodeRun, graph::types::Node)>, AppError> {
         let mut db = self.db.clone();
         let rows = NodeRun::filter_by_run_id(run.uuid)
             .filter(NodeRun::fields().revision().le(run.revision))
@@ -237,7 +263,7 @@ where
 
         // A node may have a node run per revision; its live state is the row
         // with the greatest revision at or before the run's current revision.
-        let mut live: HashMap<Uuid, NodeRun> = HashMap::new();
+        let mut live: std::collections::HashMap<Uuid, NodeRun> = std::collections::HashMap::new();
         for row in rows {
             let replace = live
                 .get(&row.node_id)
@@ -252,19 +278,11 @@ where
             .filter_map(|node_run| {
                 graph
                     .node(node_run.node_id)
-                    .map(|node| NodeState::join(node_run, node.data.clone()))
+                    .map(|node| (node_run, node.data.clone()))
             })
             .collect();
 
-        Ok(GraphState {
-            uuid: run.uuid,
-            data_id: self.data_id,
-            graph_id: self.graph_id,
-            version: run.version,
-            revision: run.revision,
-            edges: graph.edges().collect(),
-            nodes,
-        })
+        Ok(nodes)
     }
 
     /// Loads this run, or fails with [`AppError::RunNotFound`].
