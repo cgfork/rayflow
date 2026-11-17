@@ -15,7 +15,6 @@ use event::task::Task;
 use pilot::{Pilot, Step};
 use runtime::backend::Backend;
 use scheduler::{Job, JobWrite, Scheduler, actuator::Status};
-use server::StaticGraphStore;
 use toasty::{Db, Transaction};
 use uuid::Uuid;
 
@@ -74,7 +73,7 @@ async fn custom_scheduler_retries_submissions_and_runs_only_as_leader() {
         return;
     };
     let mut db = Db::builder()
-        .models(scheduler::models())
+        .models(pilot::models())
         .connect(&url)
         .await
         .unwrap();
@@ -91,7 +90,7 @@ async fn custom_scheduler_retries_submissions_and_runs_only_as_leader() {
     }
     let service = Arc::new(JobService::default());
     service.fail_after_submit.store(true, Ordering::SeqCst);
-    let backend = Backend::new(db.clone(), StaticGraphStore::new());
+    let backend = Backend::new(db.clone(), db.clone());
     let election = MySqlLeaderElection::new(
         db.clone(),
         "custom-scheduler",

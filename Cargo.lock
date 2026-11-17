@@ -4112,6 +4112,7 @@ dependencies = [
  "ldap3",
  "mime_guess",
  "openidconnect",
+ "percent-encoding",
  "reqwest",
  "runtime",
  "rust-embed",

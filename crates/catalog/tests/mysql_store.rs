@@ -2,7 +2,7 @@
 //! only its own randomly prefixed tables, using the deployed schema snapshot.
 
 use catalog::{
-    CatalogInput, CatalogOptionalData, CatalogSystem, Error, FileInput, FileKey, FileOptionalData,
+    CatalogInput, CatalogOptionalData, CatalogSystem, Error, FileInput, FileOptionalData,
     FileSystem,
     model::{Catalog, File},
 };
@@ -48,12 +48,12 @@ async fn cleanup(db: &mut Db, prefix: &str) {
 fn object() -> CatalogInput {
     CatalogInput::new("/a/b.csv", "s3://bucket/a/b.csv", 10, "text/csv")
 }
-fn file(catalog: Uuid, fullpath: &str) -> FileInput<Uuid> {
-    FileInput::new(fullpath, "b.csv", catalog)
+fn file(catalog: Uuid) -> FileInput<Uuid> {
+    FileInput::new(Uuid::from_u128(1), "b.csv", catalog)
 }
 
 #[tokio::test]
-async fn data_only_upserts_reuse_ids_by_key_and_fullpath() {
+async fn data_only_upserts_reuse_ids_by_catalog_key_and_reference() {
     let Some((mut db, prefix)) = database().await else {
         return;
     };
@@ -76,16 +76,16 @@ async fn data_only_upserts_reuse_ids_by_key_and_fullpath() {
     assert_eq!(changed.url, data.url);
     assert_eq!(changed.size, data.size);
     assert_eq!(Catalog::all().exec(&mut db).await.unwrap().len(), 1);
-    let mut data = file(id, "/data/b.csv");
+    let mut data = file(id);
     let file_id = db
         .upsert_file(&data as &dyn catalog::File<CatalogId = Uuid>)
         .await
         .unwrap();
-    let original = db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap();
+    let original = db.get_file(file_id).await.unwrap().unwrap();
     data.filename = "new.csv".into();
     assert_eq!(db.upsert_file(&data).await.unwrap(), file_id);
     let changed = db
-        .get_file(FileKey::Fullpath(&data.fullpath))
+        .get_file_by_node_run_filename(original.file.node_run_id, &data.filename)
         .await
         .unwrap()
         .unwrap();
@@ -94,10 +94,7 @@ async fn data_only_upserts_reuse_ids_by_key_and_fullpath() {
     assert_eq!(changed.file.filename, data.filename);
     assert_eq!(changed.catalog, original.catalog);
     assert_eq!(File::all().exec(&mut db).await.unwrap().len(), 1);
-    assert_ne!(
-        db.upsert_file(&file(id, "/data/B.csv")).await.unwrap(),
-        file_id
-    );
+    assert_eq!(db.upsert_file(&file(id)).await.unwrap(), file_id);
     assert_ne!(
         db.upsert_catalog(&CatalogInput::new(
             "/a/B.csv",
@@ -119,7 +116,7 @@ async fn catalog_keys_are_unique_and_can_be_renamed_by_identity() {
     };
     let data = object();
     let id = db.upsert_catalog(&data).await.unwrap();
-    let file_id = db.upsert_file(&file(id, &data.key)).await.unwrap();
+    let file_id = db.upsert_file(&file(id)).await.unwrap();
     let original = db.get_catalog(id).await.unwrap().unwrap();
     let now = Timestamp::now();
     assert!(
@@ -181,64 +178,60 @@ async fn catalog_keys_are_unique_and_can_be_renamed_by_identity() {
         .unwrap(),
         id
     );
-    let loaded = db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap();
-    assert_eq!(loaded.catalog.key, "/renamed");
-    assert_eq!(loaded.catalog.uuid, original.uuid);
-    assert_eq!(loaded.catalog.created_at, original.created_at);
-    assert_eq!(loaded.file.fullpath, data.key);
+    let loaded = db.get_file(file_id).await.unwrap().unwrap();
+    assert_eq!(loaded.catalog.as_ref().unwrap().key, "/renamed");
+    assert_eq!(loaded.catalog.as_ref().unwrap().uuid, original.uuid);
+    assert_eq!(
+        loaded.catalog.as_ref().unwrap().created_at,
+        original.created_at
+    );
+    assert_eq!(loaded.file.node_run_id, Uuid::from_u128(1));
     cleanup(&mut db, &prefix).await;
 }
 
 #[tokio::test]
-async fn file_upserts_validate_references_and_deletion_releases_names() {
+async fn file_upserts_validate_catalog_references_and_deleted_catalogs_hide_files() {
     let Some((mut db, prefix)) = database().await else {
         return;
     };
     let id = db.upsert_catalog(&object()).await.unwrap();
-    let file_id = db.upsert_file(&file(id, "/a")).await.unwrap();
+    let file_id = db.upsert_file(&file(id)).await.unwrap();
     assert!(matches!(
-        db.upsert_file(&file(Uuid::new_v4(), "/a")).await,
+        db.upsert_file(&file(Uuid::new_v4())).await,
         Err(Error::CatalogNotFound(_))
     ));
-    assert_eq!(
-        db.get_file(FileKey::Id(file_id))
-            .await
-            .unwrap()
-            .unwrap()
-            .catalog
-            .uuid,
-        id
-    );
     Catalog::filter_by_uuid(id)
         .delete()
         .exec(&mut db)
         .await
         .unwrap();
-    assert!(db.get_catalog(id).await.unwrap().is_none());
-    assert!(db.get_file(FileKey::Id(file_id)).await.unwrap().is_none());
-    let replacement = db.upsert_catalog(&object()).await.unwrap();
-    assert_ne!(replacement, id);
-    assert_eq!(
-        db.upsert_file(&file(replacement, "/a")).await.unwrap(),
-        file_id
+    assert!(db.get_file(file_id).await.unwrap().is_none());
+    assert!(
+        db.get_file_by_node_run_filename(Uuid::from_u128(1), "b.csv")
+            .await
+            .unwrap()
+            .is_none()
     );
+    let replacement = db.upsert_catalog(&object()).await.unwrap();
+    let replacement_file = db.upsert_file(&file(replacement)).await.unwrap();
+    assert_ne!(replacement_file, file_id);
     assert_eq!(
-        db.get_file(FileKey::Id(file_id))
+        db.get_file_by_node_run_filename(Uuid::from_u128(1), "b.csv")
             .await
             .unwrap()
             .unwrap()
-            .catalog
+            .file
             .uuid,
-        replacement
+        replacement_file
     );
-    File::filter_by_uuid(file_id)
+    File::filter_by_uuid(replacement_file)
         .delete()
         .exec(&mut db)
         .await
         .unwrap();
     assert_ne!(
-        db.upsert_file(&file(replacement, "/a")).await.unwrap(),
-        file_id
+        db.upsert_file(&file(replacement)).await.unwrap(),
+        replacement_file
     );
     cleanup(&mut db, &prefix).await;
 }
@@ -250,13 +243,13 @@ async fn callers_can_roll_back_catalog_and_file_upserts_together() {
     };
     let mut tx = db.transaction().await.unwrap();
     let id = tx.upsert_catalog(&object()).await.unwrap();
-    let file_id = tx.upsert_file(&file(id, "/a")).await.unwrap();
+    let file_id = tx.upsert_file(&file(id)).await.unwrap();
     let mut changed = object();
     changed.size = 20;
     changed.uploaded = true;
     assert_eq!(tx.upsert_catalog(&changed).await.unwrap(), id);
     assert_eq!(
-        tx.upsert_file(&FileInput::new("/a", "new.csv", id))
+        tx.upsert_file(&FileInput::new(Uuid::from_u128(1), "new.csv", id))
             .await
             .unwrap(),
         file_id
@@ -293,7 +286,7 @@ async fn concurrent_upserts_converge_on_one_identity_after_retry() {
     }
     let id = ids[0];
     assert_eq!(id, ids[1]);
-    let data = file(id, "/shared");
+    let data = file(id);
     let (a, b) = tokio::join!(db.upsert_file(&data), writer.upsert_file(&data));
     assert!(a.is_ok() || b.is_ok());
     let mut ids = Vec::new();
@@ -465,12 +458,12 @@ async fn caller_can_retry_upserts_after_a_concurrent_insert_into_its_snapshot() 
         return;
     };
     let id = db.upsert_catalog(&object()).await.unwrap();
-    let data = file(id, "/new");
+    let data = file(id);
     let mut writer = db.clone();
     let mut tx = db.transaction().await.unwrap();
     assert!(File::all().exec(&mut tx).await.unwrap().is_empty());
     let original = writer.upsert_file(&data).await.unwrap();
-    let changed = FileInput::new("/new", "changed", id);
+    let changed = FileInput::new(Uuid::from_u128(1), "changed", id);
     match tx.upsert_file(&changed).await {
         Ok(id) => assert_eq!(id, original),
         Err(Error::Database(error)) => assert!(
@@ -483,12 +476,7 @@ async fn caller_can_retry_upserts_after_a_concurrent_insert_into_its_snapshot() 
     }
     tx.rollback().await.unwrap();
     assert_eq!(
-        db.get_file(FileKey::Id(original))
-            .await
-            .unwrap()
-            .unwrap()
-            .file
-            .filename,
+        db.get_file(original).await.unwrap().unwrap().file.filename,
         data.filename
     );
     assert_eq!(db.upsert_file(&changed).await.unwrap(), original);
@@ -532,31 +520,12 @@ async fn catalog_writes_persist_the_supplied_upload_acknowledgement() {
 }
 
 #[tokio::test]
-async fn optional_file_fields_preserve_omissions_and_require_creation_fields() {
+async fn optional_file_fields_require_catalog_and_new_owner_and_preserve_omissions() {
     let Some((mut db, prefix)) = database().await else {
         return;
     };
     let catalog = db.upsert_catalog(&object()).await.unwrap();
-    let replacement = db
-        .upsert_catalog(&CatalogInput::new(
-            "/replacement",
-            "s3://bucket/replacement",
-            0,
-            "bin",
-        ))
-        .await
-        .unwrap();
     let mut data = FileOptionalData::<Uuid>::default();
-    assert!(matches!(
-        db.upsert_file(&data).await,
-        Err(Error::MissingField("fullpath"))
-    ));
-    data.fullpath = Some("/partial".into());
-    assert!(matches!(
-        db.upsert_file(&data).await,
-        Err(Error::MissingField("filename"))
-    ));
-    data.filename = Some("first".into());
     assert!(matches!(
         db.upsert_file(&data).await,
         Err(Error::MissingField("catalog_id"))
@@ -566,41 +535,34 @@ async fn optional_file_fields_preserve_omissions_and_require_creation_fields() {
         db.upsert_file(&data).await,
         Err(Error::CatalogNotFound(_))
     ));
-    assert!(File::all().exec(&mut db).await.unwrap().is_empty());
     data.catalog_id = Some(catalog);
+    assert!(matches!(
+        db.upsert_file(&data).await,
+        Err(Error::MissingField("filename"))
+    ));
+    data.filename = Some("first".into());
+    assert!(matches!(
+        db.upsert_file(&data).await,
+        Err(Error::MissingField("node_run_id"))
+    ));
+    data.node_run_id = Some(Uuid::new_v4());
     let id = db.upsert_file(&data).await.unwrap();
-    let original = db.get_file(FileKey::Id(id)).await.unwrap().unwrap();
+    let original = db.get_file(id).await.unwrap().unwrap();
     data.filename = None;
-    data.catalog_id = None;
+    data.node_run_id = None;
     assert_eq!(db.upsert_file(&data).await.unwrap(), id);
-    assert_eq!(
-        db.get_file(FileKey::Id(id)).await.unwrap().unwrap(),
-        original
-    );
+    assert_eq!(db.get_file(id).await.unwrap().unwrap(), original);
     data.filename = Some("second".into());
     db.upsert_file(&data).await.unwrap();
-    let changed = db.get_file(FileKey::Id(id)).await.unwrap().unwrap();
+    let changed = db.get_file(id).await.unwrap().unwrap();
     assert_eq!(changed.file.filename, "second");
-    assert_eq!(changed.catalog, original.catalog);
-    data.filename = None;
-    data.catalog_id = Some(replacement);
-    db.upsert_file(&data).await.unwrap();
-    let changed = db.get_file(FileKey::Id(id)).await.unwrap().unwrap();
-    assert_eq!(changed.file.filename, "second");
-    assert_eq!(changed.catalog.uuid, replacement);
-    assert_eq!(
-        (changed.file.id, changed.file.created_at),
-        (original.file.id, original.file.created_at)
-    );
+    assert_eq!(changed.file.node_run_id, original.file.node_run_id);
+    assert_eq!(changed.file.created_at, original.file.created_at);
     data.filename = Some(String::new());
     assert!(matches!(
         db.upsert_file(&data).await,
         Err(Error::InvalidField("filename"))
     ));
-    assert_eq!(
-        db.get_file(FileKey::Id(id)).await.unwrap().unwrap(),
-        changed
-    );
     cleanup(&mut db, &prefix).await;
 }
 
@@ -610,18 +572,15 @@ async fn updates_by_id_preserve_omissions_and_can_rename_without_changing_identi
         return;
     };
     let catalog_id = db.upsert_catalog(&object()).await.unwrap();
-    let file_id = db.upsert_file(&file(catalog_id, "/before")).await.unwrap();
-    let original = db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap();
+    let file_id = db.upsert_file(&file(catalog_id)).await.unwrap();
+    let original = db.get_file(file_id).await.unwrap().unwrap();
     db.update_catalog(catalog_id, CatalogOptionalData::default())
         .await
         .unwrap();
     db.update_file(file_id, FileOptionalData::default())
         .await
         .unwrap();
-    assert_eq!(
-        db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap(),
-        original
-    );
+    assert_eq!(db.get_file(file_id).await.unwrap().unwrap(), original);
 
     db.update_catalog(
         catalog_id,
@@ -641,11 +600,17 @@ async fn updates_by_id_preserve_omissions_and_can_rename_without_changing_identi
     )
     .await
     .unwrap();
-    let changed = db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap();
-    assert!(changed.catalog.uploaded);
-    assert_eq!(changed.catalog.size, original.catalog.size);
-    assert_eq!(changed.catalog.format, original.catalog.format);
-    assert_eq!(changed.file.fullpath, original.file.fullpath);
+    let changed = db.get_file(file_id).await.unwrap().unwrap();
+    assert!(changed.catalog.as_ref().unwrap().uploaded);
+    assert_eq!(
+        changed.catalog.as_ref().unwrap().size,
+        original.catalog.as_ref().unwrap().size
+    );
+    assert_eq!(
+        changed.catalog.as_ref().unwrap().format,
+        original.catalog.as_ref().unwrap().format
+    );
+    assert_eq!(changed.file.node_run_id, original.file.node_run_id);
     assert_eq!(changed.file.filename, "after.csv");
     assert_eq!(changed.file.catalog_uuid, catalog_id);
 
@@ -653,6 +618,7 @@ async fn updates_by_id_preserve_omissions_and_can_rename_without_changing_identi
         catalog_id,
         CatalogOptionalData {
             url: Some("s3://bucket/renamed".into()),
+            key: Some("/after".into()),
             ..Default::default()
         },
     )
@@ -661,28 +627,27 @@ async fn updates_by_id_preserve_omissions_and_can_rename_without_changing_identi
     db.update_file(
         file_id,
         FileOptionalData {
-            fullpath: Some("/after".into()),
+            node_run_id: Some(Uuid::from_u128(2)),
             ..Default::default()
         },
     )
     .await
     .unwrap();
-    let renamed = db
-        .get_file(FileKey::Fullpath("/after"))
-        .await
-        .unwrap()
-        .unwrap();
+    let renamed = db.get_file(file_id).await.unwrap().unwrap();
     assert!(
-        db.get_file(FileKey::Fullpath("/before"))
+        db.get_file_by_node_run_filename(Uuid::from_u128(1), "b.csv")
             .await
             .unwrap()
             .is_none()
     );
-    assert_eq!(renamed.catalog.url, "s3://bucket/renamed");
-    assert!(renamed.catalog.uploaded);
+    assert_eq!(renamed.catalog.as_ref().unwrap().url, "s3://bucket/renamed");
+    assert!(renamed.catalog.as_ref().unwrap().uploaded);
     assert_eq!(
-        (renamed.catalog.uuid, renamed.catalog.created_at),
-        (catalog_id, original.catalog.created_at)
+        (
+            renamed.catalog.as_ref().unwrap().uuid,
+            renamed.catalog.as_ref().unwrap().created_at
+        ),
+        (catalog_id, original.catalog.as_ref().unwrap().created_at)
     );
     assert_eq!(
         (renamed.file.uuid, renamed.file.created_at),
@@ -710,10 +675,7 @@ async fn updates_by_id_preserve_omissions_and_can_rename_without_changing_identi
     .await
     .unwrap();
     tx.rollback().await.unwrap();
-    assert_eq!(
-        db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap(),
-        renamed
-    );
+    assert_eq!(db.get_file(file_id).await.unwrap().unwrap(), renamed);
     cleanup(&mut db, &prefix).await;
 }
 
@@ -732,12 +694,13 @@ async fn updates_reject_missing_ids_invalid_references_and_unique_key_conflicts(
     assert!(Catalog::all().exec(&mut db).await.unwrap().is_empty());
     assert!(File::all().exec(&mut db).await.unwrap().is_empty());
     let catalog_id = db.upsert_catalog(&object()).await.unwrap();
-    let file_id = db.upsert_file(&file(catalog_id, "/a")).await.unwrap();
-    db.upsert_catalog(&CatalogInput::new("/taken", "s3://bucket/taken", 0, "bin"))
+    let file_id = db.upsert_file(&file(catalog_id)).await.unwrap();
+    let taken = db
+        .upsert_catalog(&CatalogInput::new("/taken", "s3://bucket/taken", 0, "bin"))
         .await
         .unwrap();
-    db.upsert_file(&file(catalog_id, "/taken")).await.unwrap();
-    let original = db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap();
+    db.upsert_file(&file(taken)).await.unwrap();
+    let original = db.get_file(file_id).await.unwrap().unwrap();
     assert!(
         matches!(db.update_file(file_id, FileOptionalData { catalog_id: Some(missing), ..Default::default() }).await, Err(Error::CatalogNotFound(id)) if id == missing)
     );
@@ -756,12 +719,12 @@ async fn updates_reject_missing_ids_invalid_references_and_unique_key_conflicts(
         db.update_file(
             file_id,
             FileOptionalData {
-                fullpath: Some(String::new()),
+                filename: Some(String::new()),
                 ..Default::default()
             }
         )
         .await,
-        Err(Error::InvalidField("fullpath"))
+        Err(Error::InvalidField("filename"))
     ));
     assert!(matches!(
         db.update_catalog(
@@ -779,7 +742,7 @@ async fn updates_reject_missing_ids_invalid_references_and_unique_key_conflicts(
         db.update_file(
             file_id,
             FileOptionalData {
-                fullpath: Some("/taken".into()),
+                catalog_id: Some(taken),
                 filename: Some("conflict".into()),
                 ..Default::default()
             }
@@ -787,10 +750,7 @@ async fn updates_reject_missing_ids_invalid_references_and_unique_key_conflicts(
         .await,
         Err(Error::Database(_))
     ));
-    assert_eq!(
-        db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap(),
-        original
-    );
+    assert_eq!(db.get_file(file_id).await.unwrap().unwrap(), original);
     cleanup(&mut db, &prefix).await;
 }
 
@@ -810,14 +770,13 @@ async fn catalog_keys_and_urls_enforce_the_varchar_character_limit() {
     assert_eq!(record.key, longest.key);
     assert_eq!(record.url, longest.url);
     assert_eq!(record.format, longest.format);
-    let fullpath = "名".repeat(512);
     let filename = "名".repeat(255);
     let file_id = db
-        .upsert_file(&FileInput::new(&fullpath, &filename, id))
+        .upsert_file(&FileInput::new(Uuid::from_u128(1), &filename, id))
         .await
         .unwrap();
-    let loaded = db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap();
-    assert_eq!(loaded.file.fullpath, fullpath);
+    let loaded = db.get_file(file_id).await.unwrap().unwrap();
+    assert_eq!(loaded.catalog.as_ref().unwrap().key, longest.key);
     assert_eq!(loaded.file.filename, filename);
     assert!(matches!(
         db.update_file(

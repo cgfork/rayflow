@@ -4,6 +4,7 @@
 //! materialized jobs through an implementation such as `AgentScheduler`.
 pub mod actuator;
 pub mod agent;
+pub mod agent_registry;
 pub mod scheduler;
 
 pub use actuator::{Actuator, Job, JobRead, JobWrite, Step, models};
@@ -11,6 +12,7 @@ pub use agent::{
     AgentRef, AgentScheduler, JobPoll, ResourceCapacity, cancel_job, fail_expired_in, fail_job,
     succeed_job, terminate_job, yield_job,
 };
+pub use agent_registry::{Error as AgentRegistryError, Instance as AgentInstance};
 pub use event::task_event::{TaskEvent, TaskEventEntry};
 pub use scheduler::Scheduler;
 

@@ -11,7 +11,6 @@ use event::task_event::TaskEventEntry;
 use pilot::Pilot;
 use runtime::{backend::Backend, command::Run};
 use scheduler::{AgentRef, JobPoll, JobRead, ResourceCapacity};
-use server::StaticGraphStore;
 use uuid::Uuid;
 
 mod support;
@@ -24,9 +23,9 @@ async fn interrupted_command_application_can_be_retried() {
         return;
     };
     let mut builder = toasty::Db::builder();
-    builder.models(scheduler::models());
+    builder.models(pilot::models());
     let db = builder.connect(&url).await.unwrap();
-    let mut backend = Backend::new(db, StaticGraphStore::new());
+    let mut backend = Backend::new(db.clone(), db);
     let mut db = backend.db().clone();
     db.reset_db().await.unwrap();
     db.push_schema().await.unwrap();

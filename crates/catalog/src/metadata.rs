@@ -18,11 +18,11 @@ pub trait Catalog {
     fn uploaded(&self) -> bool;
 }
 
-/// Logical file data; full paths typically equal the referenced catalog key.
+/// A logical file owned by a node run; its path is the referenced catalog key.
 /// Its catalog reference uses the filesystem's ID type.
 pub trait File {
     type CatalogId: Id;
-    fn fullpath(&self) -> &str;
+    fn node_run_id(&self) -> uuid::Uuid;
     fn filename(&self) -> &str;
     fn catalog_id(&self) -> Self::CatalogId;
 }
@@ -113,15 +113,15 @@ impl From<&CatalogOptionalData> for CatalogOptionalData {
 /// A logical file payload without its own identity or persistence fields.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileInput<I> {
-    pub fullpath: String,
+    pub node_run_id: uuid::Uuid,
     pub filename: String,
     pub catalog_id: I,
 }
 
 impl<I> FileInput<I> {
-    pub fn new(fullpath: impl Into<String>, filename: impl Into<String>, catalog_id: I) -> Self {
+    pub fn new(node_run_id: uuid::Uuid, filename: impl Into<String>, catalog_id: I) -> Self {
         Self {
-            fullpath: fullpath.into(),
+            node_run_id,
             filename: filename.into(),
             catalog_id,
         }
@@ -130,8 +130,8 @@ impl<I> FileInput<I> {
 
 impl<I: Id> File for FileInput<I> {
     type CatalogId = I;
-    fn fullpath(&self) -> &str {
-        &self.fullpath
+    fn node_run_id(&self) -> uuid::Uuid {
+        self.node_run_id
     }
     fn filename(&self) -> &str {
         &self.filename
@@ -142,11 +142,11 @@ impl<I: Id> File for FileInput<I> {
 }
 
 /// Sparse file data. `None` leaves an existing field unchanged.
-/// Upserts require a full path; new rows also require filename and catalog ID.
+/// Upserts require a catalog ID; new rows also require filename and node-run UUID.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileOptionalData<I> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fullpath: Option<String>,
+    pub node_run_id: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,7 +156,7 @@ pub struct FileOptionalData<I> {
 impl<F: File + ?Sized> From<&F> for FileOptionalData<F::CatalogId> {
     fn from(data: &F) -> Self {
         Self {
-            fullpath: Some(data.fullpath().to_owned()),
+            node_run_id: Some(data.node_run_id()),
             filename: Some(data.filename().to_owned()),
             catalog_id: Some(data.catalog_id()),
         }
@@ -197,8 +197,8 @@ impl<T: Catalog + ?Sized> Catalog for &T {
 
 impl<T: File + ?Sized> File for &T {
     type CatalogId = T::CatalogId;
-    fn fullpath(&self) -> &str {
-        T::fullpath(self)
+    fn node_run_id(&self) -> uuid::Uuid {
+        T::node_run_id(self)
     }
     fn filename(&self) -> &str {
         T::filename(self)

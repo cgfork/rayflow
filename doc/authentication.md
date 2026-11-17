@@ -35,7 +35,10 @@ https://rayflow.example.com/api/v1/auth/oidc/callback
 ```
 
 For local development use `http://127.0.0.1:5173` (or your UI port). HTTP is
-permitted only on loopback. HTTPS uses `__Host-` cookies with `Secure`, `HttpOnly`,
+permitted on loopback by default. For a trusted development network, explicitly
+set `auth.allow_insecure_http: true` and set `auth.public_url` to the exact browser
+origin (for example, `http://10.10.2.199:5173`). This option applies only to the
+browser origin; OIDC issuer URLs still require HTTPS outside loopback. HTTPS uses `__Host-` cookies with `Secure`, `HttpOnly`,
 `SameSite=Lax`, and `Path=/`; do not rewrite their path in the reverse proxy.
 
 Nested environment overrides use double underscores after `RAYFLOW_`:

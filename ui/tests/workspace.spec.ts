@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { expect, test, type Page as BrowserPage } from '@playwright/test';
 import type { Graph, Job, NodeStatus, RunView } from '../src/types';
 
@@ -19,7 +20,7 @@ const graph: Graph = {
 };
 const baseJob: Job = { id: 1, uuid: jobId, task_id: '70000000-0000-4000-8000-000000000001', run_id: runId, node_run_id: 1, status: 'Polled', required_cpu_cores: 2, required_memory_bytes: 2147483648, agent_id: agentId, polled_at: now, expired_at: new Date(Date.now() + 60000).toISOString(), created_at: now, updated_at: now };
 
-async function backend(page: BrowserPage, options: { empty?: boolean; historical?: boolean; rootStatus?: NodeStatus; rootRevision?: number; versions?: number[]; sharedNodes?: Record<number, string[]> } = {}) {
+async function backend(page: BrowserPage, options: { files?: boolean; empty?: boolean; historical?: boolean; rootStatus?: NodeStatus; rootRevision?: number; versions?: number[]; sharedNodes?: Record<number, string[]> } = {}) {
   let draft = structuredClone(graph);
   let jobs = [structuredClone(baseJob)];
   const calls: { path: string; method: string; body: unknown }[] = [];
@@ -51,8 +52,15 @@ async function backend(page: BrowserPage, options: { empty?: boolean; historical
     if (path === '/runs/start' || path === '/runs/resume' || path === '/runs/rerun' || path === '/runs/upgrade') return fulfill({ id: crypto.randomUUID() }, 202);
     if (path === '/runs') return fulfill({ items: [{ id: 1, uuid: runId, graph_id: graphId, data_id: dataId, version: 2, revision: 3, created_at: now, updated_at: now }], next_cursor: null });
     if (path === `/runs/${runId}`) {
-      const result: RunView = { graph, current: !options.historical, state: { uuid: runId, graph_id: graphId, data_id: dataId, version: 2, revision: 3,
-        nodes: graph.nodes.slice(0, 3).map((node, index) => ({ ...node, node_id: node.id, status: index === 0 ? options.rootStatus ?? 'Succeeded' : index === 1 ? 'Pending' : 'Running', revision: index === 0 ? options.rootRevision ?? 3 : 3, updated_at: now })),
+      const runGraph = structuredClone(graph);
+      if (options.files) {
+        for (const node of runGraph.nodes) {
+          node.inputs = [{ file_name: 'input.bin', source: 'extract_data.result.bin', required: true, format: null }];
+          node.outputs = [{ file_name: 'result.bin', kind: 'File', multiple: false }];
+        }
+      }
+      const result: RunView = { graph: runGraph, current: !options.historical, state: { uuid: runId, graph_id: graphId, data_id: dataId, version: 2, revision: 3,
+        nodes: runGraph.nodes.slice(0, 3).map((node, index) => ({ ...node, uuid: `80000000-0000-4000-8000-00000000000${index + 1}`, version: graph.version, node_id: node.id, status: index === 0 ? options.rootStatus ?? 'Succeeded' : index === 1 ? 'Pending' : 'Running', revision: index === 0 ? options.rootRevision ?? 3 : 3, updated_at: now })),
       } };
       return fulfill(result);
     }
@@ -71,33 +79,42 @@ async function backend(page: BrowserPage, options: { empty?: boolean; historical
   return { calls, failures };
 }
 
-test('builds a graph, saves its draft, and publishes through the existing APIs', async ({ page }) => {
-  const { calls } = await backend(page, { empty: true });
-  await page.goto('/');
-  await expect(page.getByText('Your next workflow starts here')).toBeVisible();
-  await page.getByRole('button', { name: 'New workflow' }).click();
-  await page.getByLabel('Workflow name', { exact: true }).fill('nightly-import');
-  await page.getByRole('button', { name: 'Create workflow', exact: true }).click();
-  await page.getByLabel('Node name', { exact: true }).fill('extract');
-  await page.getByLabel('Docker image', { exact: true }).fill('alpine:3.21');
-  await page.getByRole('button', { name: 'Add node', exact: true }).click();
-  await page.getByLabel('Docker image', { exact: true }).fill('alpine:3.21');
-  await expect(page.getByRole('button', { name: 'Publish', exact: true })).toBeDisabled();
-  await page.locator('.react-flow__node').filter({ hasText: 'extract' }).click();
-  await page.getByLabel('Connect to node').selectOption({ label: 'task_2' });
-  await page.getByRole('button', { name: 'Add connection', exact: true }).click();
-  await expect(page.getByText('Ready to publish', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Save draft' }).click();
-  await expect(page.getByText('All changes saved')).toBeVisible();
-  const saved = calls.find((call) => call.method === 'PUT')!.body as { graph: Graph; actor: string };
-  expect(saved.graph.nodes).toHaveLength(2);
-  expect(saved.graph.edges).toEqual([[saved.graph.nodes[0].id, saved.graph.nodes[1].id]]);
-  expect(saved.actor).toBe('operator');
-  await page.getByRole('button', { name: 'Publish', exact: true }).click();
-  await page.getByRole('button', { name: 'Publish version' }).click();
-  await expect(page.getByRole('status').filter({ hasText: 'Published nightly-import' })).toBeVisible();
-  expect(calls.some((call) => call.path.endsWith('/publish') && call.method === 'POST')).toBe(true);
-});
+for (const withoutRandomUUID of [false, true]) {
+  test(`builds, saves, and publishes a graph ${withoutRandomUUID ? 'without secure-context randomUUID' : 'with native randomUUID'}`, async ({ page }) => {
+    if (withoutRandomUUID) await page.addInitScript(() => {
+      Object.defineProperty(window.crypto, 'randomUUID', { value: undefined, configurable: true });
+    });
+    const { calls } = await backend(page, { empty: true });
+    await page.goto('/');
+    await expect(page.getByText('Your next workflow starts here')).toBeVisible();
+    await page.getByRole('button', { name: 'New workflow' }).click();
+    await page.getByLabel('Workflow name', { exact: true }).fill('nightly-import');
+    await page.getByRole('button', { name: 'Create workflow', exact: true }).click();
+    await page.getByLabel('Node name', { exact: true }).fill('extract');
+    await page.getByLabel('Docker image', { exact: true }).fill('alpine:3.21');
+    await page.getByRole('button', { name: 'Add node', exact: true }).click();
+    await page.getByLabel('Docker image', { exact: true }).fill('alpine:3.21');
+    await expect(page.getByRole('button', { name: 'Publish', exact: true })).toBeDisabled();
+    await page.locator('.react-flow__node').filter({ hasText: 'extract' }).click();
+    await page.getByLabel('Connect to node').selectOption({ label: 'task_2' });
+    await page.getByRole('button', { name: 'Add connection', exact: true }).click();
+    await expect(page.getByText('Ready to publish', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Save draft' }).click();
+    await expect(page.getByText('All changes saved')).toBeVisible();
+    const saved = calls.find((call) => call.method === 'PUT')!.body as { graph: Graph; actor: string };
+    expect(saved.graph.nodes).toHaveLength(2);
+    const ids = [saved.graph.id, ...saved.graph.nodes.map((node) => node.id)];
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const id of ids) expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(saved.graph.edges).toEqual([[saved.graph.nodes[0].id, saved.graph.nodes[1].id]]);
+    expect(saved.actor).toBe('operator');
+    await page.getByRole('button', { name: 'Publish', exact: true }).click();
+    await page.getByRole('button', { name: 'Publish version' }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Published nightly-import' })).toBeVisible();
+    expect(calls.some((call) => call.path.endsWith('/publish') && call.method === 'POST')).toBe(true);
+  });
+
+}
 
 test('validates cycles, edits JSON, and preserves unsaved work when navigation is cancelled', async ({ page }) => {
   const { calls } = await backend(page);
@@ -581,4 +598,41 @@ test('clears broken bindings after removing a connection or producer on mobile',
   await expect(page.getByLabel('Input 1 file name')).toHaveValue('local.json');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: 'test-results/node-settings-mobile.png', fullPage: true });
+});
+
+for (const status of ['Succeeded', 'Running', 'Ready', 'Pending', 'Failed', 'Terminated'] as NodeStatus[]) {
+  test(`Runtime file download visibility for a ${status} node`, async ({ page }) => {
+    await backend(page, { files: true, rootStatus: status });
+    await page.goto('/#/runtime');
+    await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+    await page.locator('.react-flow__node').filter({ hasText: 'extract_data' }).click();
+    await expect(page.getByRole('button', { name: 'Download input input.bin', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Download output result.bin', exact: true })).toHaveCount(status === 'Succeeded' ? 1 : 0);
+    await page.locator('.react-flow__node').filter({ hasText: 'publish_dataset' }).click();
+    await expect(page.getByRole('button', { name: 'Download input input.bin', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Download output result.bin', exact: true })).toHaveCount(0);
+  });
+}
+
+test('Runtime downloads use the run API and show missing-file errors', async ({ page }) => {
+  await backend(page, { files: true });
+  const bodies: unknown[] = [];
+  await page.route(`**/api/v1/runs/${runId}/files/download`, async (route) => {
+    bodies.push(route.request().postDataJSON());
+    if (route.request().postDataJSON().direction === 'input') return route.fulfill({ status: 404, json: { error: 'Input file is not available yet' } });
+    return route.fulfill({ json: { presigned: { url: 'http://127.0.0.1:5184/signed-result' } } });
+  });
+  await page.route(`**/api/v1/runs/${runId}/files/content?**`, (route) => route.fulfill({ body: 'downloaded bytes', headers: { 'Content-Disposition': 'attachment; filename="result.bin"' } }));
+  await page.goto('/#/runtime');
+  await page.getByRole('button', { name: 'Inspect run 20000000' }).click();
+  await page.locator('.react-flow__node').filter({ hasText: 'extract_data' }).click();
+  const download = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Download output result.bin', exact: true }).click();
+  const downloaded = await download;
+  expect(downloaded.suggestedFilename()).toBe('result.bin');
+  expect(await readFile((await downloaded.path())!, 'utf8')).toBe('downloaded bytes');
+  expect(bodies[0]).toEqual({ node_id: graph.nodes[0].id, file_name: 'result.bin', direction: 'output', revision: 3 });
+  await page.getByRole('button', { name: 'Download input input.bin', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Input file is not available yet');
+  await expect(page.getByRole('button', { name: 'Download input input.bin', exact: true })).toBeEnabled();
 });

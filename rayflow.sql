@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS node_config (
 
 CREATE TABLE IF NOT EXISTS node_run (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    uuid CHAR(36) NOT NULL COMMENT 'stable node-run identity',
     run_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
     data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
     graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS node_run (
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     PRIMARY KEY (id),
+    UNIQUE KEY uk_node_run_uuid (uuid),
     UNIQUE KEY uk_node_run_run_node_revision (run_id, node_id, revision),
     KEY idx_node_run_data_graph (data_id, graph_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node status within a dag execution run, one row per revision';
@@ -251,13 +253,13 @@ CREATE TABLE IF NOT EXISTS catalog (
 CREATE TABLE IF NOT EXISTS file (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     uuid CHAR(36) NOT NULL,
-    fullpath VARCHAR(512) NOT NULL,
+    node_run_id CHAR(36) NOT NULL COMMENT 'UUID of the producing node run',
     filename VARCHAR(255) NOT NULL,
     catalog_uuid CHAR(36) NOT NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
     UNIQUE KEY uk_file_uuid (uuid),
-    UNIQUE KEY uk_file_fullpath (fullpath),
-    KEY idx_file_catalog_uuid (catalog_uuid)
+    UNIQUE KEY uk_file_catalog_uuid (catalog_uuid),
+    KEY idx_file_node_run_id (node_run_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT = 'logical file names referencing catalog UUIDs';

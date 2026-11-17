@@ -1,9 +1,10 @@
+import { randomUUID } from './uuid';
 import { useMemo, useState } from 'react';
-import { Activity, ArrowUpCircle, ArrowUpRight, Box, CircleCheck, Clock3, GitBranch, Play, RotateCcw, Workflow } from 'lucide-react';
+import { Activity, ArrowUpCircle, ArrowUpRight, Box, CircleCheck, Clock3, Download, GitBranch, Play, RotateCcw, Workflow } from 'lucide-react';
 import { api, dateTime, relativeTime, send, shortId, usePaged, useRemote } from './api';
 import { Back, Badge, Details, Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination, Refresh, SearchBox } from './components';
 import FlowCanvas from './FlowCanvas';
-import type { Graph, Page, Run, RunView } from './types';
+import type { Graph, GraphNode, Page, Run, RunView } from './types';
 
 type RunAction = 'rerun' | 'resume';
 
@@ -42,7 +43,7 @@ export default function Runtime({ notify, openJobs }: { notify: (message: string
 function StartRun({ close, completed }: { close: () => void; completed: () => void }) {
   const graphs = useRemote<Page<Graph>>('/graphs?limit=200');
   const [graphId, setGraphId] = useState('');
-  const [dataId, setDataId] = useState<string>(() => crypto.randomUUID());
+  const [dataId, setDataId] = useState<string>(() => randomUUID());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const unique = (graphs.data?.items ?? []).filter((graph, index, items) => items.findIndex((item) => item.id === graph.id) === index);
@@ -91,11 +92,37 @@ function RunDetail({ id, close, notify, openJobs }: { id: string; close: () => v
       {!result.data.current && <div className="info-banner">This is a historical run version. Open the current version to issue node commands.</div>}
       <div className="studio-body runtime-canvas"><div className="canvas-panel"><div className="canvas-toolbar"><span><GitBranch size={15} />Execution graph</span><span className="live-label"><i />Refreshes every 5s</span></div><FlowCanvas graph={result.data.graph} statuses={statuses} selected={selected} select={setSelected} /><div className="canvas-caption"><span>Data <code>{shortId(result.data.state.data_id)}</code></span><span>Select a node to inspect its state</span></div></div><aside className="inspector"><div className="inspector-heading">NODE STATE<Activity size={16} /></div>{node ? <div className="inspector-fields"><h3>{node.name}</h3><Badge status={state?.status ?? 'waiting'}>{state?.status ?? 'Waiting'}</Badge><Details items={[
         ['Type', node.node_type], ['Node ID', <code>{node.id}</code>], ['Revision', state ? `#${state.revision}` : 'Not started'], ['Updated', dateTime(state?.updated_at)], ['Inputs', node.inputs.length], ['Outputs', node.outputs.length],
-      ]} /><div className="vertical-actions"><button className="button primary" disabled={!canRunCommand(result.data, node.id, 'resume') || !!result.error} onClick={() => setAction({ type: 'resume', nodeId: node.id })}><Play size={15} />Resume node</button><button className="button" disabled={!canRunCommand(result.data, node.id, 'rerun') || !!result.error} onClick={() => setAction({ type: 'rerun', nodeId: node.id })}><RotateCcw size={15} />Rerun node</button></div><p className="field-hint">Resume continues a pending node. Rerun creates a new revision.</p></div> : <div className="inspector-empty"><Activity size={28} /><h3>Every node tells a story</h3><p>Select one to see its current state and available actions.</p></div>}</aside></div>
+      ]} /><RuntimeFiles key={`${id}-${node.id}-${result.data.state.revision}`} runId={id} node={state ? { ...node, inputs: state.inputs, outputs: state.outputs } : node} revision={result.data.state.revision} succeeded={state?.status === 'Succeeded'} /><div className="vertical-actions"><button className="button primary" disabled={!canRunCommand(result.data, node.id, 'resume') || !!result.error} onClick={() => setAction({ type: 'resume', nodeId: node.id })}><Play size={15} />Resume node</button><button className="button" disabled={!canRunCommand(result.data, node.id, 'rerun') || !!result.error} onClick={() => setAction({ type: 'rerun', nodeId: node.id })}><RotateCcw size={15} />Rerun node</button></div><p className="field-hint">Resume continues a pending node. Rerun creates a new revision.</p></div> : <div className="inspector-empty"><Activity size={28} /><h3>Every node tells a story</h3><p>Select one to see its current state and available actions.</p></div>}</aside></div>
     </>}
     {action && <RunCommand id={id} action={action.type} initialNode={action.nodeId} close={() => setAction(null)} completed={(message) => { setAction(null); result.refresh(); notify(message); }} />}
     {upgrading && <UpgradeRun id={id} close={() => setUpgrading(false)} completed={(message) => { setUpgrading(false); result.refresh(); notify(message); }} />}
   </>;
+}
+
+function RuntimeFiles({ runId, node, revision, succeeded }: { runId: string; node: GraphNode; revision: number; succeeded: boolean }) {
+  const [busy, setBusy] = useState<string>();
+  const [error, setError] = useState<string>();
+  async function download(direction: 'input' | 'output', fileName: string) {
+    setBusy(`${direction}:${fileName}`); setError(undefined);
+    try {
+      await send(`/runs/${runId}/files/download`, { node_id: node.id, direction, file_name: fileName, revision });
+      const anchor = document.createElement('a');
+      const query = new URLSearchParams({ node_id: node.id, direction, file_name: fileName, revision: String(revision) });
+      anchor.href = `/api/v1/runs/${runId}/files/content?${query}`;
+      anchor.rel = 'noopener noreferrer';
+      document.body.append(anchor); anchor.click(); anchor.remove();
+    } catch (failure) { setError((failure as Error).message); }
+    finally { setBusy(undefined); }
+  }
+  return <><ErrorBanner error={error} />{(['input', 'output'] as const).map((direction) => {
+    const files = direction === 'input' ? node.inputs : node.outputs;
+    return <div className="field-section" key={direction}><h3>{direction === 'input' ? 'Input files' : 'Output files'}</h3>
+      {!files.length && <p className="muted small-text">No {direction} files.</p>}
+      {files.map((file) => <div className="runtime-file" key={file.file_name}><span title={file.file_name}>{file.file_name}</span>
+        {(direction === 'input' || succeeded) && <button type="button" className="button" aria-label={`Download ${direction} ${file.file_name}`} disabled={!!busy} onClick={() => void download(direction, file.file_name)}><Download size={14} />{busy === `${direction}:${file.file_name}` ? 'Preparing…' : 'Download'}</button>}
+      </div>)}
+    </div>;
+  })}</>;
 }
 
 function UpgradeRun({ id, close, completed }: { id: string; close: () => void; completed: (message: string) => void }) {

@@ -37,6 +37,7 @@ async fn configured_job(db: &mut Db, run: &Run, cpu_cores: u32, memory_bytes: u6
     let now = Timestamp::now();
     let node_id = Uuid::new_v4();
     let node_run = NodeRun::create()
+        .uuid(Uuid::new_v4())
         .run_id(run.uuid)
         .data_id(run.data_id)
         .graph_id(run.graph_id)
@@ -391,6 +392,7 @@ async fn poll_checks_both_resources_and_scans_past_unfitting_candidates() {
         .unwrap();
     let node_id = Uuid::new_v4();
     let node_run = NodeRun::create()
+        .uuid(Uuid::new_v4())
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)
@@ -546,6 +548,7 @@ async fn job_creation_requires_a_valid_node_config_lease() {
         .await
         .unwrap();
     let node_run = NodeRun::create()
+        .uuid(Uuid::new_v4())
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)
@@ -613,6 +616,7 @@ async fn missing_leases_return_errors_and_roll_back_polling() {
         .unwrap();
     let node_id = Uuid::new_v4();
     let node_run = NodeRun::create()
+        .uuid(Uuid::new_v4())
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)

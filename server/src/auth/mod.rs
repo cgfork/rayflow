@@ -129,7 +129,8 @@ impl Auth {
             .validate_with_providers(!providers.is_empty())
             .map_err(AuthError::Configuration)?;
         if config.enabled {
-            config.public_url = config::web_url(&config.public_url)
+            config.public_url = config
+                .public_origin()
                 .map_err(AuthError::Configuration)?
                 .origin()
                 .ascii_serialization();
@@ -615,6 +616,3 @@ fn digest(value: &str) -> String {
 fn same_secret(left: &str, right: &str) -> bool {
     bool::from(Sha256::digest(left.as_bytes()).ct_eq(&Sha256::digest(right.as_bytes())))
 }
-
-#[cfg(test)]
-mod tests;

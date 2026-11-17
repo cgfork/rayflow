@@ -53,6 +53,7 @@ async fn published_settings_pin_job_configuration_to_the_run_version() {
             .await
             .unwrap();
         let node_run = NodeRun::create()
+            .uuid(Uuid::new_v4())
             .run_id(run.uuid)
             .data_id(run.data_id)
             .graph_id(run.graph_id)

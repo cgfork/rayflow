@@ -29,11 +29,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+percent-encoding = "2"
 argon2 = "0.5"
 futures-util = { workspace = true }
 ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
 openidconnect = "4"
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 sha2 = "0.10"
 subtle = "2"
 

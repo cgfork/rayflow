@@ -2,8 +2,8 @@ use crate::api::catalog::{
     CommitUploadRequest, DownloadRequest, MultipartRequest, PrepareUploadRequest, Transfer,
 };
 use catalog::{
-    CatalogInput, CatalogOptionalData, CatalogSystem, FileInput, FileKey, FileSystem,
-    ObjectStorage, PresignOperation,
+    CatalogInput, CatalogOptionalData, CatalogSystem, FileInput, FileSystem, ObjectStorage,
+    PresignOperation,
     model::{Catalog, File},
 };
 use catalog::{
@@ -84,8 +84,17 @@ impl<S> App<S> {
         let mut tx = db.transaction().await?;
         let job = lock_claim(&mut tx, request.job_id, request.agent_id).await?;
         let (fullpath, url) = self.artifact_location(&job, &request.key)?;
-        if let Some(existing) = tx.get_file(FileKey::Fullpath(&fullpath)).await?
-            && existing.catalog.key != fullpath
+        let filename = request.key.rsplit('/').next().unwrap().to_owned();
+        if let Some(existing) = tx
+            .get_file_by_node_run_filename(
+                job.node_run.get().uuid,
+                request.key.rsplit('/').next().unwrap(),
+            )
+            .await?
+            && existing
+                .catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.key != fullpath)
         {
             return Err(AppError::InvalidRequest(
                 "artifact name belongs to another object".into(),
@@ -119,6 +128,7 @@ impl<S> App<S> {
         let mut tx = db.transaction().await?;
         let job = lock_claim(&mut tx, request.job_id, request.agent_id).await?;
         let (fullpath, url) = self.artifact_location(&job, &request.key)?;
+        let filename = request.key.rsplit('/').next().unwrap().to_owned();
         // Toasty has no locking read. Serialize acknowledgement with another prepare.
         let table = tx.schema().table_for(Catalog::id()).name.replace('`', "``");
         toasty::sql::query(format!(
@@ -140,8 +150,13 @@ impl<S> App<S> {
                 "upload does not match prepared catalog metadata".into(),
             ));
         }
-        if let Some(existing) = tx.get_file(FileKey::Fullpath(&fullpath)).await?
-            && existing.catalog.uuid != catalog.uuid
+        if let Some(existing) = tx
+            .get_file_by_node_run_filename(job.node_run.get().uuid, &filename)
+            .await?
+            && existing
+                .catalog
+                .as_ref()
+                .is_some_and(|existing_catalog| existing_catalog.uuid != catalog.uuid)
         {
             return Err(AppError::InvalidRequest(
                 "artifact name already has a catalog UUID".into(),
@@ -155,9 +170,12 @@ impl<S> App<S> {
             },
         )
         .await?;
-        let filename = request.key.rsplit('/').next().unwrap().to_owned();
         let id = tx
-            .upsert_file(&FileInput::new(fullpath, filename, catalog.uuid))
+            .upsert_file(&FileInput::new(
+                job.node_run.get().uuid,
+                filename,
+                catalog.uuid,
+            ))
             .await?;
         let file = File::filter_by_uuid(id).get(&mut tx).await?;
         tx.commit().await?;
@@ -175,15 +193,21 @@ impl<S> App<S> {
         check_claim(&job, request.agent_id)?;
         let (fullpath, url) = self.artifact_location(&job, &request.key)?;
         let loaded = db
-            .get_file(FileKey::Fullpath(&fullpath))
+            .get_file_by_node_run_filename(
+                job.node_run.get().uuid,
+                request.key.rsplit('/').next().unwrap(),
+            )
             .await?
-            .ok_or_else(|| AppError::ArtifactNotFound(fullpath))?;
-        if loaded.catalog.url != url {
+            .ok_or_else(|| AppError::ArtifactNotFound(fullpath.clone()))?;
+        let loaded_catalog = loaded
+            .catalog
+            .ok_or_else(|| AppError::ArtifactNotFound(fullpath.clone()))?;
+        if loaded_catalog.url != url {
             return Err(AppError::InvalidRequest(
                 "artifact catalog location does not match its key".into(),
             ));
         }
-        self.transfer(loaded.catalog, PresignOperation::Download, &job)
+        self.transfer(loaded_catalog, PresignOperation::Download, &job)
     }
 
     fn artifact_location(&self, job: &Job, key: &str) -> Result<(String, String), AppError> {

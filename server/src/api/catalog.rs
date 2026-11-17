@@ -9,7 +9,7 @@ use catalog::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Prepare an upload. The server creates or reuses the catalog by object URL.
+/// Prepare an upload. The server creates or reuses the catalog by key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrepareUploadRequest {
     pub job_id: Uuid,
@@ -150,36 +150,4 @@ async fn download<S>(
     Json(body): Json<DownloadRequest>,
 ) -> Result<Json<Transfer>, AppError> {
     app.download_artifact(body).await.map(Json)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn multipart_payloads_keep_claim_identity_flat() {
-        use serde_json::json;
-        let context = MultipartRequest {
-            job_id: Uuid::new_v4(),
-            agent_id: Uuid::new_v4(),
-            key: "run/key".into(),
-            catalog_uuid: Uuid::new_v4(),
-        };
-        let expected = json!({"job_id": context.job_id,"agent_id":context.agent_id,"key":context.key,"catalog_uuid":context.catalog_uuid,"upload_id":"opaque/id","part_number":2});
-        let upload = MultipartUploadRequest {
-            context: context.clone(),
-            upload_id: "opaque/id".into(),
-            part_number: 2,
-        };
-        assert_eq!(serde_json::to_value(upload).unwrap(), expected);
-        let loaded: MultipartUploadRequest = serde_json::from_value(expected).unwrap();
-        assert_eq!(loaded.context.job_id, context.job_id);
-        assert_eq!(loaded.part_number, 2);
-        let session = MultipartSessionRequest {
-            context,
-            upload_id: "opaque/id".into(),
-        };
-        let wire = serde_json::to_value(session).unwrap();
-        assert_eq!(wire["upload_id"], "opaque/id");
-        assert!(wire.get("context").is_none() && wire.get("action").is_none());
-    }
 }

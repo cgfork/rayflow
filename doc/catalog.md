@@ -1,24 +1,28 @@
 # Catalog and object storage
 
-`crates/catalog` separates physical object metadata (`Catalog`) from logical file
-names (`File`). A catalog stores `id`, `uuid`, `key`, `url`, `size` in bytes, `format`,
-`uploaded` (a boolean upload acknowledgement), `created_at`, and `updated_at`. A file stores `id`, `uuid`, `fullpath`,
-`filename`, `catalog_uuid`, and the same two timestamps. Multiple logical files
-can reference one catalog UUID. Catalog `key` and `url` each use `VARCHAR(750)`
-with separate unique constraints. These lengths keep each `utf8mb4` index within
-MySQL's 3072-byte limit. A file's `fullpath` typically equals its catalog's key;
-other logical paths can reference the same catalog.
+`crates/catalog` separates physical object metadata (`Catalog`) from node-run-owned
+files (`File`). Catalog records store `id`, `uuid`, `key`, `url`, byte `size`,
+`format`, `uploaded`, `created_at`, and `updated_at`. File records store `id`,
+`uuid`, `node_run_id` (the producing node run's UUID), `filename`, `catalog_uuid`,
+and the same timestamps. There is no `file.fullpath`: use the referenced
+catalog's key for the path. Catalog keys and URLs have separate unique
+`VARCHAR(750)` constraints. A catalog UUID identifies one file record.
 
-Register `catalog::models()` with a Toasty database, or use `server::models()`,
-which includes them. Run `./init-db.sh` to apply the migrations (8 creates these
-tables; 10 adds `uploaded`; 11 changes the URL column; 12 and 13 remove deletion
-timestamps; 17 adds the unique catalog key; 18 renames file `fullname` to `fullpath`). `rayflow.sql` contains
-the matching schema for a fresh installation.
+Register `catalog::models()` or use `server::models()`. Run `./init-db.sh` before
+starting updated binaries. `rayflow.sql` contains the schema for fresh installs.
+Migrations 19–21 add stable node-run UUIDs, backfill file ownership, and remove
+`file.fullpath`. Numeric node-run primary keys and task/job references remain
+unchanged. Each new node-run revision gets a new UUID; Pend/Resume keeps the same
+UUID. Run inspection exposes each node run's UUID as `state.nodes[].uuid`.
 
-Migration 17 initializes existing keys from their URLs, preserving UUIDs, file
-references, and timestamps. Use `update_catalog(id, data)` to assign another key
-to existing metadata, including the logical full path for existing job artifacts.
-Migration 18 preserves file paths, UUIDs, references, and path uniqueness.
+The ownership migration resolves existing files from their catalog keys and
+pinned graph node names, including percent-encoded names. It preserves file,
+catalog, and node-run identities and timestamps. If a legacy file has no
+resolvable producer, migration 21 stops before removing `fullpath`; explicitly
+map its `file.node_run_id` to the correct existing `node_run.uuid` and rerun
+initialization. A duplicate catalog reference also stops migration rather than
+dropping rows. Migration 20 is tracked separately so this retry is supported.
+Stop server, pilot, and agents before applying these schema changes.
 
 ## Metadata operations
 
@@ -45,7 +49,7 @@ borrowed inputs, along with numeric or borrowed IDs and borrowed data views.
 Identities implement `Id` (`Clone`, `Eq`, `Hash`, `Debug`, and `Display`).
 
 `Catalog` exposes `key()`, `url()`, `size()`, `format()`, and `uploaded()`. `File` exposes
-`fullpath()`, `filename()`, and `catalog_id()` using its associated catalog ID
+`node_run_id()`, `filename()`, and `catalog_id()` using its associated catalog ID
 type. Neither data trait exposes the object's own identity. Database IDs and
 audit timestamps remain on the persistence models.
 `CatalogInput` and `FileInput<I>` are convenient write payloads without their
@@ -64,10 +68,10 @@ For MySQL, pass the concrete optional data directly or by reference; references
 to complete `Catalog` or `File` implementations (including input structs and
 owned records) supply every field.
 
-`FileOptionalData<I>` has optional `fullpath`, `filename`, and `catalog_id`
-fields with the same omission semantics. Upserts require a full path, and new
-files also require filename and catalog ID. A full-path-only payload returns an
-existing ID without changing its timestamps.
+`FileOptionalData<I>` has optional `node_run_id`, `filename`, and `catalog_id`
+fields with the same omission semantics. Upserts require a catalog ID, and new
+files also require filename and node-run UUID. A catalog-ID-only payload returns
+an existing file ID without changing its timestamps.
 
 `CatalogSystem` supports:
 
@@ -78,18 +82,18 @@ existing ID without changing its timestamps.
 
 `FileSystem` adds:
 
-- `upsert_file(&data)` inserts or updates by full path and returns `FileId`.
-- `update_file(id, data)` updates supplied fields by ID, including a new full path.
-- `get_file(FileKey::Id(id))` or `get_file(FileKey::Fullpath(name))` returns
+- `upsert_file(&data)` inserts or updates by catalog ID and returns `FileId`.
+- `update_file(id, data)` updates supplied fields by ID, including a new filename or catalog reference.
+- `get_file(FileKey::Id(id))` or `get_file(FileKey::CatalogKey(key))` returns
   `FileWithCatalog<FileData, CatalogData>`, or `None` if either record is missing.
 
 Upserts preserve the ID and creation timestamp of the row that already owns
-the key or full path. A new key or full path creates a new record. Changing the
+the catalog key or catalog reference. A new catalog key or reference creates a new record. Changing the
 URL for an existing key preserves the catalog UUID and file references. File writes
 validate supplied catalog references. Timestamps are assigned by the store.
 Updates return `Result<(), Err>` and do not create missing rows: MySQL returns
 `CatalogNotFound` or `FileNotFound`. Empty updates preserve timestamps. Updates
-do not require the key or full path; either can be supplied to rename a record,
+do not require the catalog key or catalog reference; partial fields can rename a record,
 subject to the existing unique constraints. Constraint failures remain database
 errors and roll back the write.
 
@@ -100,13 +104,13 @@ let catalog_id = db.upsert_catalog(&CatalogInput::new(
     "/run-1/results.csv", "s3://artifacts/run-1/results.csv", 1024, "text/csv",
 )).await?;
 let file_id = db.upsert_file(&FileInput::new(
-    "/run-1/results.csv", "results.csv", catalog_id,
+    node_run.uuid, "results.csv", catalog_id,
 )).await?;
 let loaded = db.get_file(FileKey::Id(file_id)).await?;
 ```
 
 Writes use transactions or nested savepoints and leave an outer commit or
-rollback to the caller. Both stores use Toasty to select by key or full path,
+rollback to the caller. Both stores use Toasty to select by catalog key or catalog UUID,
 update only supplied fields, or create a missing row. A concurrent creation can
 hit a unique constraint. Retry the entire caller transaction with a fresh
 snapshot after a creation race, deadlock, or snapshot conflict. Catalog references
@@ -150,19 +154,19 @@ URLs must be absolute object locations, for example `s3://a/b/c`, `oss://a/b/c`,
 accepted. URLs are stored as supplied; credentials and fragments are rejected.
 These operations store metadata and do not access the object's bytes. `format`
 is a nonempty string of up to 255 characters, such as `parquet` or `text/csv`.
-`fullpath` allows 512 characters and `filename` 255. The deployed schema uses a
+`filename` allows 255 characters. The deployed schema uses a
 case-sensitive collation for names.
 
 ## Deletion
 
-Catalogs and files have no deletion timestamp. Their keys, URLs, and full paths are
-unique across all stored rows. Delete records through the persistence models:
+Catalogs and files have no deletion timestamp. Catalog keys and URLs are unique across
+all stored rows, as are file catalog references. Delete records through the persistence models:
 
 ```rust,ignore
 File::filter_by_uuid(file.uuid).delete().exec(&mut db).await?;
 ```
 
-Deleting a file releases its full path. Deleting a catalog releases its key and URL;
+Deleting a file releases its catalog reference. Deleting a catalog releases its key and URL;
 linked file records remain, but `get_file` returns `None` while their catalog is
 missing. Remove or repoint linked files when deleting their catalog. Metadata
 deletion does not remove bytes from object storage.
@@ -382,7 +386,7 @@ The server trusts the agent's completed PUT; it does not HEAD the object.
 The agent reports success only after all outputs are committed.
 
 The server adds its configured prefix to the supplied relative key to form the
-catalog key and file full path, both `/prefix/<key>`. It adds the bucket to form
+catalog key `/prefix/<key>`; files reference that catalog and their producing node run. It adds the bucket to form
 the object URL used for signing. Catalog handlers do not load graph definitions,
 interpret input/output names, or choose producer revisions. Directory members
 have their own keys; the root directory uses a key ending in
@@ -535,3 +539,38 @@ directory, including when the producer ran on another agent.
 Library users can supply separate roots through `Agentd::open_with_data_dir`
 and matching `Settings.data_dir`. The convenience `Agentd::open` and
 `Settings::new` use `workdir/data`; set an explicit root for deployments.
+
+## Browser downloads from Runtime
+
+The Runtime node inspector always shows download actions for declared inputs.
+It shows output download actions only when that node has succeeded. An input
+whose producer has not published a file returns a not-found error.
+
+`POST /api/v1/runs/{run_id}/files/download` returns catalog metadata and a signed
+GET URL through `ObjectStorage`. Unlike the agent catalog endpoint, it does not
+require an active job claim. It requires a browser session when auth is enabled;
+fleet bearer credentials cannot access this route. The normal browser write
+header (`X-Rayflow-Request: 1`) and origin checks apply.
+
+```json
+{
+  "node_id": "b7c91d28-4a26-482b-95b9-fd4caabfa945",
+  "direction": "output",
+  "file_name": "x.json",
+  "revision": 2
+}
+```
+
+`direction` is `input` or `output`. `revision` may be omitted to select the
+current run revision. The server validates the declared port and resolves its
+producer's pinned graph version and node revision. Outputs require a succeeded
+node; all downloads require committed, uploaded catalog metadata. Requesters
+cannot supply arbitrary catalog keys or storage URLs.
+
+`GET /api/v1/runs/{run_id}/files/content` accepts the same fields as query
+parameters and streams the object through the server with
+`Content-Disposition: attachment` and `application/octet-stream`. The Runtime
+button checks availability via POST, then uses this same-origin GET so the
+browser saves the file regardless of its storage content type. Large objects
+are streamed without buffering the entire object. No RustFS CORS setup is needed.
+Directory outputs download their `.rayflow-directory.json` manifest.

@@ -176,6 +176,7 @@ async fn resume_returns_to_ready_and_enqueues_one_task() {
         .await
         .unwrap();
     let initial = NodeRun::all().exec(&mut db).await.unwrap().remove(0);
+    assert!(!initial.uuid.is_nil());
     assert_eq!(initial.status, Status::Ready.to_string());
     assert_eq!(initial.version, version);
     assert_eq!(
@@ -229,6 +230,7 @@ async fn resume_returns_to_ready_and_enqueues_one_task() {
         .unwrap();
     assert_eq!(resumed.status, Status::Ready.to_string());
     assert_eq!(resumed.revision, initial.revision);
+    assert_eq!(resumed.uuid, initial.uuid);
     let tasks = event::task::Task::all().exec(&mut db).await.unwrap();
     assert_eq!(tasks.len(), 2);
     assert_ne!(tasks[0].id, tasks[1].id);
@@ -290,6 +292,7 @@ async fn concurrent_run_transitions_once_without_creating_tasks() {
         .await
         .unwrap();
     NodeRun::create()
+        .uuid(Uuid::new_v4())
         .run_id(run.uuid)
         .data_id(data_id)
         .graph_id(graph_id)
@@ -460,6 +463,20 @@ async fn rerun_creates_a_ready_revision_and_one_task() {
         assert_eq!(current.status, Status::Ready.to_string());
         assert_eq!(current.ineffective, 0);
         assert_ne!(current.id, original.id);
+        assert_ne!(current.uuid, original.uuid);
+        let uuids = NodeRun::filter_by_run_id(run.uuid)
+            .exec(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(
+            uuids
+                .iter()
+                .map(|row| row.uuid)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            uuids.len()
+        );
+        assert!(!current.uuid.is_nil());
         let history = NodeRun::filter_by_run_id(original.run_id)
             .filter(NodeRun::fields().node_id().eq(node))
             .filter(NodeRun::fields().revision().lt(revision))

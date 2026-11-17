@@ -7,7 +7,6 @@ COPY crates/ crates/
 COPY server/ server/
 COPY pilot/ pilot/
 COPY agent/ agent/
-COPY graphs/ graphs/
 RUN cargo build --locked --release -p pilot --bin pilot
 
 FROM debian:bookworm-slim AS runtime

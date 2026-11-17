@@ -256,7 +256,7 @@ fn job(run: Uuid, node: Uuid, revision: u64) -> Job {
     let mut value = serde_json::to_value(job).unwrap();
     let now = Timestamp::now();
     value["run"] = json!({"id":1,"uuid":run,"data_id":task.data_id,"graph_id":task.graph_id,"version":1,"revision":revision,"created_at":now,"updated_at":now});
-    value["node_run"] = json!({"id":1,"run_id":run,"data_id":task.data_id,"graph_id":task.graph_id,"version":1,"node_id":node,"revision":revision,"status":"Running","created_at":now,"updated_at":now});
+    value["node_run"] = json!({"uuid": Uuid::new_v4(),"id":1,"run_id":run,"data_id":task.data_id,"graph_id":task.graph_id,"version":1,"node_id":node,"revision":revision,"status":"Running","created_at":now,"updated_at":now});
     serde_json::from_value(value).unwrap()
 }
 fn node(id: Uuid) -> Node {

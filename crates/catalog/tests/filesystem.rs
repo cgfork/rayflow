@@ -1,7 +1,7 @@
 //! Non-UUID identities, borrowed data, and borrowed inputs exercise the filesystem GATs.
 use catalog::{
-    Catalog, CatalogInput, CatalogOptionalData, CatalogSystem, File, FileInput, FileKey,
-    FileOptionalData, FileSystem, FileWithCatalog,
+    Catalog, CatalogInput, CatalogOptionalData, CatalogSystem, File, FileInput, FileOptionalData,
+    FileSystem, FileWithCatalog,
 };
 use std::io;
 
@@ -89,6 +89,15 @@ impl CatalogSystem for BorrowingStore<'_> {
     {
         Ok((id == 7).then_some(&*self.catalog))
     }
+    async fn get_catalog_by_key<'a>(
+        &'a mut self,
+        key: &str,
+    ) -> Result<Option<Self::CatalogData<'a>>, io::Error>
+    where
+        Self: 'a,
+    {
+        Ok((key == self.catalog.key).then_some(&*self.catalog))
+    }
 }
 
 impl FileSystem for BorrowingStore<'_> {
@@ -114,7 +123,7 @@ impl FileSystem for BorrowingStore<'_> {
         Self: 'a,
     {
         let data = data.into();
-        assert_eq!(data.fullpath.as_deref(), Some(self.file.fullpath.as_str()));
+        assert_eq!(data.catalog_id, Some(self.file.catalog_id));
         if let Some(filename) = &data.filename {
             self.file.filename = filename.clone();
         }
@@ -136,8 +145,8 @@ impl FileSystem for BorrowingStore<'_> {
             return Err(io::ErrorKind::NotFound.into());
         }
         let data = data.into();
-        if let Some(fullpath) = &data.fullpath {
-            self.file.fullpath = fullpath.clone();
+        if let Some(node_run_id) = data.node_run_id {
+            self.file.node_run_id = node_run_id;
         }
         if let Some(filename) = &data.filename {
             self.file.filename = filename.clone();
@@ -151,20 +160,31 @@ impl FileSystem for BorrowingStore<'_> {
 
     async fn get_file<'a>(
         &'a mut self,
-        key: FileKey<'_, Self::FileId<'a>>,
-    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Self::CatalogData<'a>>>, io::Error>
+        id: Self::FileId<'a>,
+    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Option<Self::CatalogData<'a>>>>, io::Error>
     where
         Self: 'a,
     {
-        let matches = match key {
-            FileKey::Id(id) => id == self.file_id,
-            FileKey::Fullpath(name) => name == self.file.fullpath,
-        };
+        Ok((id == self.file_id).then_some(FileWithCatalog {
+            file: &*self.file,
+            catalog: Some(&*self.catalog),
+        }))
+    }
+    async fn get_file_by_node_run_filename<'a>(
+        &'a mut self,
+        node_run_id: uuid::Uuid,
+        filename: &str,
+    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Option<Self::CatalogData<'a>>>>, io::Error>
+    where
+        Self: 'a,
+    {
         Ok(
-            (matches && self.file.catalog_id == 7).then_some(FileWithCatalog {
-                file: &*self.file,
-                catalog: &*self.catalog,
-            }),
+            (node_run_id == self.file.node_run_id && filename == self.file.filename).then_some(
+                FileWithCatalog {
+                    file: &*self.file,
+                    catalog: Some(&*self.catalog),
+                },
+            ),
         )
     }
 }
@@ -179,7 +199,7 @@ async fn read_catalog<'a, S: CatalogSystem + 'a>(
 #[tokio::test]
 async fn identities_and_borrowed_data_are_independent() {
     let mut catalog = CatalogInput::new("/a", "s3://bucket/a", 10, "bin");
-    let mut file = FileInput::new("/a", "a", 7);
+    let mut file = FileInput::new(uuid::Uuid::from_u128(1), "a", 7);
     let file_id = String::from("file-seven");
     let catalog_ptr = &catalog as *const CatalogInput;
     let file_ptr = &file as *const FileInput<u64>;
@@ -214,9 +234,12 @@ async fn identities_and_borrowed_data_are_independent() {
     assert_eq!(loaded.size(), 30);
     assert!(!loaded.uploaded());
     let id = store
-        .upsert_file(&FileOptionalData::from(
-            &FileInput::new("/a", "a.csv", 7_u64) as &dyn File<CatalogId = u64>,
-        ))
+        .upsert_file(&FileOptionalData::from(&FileInput::new(
+            uuid::Uuid::from_u128(1),
+            "a.csv",
+            7_u64,
+        )
+            as &dyn File<CatalogId = u64>))
         .await
         .unwrap()
         .to_owned();
@@ -224,9 +247,9 @@ async fn identities_and_borrowed_data_are_independent() {
     assert_eq!(
         store
             .upsert_file(&FileOptionalData {
-                fullpath: Some("/a".into()),
+                node_run_id: Some(uuid::Uuid::from_u128(1)),
                 filename: Some("new.csv".into()),
-                catalog_id: None
+                catalog_id: Some(7)
             })
             .await
             .unwrap(),
@@ -235,12 +258,12 @@ async fn identities_and_borrowed_data_are_independent() {
     let loaded = {
         let name = String::from("/a");
         store
-            .get_file(FileKey::Fullpath(&name))
+            .get_file_by_node_run_filename(uuid::Uuid::from_u128(1), "new.csv")
             .await
             .unwrap()
             .unwrap()
     };
-    assert!(std::ptr::eq(loaded.catalog, catalog_ptr));
+    assert!(loaded.catalog.is_some() && std::ptr::eq(loaded.catalog.unwrap(), catalog_ptr));
     assert!(std::ptr::eq(loaded.file, file_ptr));
     assert_eq!(loaded.file.filename(), "new.csv");
     assert!(store.get_catalog(8).await.unwrap().is_none());
@@ -255,7 +278,7 @@ async fn s3_preserves_identity_data_and_optional_data_gats() {
     };
     use std::time::Duration;
     let mut catalog = CatalogInput::new("/a", "s3://bucket/a", 10, "bin");
-    let mut file = FileInput::new("/a", "a", 7);
+    let mut file = FileInput::new(uuid::Uuid::from_u128(1), "a", 7);
     let mut store = S3::new(
         BorrowingStore {
             catalog: &mut catalog,
@@ -288,16 +311,20 @@ async fn s3_preserves_identity_data_and_optional_data_gats() {
     assert_eq!(loaded.size(), 20);
     assert_eq!(loaded.format(), "csv");
     let file_id = store
-        .upsert_file(&FileOptionalData::from(&FileInput::new("/a", "a", id)))
+        .upsert_file(&FileOptionalData::from(&FileInput::new(
+            uuid::Uuid::from_u128(1),
+            "a",
+            id,
+        )))
         .await
         .unwrap()
         .to_owned();
     assert_eq!(
         store
             .upsert_file(&FileOptionalData {
-                fullpath: Some("/a".into()),
+                node_run_id: Some(uuid::Uuid::from_u128(1)),
                 filename: Some("new".into()),
-                catalog_id: None
+                catalog_id: Some(7)
             })
             .await
             .unwrap(),
@@ -305,7 +332,7 @@ async fn s3_preserves_identity_data_and_optional_data_gats() {
     );
     assert_eq!(
         store
-            .get_file(FileKey::Id(&file_id))
+            .get_file(&file_id)
             .await
             .unwrap()
             .unwrap()
@@ -342,13 +369,9 @@ async fn s3_preserves_identity_data_and_optional_data_gats() {
         )
         .await
         .unwrap();
-    let loaded = store
-        .get_file(FileKey::Id(&file_id))
-        .await
-        .unwrap()
-        .unwrap();
+    let loaded = store.get_file(&file_id).await.unwrap().unwrap();
     assert_eq!(loaded.file.filename(), "updated");
-    assert_eq!(loaded.file.fullpath(), "/a");
+    assert_eq!(loaded.file.node_run_id(), uuid::Uuid::from_u128(1));
     assert!(!loaded.catalog.uploaded());
     assert_eq!(loaded.catalog.size(), 20);
     assert!(
@@ -371,7 +394,7 @@ fn object_storage_contract_signs_preloaded_records_and_multipart_operations() {
     };
     use std::time::Duration;
     let mut data = CatalogInput::new("/a", "s3://bucket/a", 10, "bin");
-    let mut file = FileInput::new("/a", "a", 7);
+    let mut file = FileInput::new(uuid::Uuid::from_u128(1), "a", 7);
     let storage = Config::new(
         "http://localhost:9000",
         Credentials::new("access", "secret", None, None, "test"),

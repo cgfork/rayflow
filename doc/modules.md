@@ -137,7 +137,9 @@ so another `GraphStore` can be injected by an application.
 
 HTTP handlers and application operations are grouped by resource: `graph`,
 `graph_draft`, `run`/`state`, `job`, `agent`, and `catalog`. Collection operations share
-`app::pagination::{PageQuery, Page}`. Graph endpoints use `GraphStore` and
+`app::pagination::{PageQuery, Page}`. Job modules also own task-event emission;
+graph modules own both published reads and draft editing/publication. Server
+and object-storage settings live together in `server::config`. Graph endpoints use `GraphStore` and
 `DraftGraphStore` and return complete DAGs without exposing persistence records.
 Draft writes/publishing, run commands, and job actions reuse their existing
 application methods. `app::AgentInstance` records poll observations in
@@ -200,7 +202,6 @@ server/        Axum API binary and reusable application state
 pilot/         leader-elected consumer binary
 agent/         container execution and HTTP polling binary
 ui/            React workflow editor and runtime, job, and agent management
-graphs/        sample graphs available to tests and library consumers
 doc/           architecture, design, module, and usage documentation
 rayflow.sql    MySQL schema for all persistent models
 ```

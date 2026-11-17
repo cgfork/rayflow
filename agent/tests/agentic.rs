@@ -194,7 +194,7 @@ async fn polled_job_persists_node_starts_and_reports() {
         "graph_id": task.graph_id, "version": 1, "revision": 1,
         "created_at": now, "updated_at": now
     });
-    value["node_run"] = json!({
+    value["node_run"] = json!({"uuid": Uuid::new_v4(),
         "id": task.node_run_id, "run_id": job.run_id,
         "data_id": task.data_id, "graph_id": task.graph_id,
         "version": 1, "node_id": task.node_id, "revision": 1,
@@ -299,7 +299,7 @@ async fn recovered_result_is_retried_and_acknowledged() {
     let mut value = serde_json::to_value(&job).unwrap();
     let now = Timestamp::now();
     value["run"] = json!({"id":1,"uuid":job.run_id,"data_id":task.data_id,"graph_id":task.graph_id,"version":1,"revision":3,"created_at":now,"updated_at":now});
-    value["node_run"] = json!({"id":task.node_run_id,"run_id":job.run_id,"data_id":task.data_id,"graph_id":task.graph_id,"version":1,"node_id":task.node_id,"revision":3,"status":"Running","created_at":now,"updated_at":now});
+    value["node_run"] = json!({"uuid": Uuid::new_v4(),"id":task.node_run_id,"run_id":job.run_id,"data_id":task.data_id,"graph_id":task.graph_id,"version":1,"node_id":task.node_id,"revision":3,"status":"Running","created_at":now,"updated_at":now});
     let job: Job = serde_json::from_value(value).unwrap();
     let file_fs = agent::filefs::FileFs::new(workdir.join("data"), job.run_id, task.node_id, 3);
     file_fs.prepare().await.unwrap();

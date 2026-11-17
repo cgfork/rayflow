@@ -7,7 +7,6 @@ use coordinator::TransactionalLeaderElection;
 use graph::{ForkPoint, GraphStore};
 use runtime::{Error as BackendError, backend::Backend};
 use scheduler::{Actuator, AgentScheduler, Scheduler};
-use server::StaticGraphStore;
 use toasty::Db;
 use tokio::time::{MissedTickBehavior, interval};
 use uuid::Uuid;
@@ -32,12 +31,8 @@ pub enum Error {
 pub use scheduler::Step;
 
 /// Consumes commands, tasks, and task events while this pilot holds the leader
-/// lease.
-pub struct Pilot<
-    E = coordinator::mysql::MySqlLeaderElection,
-    S = AgentScheduler,
-    G = StaticGraphStore,
-> {
+/// lease. The default graph store reads published graphs from the database.
+pub struct Pilot<E = coordinator::mysql::MySqlLeaderElection, S = AgentScheduler, G = Db> {
     election: E,
     actuator: Actuator<G>,
     db: Db,

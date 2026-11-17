@@ -39,7 +39,7 @@ async fn application_errors_return_json_messages_and_stable_business_codes() {
             "RAYFLOW_ARTIFACT_NOT_FOUND",
         ),
         (
-            E::StorageConfiguration(server::storage::Error::InvalidBucket),
+            E::StorageConfiguration(server::config::StorageConfigError::InvalidBucket),
             S::BAD_REQUEST,
             "RAYFLOW_INVALID_STORAGE_CONFIGURATION",
         ),
@@ -426,10 +426,4 @@ async fn missing_graphs_and_invalid_drafts_have_consistent_responses_across_stor
     ] {
         assert_response(AppError::Graph(Box::new(error)), status, code).await;
     }
-    assert_response(
-        AppError::Graph(Box::new(server::graph::GraphNotFound(Uuid::nil()))),
-        S::NOT_FOUND,
-        "RAYFLOW_GRAPH_NOT_FOUND",
-    )
-    .await;
 }

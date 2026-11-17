@@ -3,7 +3,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use catalog::directory::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST};
-use catalog::{CatalogSystem, FileKey, FileSystem, model::Catalog};
+use catalog::{CatalogSystem, FileSystem, model::Catalog};
 use event::task::Task;
 use graph::{
     GraphStore,
@@ -114,6 +114,7 @@ async fn setup(kind: Kind) -> Option<Fixture> {
     let mut jobs = Vec::new();
     for (node, version, revision) in [(producer, 1, 2), (consumer, 2, 7)] {
         let node_run = NodeRun::create()
+            .uuid(Uuid::new_v4())
             .run_id(run.uuid)
             .data_id(run.data_id)
             .graph_id(graph_id)
@@ -222,7 +223,7 @@ async fn catalog_operations_use_agent_supplied_keys_and_acknowledge_publication(
             .contains("X-Amz-Signature=")
     );
     assert!(
-        f.db.get_file(FileKey::Fullpath(&key))
+        f.db.get_file(FileKey::CatalogKey(&key))
             .await
             .unwrap()
             .is_none()
@@ -236,7 +237,19 @@ async fn catalog_operations_use_agent_supplied_keys_and_acknowledge_publication(
     assert!(!f.db.get_catalog(uuid).await.unwrap().unwrap().uploaded);
     let (status, body) = action(&f, f.producer.uuid, "commit", upload.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["fullpath"], key);
+    assert!(body.get("fullpath").is_none());
+    let owner = NodeRun::filter_by_id(f.producer.node_run_id)
+        .get(&mut f.db)
+        .await
+        .unwrap();
+    assert_eq!(body["node_run_id"], owner.uuid.to_string());
+    assert_eq!(
+        action(&f, f.consumer.uuid, "commit", upload.clone())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST,
+        "a different node run cannot take ownership of an existing file"
+    );
     let file_uuid = body["uuid"].as_str().unwrap().to_owned();
     assert_ne!(file_uuid, uuid.to_string());
     assert!(f.db.get_catalog(uuid).await.unwrap().unwrap().uploaded);
@@ -510,6 +523,7 @@ async fn run_inspection_exposes_producer_versions_at_the_requested_revision() {
         .await
         .unwrap();
     NodeRun::create()
+        .uuid(Uuid::new_v4())
         .run_id(f.run)
         .data_id(producer.data_id)
         .graph_id(producer.graph_id)
@@ -602,4 +616,191 @@ async fn catalog_api_exposes_only_transfer_operations() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn browser_downloads_resolve_pinned_producers_without_an_active_claim() {
+    let Some(mut f) = setup(Kind::File).await else {
+        return;
+    };
+    let key = format!("{}/old%20flow/1/old%20producer/2/result", f.run);
+    let body = json!({"agent_id": f.agent, "key": key, "size": 12, "format": "bin"});
+    let (status, prepared) = action(&f, f.producer.uuid, "prepare", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{prepared}");
+    let mut commit = body;
+    commit["catalog_uuid"] = prepared["catalog"]["uuid"].clone();
+    assert_eq!(
+        action(&f, f.producer.uuid, "commit", commit).await.0,
+        StatusCode::OK
+    );
+    let producer = NodeRun::filter_by_id(f.producer.node_run_id)
+        .get(&mut f.db)
+        .await
+        .unwrap();
+    let consumer = NodeRun::filter_by_id(f.consumer.node_run_id)
+        .get(&mut f.db)
+        .await
+        .unwrap();
+    let path = format!("/api/v1/runs/{}/files/download", f.run);
+    let output = json!({"node_id": producer.node_id, "file_name": "result", "direction": "output", "revision": 9});
+    assert_eq!(
+        request(&f, "POST", &path, output.clone()).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    NodeRun::filter_by_id(producer.id)
+        .update()
+        .status("Succeeded")
+        .exec(&mut f.db)
+        .await
+        .unwrap();
+    // Completed jobs must not need an agent claim to download their acknowledged output.
+    Job::filter_by_uuid(f.producer.uuid)
+        .update()
+        .status(Status::Succeeded)
+        .agent_id(None)
+        .exec(&mut f.db)
+        .await
+        .unwrap();
+    let (status, transfer) = request(&f, "POST", &path, output.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{transfer}");
+    assert_eq!(transfer["catalog"]["key"], format!("/prefix/{key}"));
+    assert_eq!(transfer["presigned"]["operation"], "download");
+    let input = json!({"node_id": consumer.node_id, "file_name": "input", "direction": "input", "revision": 9});
+    let (status, transfer) = request(&f, "POST", &path, input.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{transfer}");
+    assert_eq!(transfer["catalog"]["key"], format!("/prefix/{key}"));
+    // A producer rerun after the consumer started must not change that consumer's inputs.
+    let later = NodeRun::create()
+        .uuid(Uuid::new_v4())
+        .run_id(f.run)
+        .data_id(producer.data_id)
+        .graph_id(producer.graph_id)
+        .version(2)
+        .node_id(producer.node_id)
+        .revision(8)
+        .status("Succeeded")
+        .created_at(Timestamp::now())
+        .updated_at(Timestamp::now())
+        .exec(&mut f.db)
+        .await
+        .unwrap();
+    let later_key = format!("/prefix/{}/flow/2/producer/8/result", f.run);
+    let mut data =
+        catalog::CatalogInput::new(&later_key, format!("s3://artifacts{later_key}"), 24, "bin");
+    data.uploaded = true;
+    let catalog_id = f.db.upsert_catalog(&data).await.unwrap();
+    f.db.upsert_file(&catalog::FileInput::new(later.uuid, "result", catalog_id))
+        .await
+        .unwrap();
+    let (status, transfer) = request(&f, "POST", &path, input.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{transfer}");
+    assert_eq!(transfer["catalog"]["key"], format!("/prefix/{key}"));
+    let (status, transfer) = request(&f, "POST", &path, output.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{transfer}");
+    assert_eq!(transfer["catalog"]["key"], later_key);
+    let mut historical = output.clone();
+    historical["revision"] = json!(2);
+    let (status, transfer) = request(&f, "POST", &path, historical).await;
+    assert_eq!(status, StatusCode::OK, "{transfer}");
+    assert_eq!(transfer["catalog"]["key"], format!("/prefix/{key}"));
+    let mut invalid = output.clone();
+    invalid["file_name"] = json!("../undeclared");
+    assert_eq!(
+        request(&f, "POST", &path, invalid).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let mut invalid = output.clone();
+    invalid["revision"] = json!(10);
+    assert_eq!(
+        request(&f, "POST", &path, invalid).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let uuid: Uuid = serde_json::from_value(prepared["catalog"]["uuid"].clone()).unwrap();
+    Catalog::filter_by_uuid(uuid)
+        .update()
+        .uploaded(false)
+        .exec(&mut f.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&f, "POST", &path, input).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn browser_content_downloads_stream_attachments_with_the_requested_filename() {
+    let Some(mut f) = setup(Kind::File).await else {
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = axum::Router::new().fallback(|| async {
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            Body::from_stream(futures_util::stream::iter([
+                Ok::<_, std::io::Error>(b"binary\0".to_vec()),
+                Ok(b"content".to_vec()),
+            ])),
+        )
+    });
+    let task = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+    let graph_id = NodeRun::filter_by_id(f.producer.node_run_id)
+        .get(&mut f.db)
+        .await
+        .unwrap()
+        .graph_id;
+    let versions = Versions(vec![
+        f.app.read_graph(graph_id, Some(1)).await.unwrap(),
+        f.app.read_graph(graph_id, Some(2)).await.unwrap(),
+    ]);
+    let config = Config { storage: Some(serde_json::from_value(json!({"endpoint":endpoint,"bucket":"artifacts","prefix":"prefix","access_key":"access","secret_key":"secret"})).unwrap()), ..Config::default() };
+    f.app = App::new(f.db.clone(), config, versions);
+    let key = format!("{}/old%20flow/1/old%20producer/2/result", f.run);
+    let mut body = json!({"agent_id":f.agent,"key":key,"size":14,"format":"bin"});
+    let (status, prepared) = action(&f, f.producer.uuid, "prepare", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{prepared}");
+    body["catalog_uuid"] = prepared["catalog"]["uuid"].clone();
+    assert_eq!(
+        action(&f, f.producer.uuid, "commit", body).await.0,
+        StatusCode::OK
+    );
+    NodeRun::filter_by_id(f.producer.node_run_id)
+        .update()
+        .status("Succeeded")
+        .exec(&mut f.db)
+        .await
+        .unwrap();
+    for (job, direction, filename) in [
+        (&f.producer, "output", "result"),
+        (&f.consumer, "input", "input"),
+    ] {
+        let node = NodeRun::filter_by_id(job.node_run_id)
+            .get(&mut f.db)
+            .await
+            .unwrap();
+        let response = server::router(f.app.clone()).oneshot(Request::get(format!("/api/v1/runs/{}/files/content?node_id={}&direction={direction}&file_name={filename}&revision=9", f.run, node.node_id)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(
+            response.headers()["content-disposition"]
+                .to_str()
+                .unwrap()
+                .ends_with(&format!("filename*=UTF-8''{filename}"))
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"binary\0content"
+        );
+    }
+    task.abort();
 }

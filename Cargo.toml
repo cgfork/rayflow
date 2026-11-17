@@ -42,7 +42,3 @@ jiff = { version = "0.2", features = ["serde"] }
 tokio = { version = "1.53", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-hyper = { version = "1", default-features = false, features = ["client", "http1"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
-http-body-util = "0.1"
-bytes = "1"

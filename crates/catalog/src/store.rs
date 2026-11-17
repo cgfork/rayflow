@@ -2,7 +2,7 @@
 //! leave ownership of an outer commit or rollback with the caller.
 
 use crate::{
-    CatalogOptionalData, CatalogSystem, FileKey, FileOptionalData, FileSystem, FileWithCatalog,
+    CatalogOptionalData, CatalogSystem, FileOptionalData, FileSystem, FileWithCatalog,
     model::{Catalog, File},
 };
 use jiff::Timestamp;
@@ -134,6 +134,13 @@ impl<B: Executor> CatalogSystem for B {
     {
         Ok(Catalog::filter_by_uuid(id).first().exec(self).await?)
     }
+
+    async fn get_catalog_by_key<'a>(&'a mut self, key: &str) -> Result<Option<Catalog>, Error>
+    where
+        Self: 'a,
+    {
+        Ok(Catalog::filter_by_key(key).first().exec(self).await?)
+    }
 }
 
 impl<B: Executor> FileSystem for B {
@@ -159,16 +166,12 @@ impl<B: Executor> FileSystem for B {
         Self: 'a,
     {
         let mut data = data.into();
-        let fullpath = data
-            .fullpath
-            .as_deref()
-            .ok_or(Error::MissingField("fullpath"))?;
-        validate_field("fullpath", fullpath, 512)?;
+        let catalog_id = data.catalog_id.ok_or(Error::MissingField("catalog_id"))?;
         if let Some(filename) = &data.filename {
             validate_field("filename", filename, 255)?;
         }
         let mut tx = self.transaction().await?;
-        let existing = File::filter_by_fullpath(fullpath)
+        let existing = File::filter(File::fields().catalog_uuid().eq(catalog_id))
             .first()
             .exec(&mut tx)
             .await?;
@@ -178,7 +181,7 @@ impl<B: Executor> FileSystem for B {
             return Err(Error::CatalogNotFound(catalog_id));
         }
         let id = if let Some(record) = existing {
-            data.fullpath = None;
+            data.catalog_id = None;
             update_file_fields(&mut tx, record.uuid, data).await?;
             record.uuid
         } else {
@@ -186,20 +189,19 @@ impl<B: Executor> FileSystem for B {
             let catalog_id = data.catalog_id.ok_or(Error::MissingField("catalog_id"))?;
             let now = Timestamp::now();
             let uuid = Uuid::new_v4();
-            let temporary = uuid.to_string();
+            let node_run_id = data.node_run_id.ok_or(Error::MissingField("node_run_id"))?;
             File::create()
                 .uuid(uuid)
-                .fullpath(insert_varchar(fullpath, 512, &temporary))
+                .node_run_id(node_run_id)
                 .filename(insert_varchar(&filename, 255, "file"))
                 .catalog_uuid(catalog_id)
                 .created_at(now)
                 .updated_at(now)
                 .exec(&mut tx)
                 .await?;
-            if fullpath.len() > 512 || filename.len() > 255 {
+            if filename.len() > 255 {
                 File::filter_by_uuid(uuid)
                     .update()
-                    .fullpath(fullpath)
                     .filename(filename)
                     .exec(&mut tx)
                     .await?;
@@ -219,9 +221,6 @@ impl<B: Executor> FileSystem for B {
         Self: 'a,
     {
         let data = data.into();
-        if let Some(fullpath) = &data.fullpath {
-            validate_field("fullpath", fullpath, 512)?;
-        }
         if let Some(filename) = &data.filename {
             validate_field("filename", filename, 255)?;
         }
@@ -246,21 +245,41 @@ impl<B: Executor> FileSystem for B {
 
     async fn get_file<'a>(
         &'a mut self,
-        key: FileKey<'_, Uuid>,
-    ) -> Result<Option<FileWithCatalog<File, Catalog>>, Error>
+        id: Uuid,
+    ) -> Result<Option<FileWithCatalog<File, Option<Catalog>>>, Error>
     where
         Self: 'a,
     {
         let mut tx = self.transaction().await?;
-        let query = match key {
-            FileKey::Id(id) => File::filter(File::fields().uuid().eq(id)),
-            FileKey::Fullpath(name) => File::filter(File::fields().fullpath().eq(name)),
+        let result = match File::filter_by_uuid(id).first().exec(&mut tx).await? {
+            Some(file) => Some(FileWithCatalog {
+                catalog: tx.get_catalog(file.catalog_uuid).await?,
+                file,
+            }),
+            None => None,
         };
-        let result = match query.first().exec(&mut tx).await? {
-            Some(file) => tx
-                .get_catalog(file.catalog_uuid)
-                .await?
-                .map(|catalog| FileWithCatalog { file, catalog }),
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    async fn get_file_by_node_run_filename<'a>(
+        &'a mut self,
+        node_run_id: Uuid,
+        filename: &str,
+    ) -> Result<Option<FileWithCatalog<File, Option<Catalog>>>, Error>
+    where
+        Self: 'a,
+    {
+        let mut tx = self.transaction().await?;
+        let result = match File::filter_by_node_run_id_and_filename(node_run_id, filename)
+            .first()
+            .exec(&mut tx)
+            .await?
+        {
+            Some(file) => Some(FileWithCatalog {
+                catalog: tx.get_catalog(file.catalog_uuid).await?,
+                file,
+            }),
             None => None,
         };
         tx.commit().await?;
@@ -321,8 +340,8 @@ async fn update_file_fields(
     let mut update = File::filter_by_uuid(id)
         .update()
         .updated_at(Timestamp::now());
-    if let Some(fullpath) = data.fullpath {
-        update = update.fullpath(fullpath);
+    if let Some(node_run_id) = data.node_run_id {
+        update = update.node_run_id(node_run_id);
     }
     if let Some(filename) = data.filename {
         update = update.filename(filename);

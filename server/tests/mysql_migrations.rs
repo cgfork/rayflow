@@ -1,10 +1,7 @@
 //! Migration integration tests use temporary databases, including legacy DDL
 //! that the current Toasty models cannot express.
 
-use catalog::{
-    CatalogInput, CatalogSystem, FileInput, FileKey, FileSystem,
-    model::{Catalog, File},
-};
+use catalog::{CatalogInput, CatalogSystem, FileInput, FileSystem, model::Catalog};
 use event::{Emit, task::Task};
 use jiff::Timestamp;
 use runtime::command::{NodeRun, Run};
@@ -97,47 +94,36 @@ async fn catalog_key_and_file_fullpath_migrations_preserve_metadata_and_referenc
         .bind(catalog_id).exec(&mut db).await.unwrap();
     sql::statement("INSERT INTO file (uuid, fullname, filename, catalog_uuid, created_at, updated_at) VALUES (?, '/existing', 'existing', ?, '2025-01-01', '2025-03-01')")
         .bind(file_id).bind(catalog_id).exec(&mut db).await.unwrap();
-    assert_eq!(initialize(&url).await.unwrap().applied(), 2);
-    let loaded = db
-        .get_file(FileKey::Fullpath("/existing"))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(loaded.file.uuid, file_id);
-    assert_eq!(loaded.catalog.uuid, catalog_id);
-    assert_eq!(loaded.catalog.key, "s3://bucket/existing");
-    assert_eq!(loaded.catalog.url, "s3://bucket/existing");
-    assert_eq!(loaded.catalog.size, 42);
-    assert!(loaded.catalog.uploaded);
     assert_eq!(
-        loaded.catalog.created_at,
-        "2025-01-01T00:00:00Z".parse::<Timestamp>().unwrap()
-    );
-    assert_eq!(
-        loaded.catalog.updated_at,
-        "2025-03-01T00:00:00Z".parse::<Timestamp>().unwrap()
-    );
-    assert_eq!(loaded.file.created_at, loaded.catalog.created_at);
-    assert_eq!(loaded.file.updated_at, loaded.catalog.updated_at);
-    let mut data = loaded.catalog.clone();
-    data.url = "oss://new-bucket/existing".into();
-    assert_eq!(db.upsert_catalog(&data).await.unwrap(), catalog_id);
-    assert_eq!(
-        db.get_file(FileKey::Id(file_id))
+        MigrationSet::new(&migrations.migrations()[..18])
+            .apply(&db)
             .await
             .unwrap()
-            .unwrap()
-            .catalog
-            .url,
-        data.url
+            .applied(),
+        2
     );
+    let preserved = sql::query("SELECT f.uuid, f.fullpath, f.catalog_uuid, c.`key`, c.size, c.uploaded FROM file f JOIN catalog c ON c.uuid=f.catalog_uuid WHERE f.uuid=?").bind(file_id).exec(&mut db).await.unwrap();
+    let row = preserved[0].as_record_unwrap();
+    assert_eq!(row[0], file_id.to_string());
+    assert_eq!(row[1], "/existing");
+    assert_eq!(row[2], catalog_id.to_string());
+    assert_eq!(row[3], "s3://bucket/existing");
+    assert_eq!(row[4], 42_u64);
+    assert_eq!(row[5], 1_i64);
     assert!(sql::statement("INSERT INTO catalog (uuid, `key`, url, size, format) VALUES (?, 's3://bucket/existing', 's3://bucket/other', 0, 'bin')")
         .bind(Uuid::new_v4()).exec(&mut db).await.is_err());
     assert!(sql::statement("INSERT INTO file (uuid, fullpath, filename, catalog_uuid) VALUES (?, '/existing', 'other', ?)")
         .bind(Uuid::new_v4()).bind(catalog_id).exec(&mut db).await.is_err());
     assert!(sql::query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'file' AND COLUMN_NAME = 'fullname'")
         .exec(&mut db).await.unwrap().is_empty());
-    assert_eq!(initialize(&url).await.unwrap().applied(), 0);
+    assert_eq!(
+        MigrationSet::new(&migrations.migrations()[..18])
+            .apply(&db)
+            .await
+            .unwrap()
+            .applied(),
+        0
+    );
     cleanup(&url, &mut db).await;
 }
 
@@ -291,24 +277,22 @@ async fn catalog_and_file_migrations_remove_deletion_fields_and_preserve_records
     let original = sql::query("SELECT f.uuid, f.fullname, f.catalog_uuid, f.created_at, f.updated_at, c.uuid, c.url, c.size, c.format, c.uploaded, c.created_at, c.updated_at FROM file f JOIN catalog c ON c.uuid = f.catalog_uuid WHERE f.uuid = ?")
         .bind(file).exec(&mut db).await.unwrap();
     assert_eq!(
-        initialize(&url).await.unwrap().applied(),
-        MIGRATIONS.migrations().len() - 11
+        MigrationSet::new(&migrations.migrations()[..18])
+            .apply(&db)
+            .await
+            .unwrap()
+            .applied(),
+        18 - 11
     );
-    let stored = db.get_file(FileKey::Id(file)).await.unwrap().unwrap();
+    let stored = db.get_catalog(catalog).await.unwrap().unwrap();
     let preserved = sql::query("SELECT f.uuid, f.fullpath, f.catalog_uuid, f.created_at, f.updated_at, c.uuid, c.url, c.size, c.format, c.uploaded, c.created_at, c.updated_at FROM file f JOIN catalog c ON c.uuid = f.catalog_uuid WHERE f.uuid = ?")
         .bind(file).exec(&mut db).await.unwrap();
     assert_eq!(preserved, original);
-    assert!(stored.catalog.uploaded);
+    assert!(stored.uploaded);
     assert!(sql::query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('catalog', 'file') AND COLUMN_NAME = 'deleted_at'")
         .exec(&mut db).await.unwrap().is_empty());
     assert!(
-        serde_json::to_value(&stored.catalog)
-            .unwrap()
-            .get("deleted_at")
-            .is_none()
-    );
-    assert!(
-        serde_json::to_value(&stored.file)
+        serde_json::to_value(&stored)
             .unwrap()
             .get("deleted_at")
             .is_none()
@@ -324,7 +308,14 @@ async fn catalog_and_file_migrations_remove_deletion_fields_and_preserve_records
     );
     assert!(sql::statement("INSERT INTO file (uuid, fullpath, filename, catalog_uuid) VALUES (?, '/kept', 'other', ?)")
         .bind(Uuid::new_v4()).bind(catalog).exec(&mut db).await.is_err());
-    assert_eq!(initialize(&url).await.unwrap().applied(), 0);
+    assert_eq!(
+        MigrationSet::new(&migrations.migrations()[..18])
+            .apply(&db)
+            .await
+            .unwrap()
+            .applied(),
+        0
+    );
     cleanup(&url, &mut db).await;
 }
 
@@ -349,7 +340,12 @@ async fn removal_of_deleted_at_rejects_historical_conflicts_and_can_be_retried()
         sql::statement("INSERT INTO file (uuid, fullname, filename, catalog_uuid, deleted_at) VALUES (?, '/conflict', 'conflict', ?, ?)")
             .bind(uuid).bind(catalog).bind(deleted_at).exec(&mut db).await.unwrap();
     }
-    assert!(initialize(&url).await.is_err());
+    assert!(
+        MigrationSet::new(&migrations.migrations()[..18])
+            .apply(&db)
+            .await
+            .is_err()
+    );
     assert_eq!(
         sql::query("SELECT uuid FROM catalog")
             .exec(&mut db)
@@ -372,7 +368,12 @@ async fn removal_of_deleted_at_rejects_historical_conflicts_and_can_be_retried()
         .await
         .unwrap();
     // Catalog migration commits; the independent file migration still fails.
-    assert!(initialize(&url).await.is_err());
+    assert!(
+        MigrationSet::new(&migrations.migrations()[..18])
+            .apply(&db)
+            .await
+            .is_err()
+    );
     assert!(sql::query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'catalog' AND COLUMN_NAME = 'deleted_at'")
         .exec(&mut db).await.unwrap().is_empty());
     sql::statement("UPDATE file SET fullname = '/archived' WHERE uuid = ?")
@@ -381,20 +382,28 @@ async fn removal_of_deleted_at_rejects_historical_conflicts_and_can_be_retried()
         .await
         .unwrap();
     assert_eq!(
-        initialize(&url).await.unwrap().applied(),
-        MIGRATIONS.migrations().len() - 12
-    );
-    assert_eq!(Catalog::all().exec(&mut db).await.unwrap().len(), 2);
-    assert_eq!(File::all().exec(&mut db).await.unwrap().len(), 2);
-    assert_eq!(
-        db.get_file(FileKey::Id(old_file))
+        MigrationSet::new(&migrations.migrations()[..18])
+            .apply(&db)
             .await
             .unwrap()
-            .unwrap()
-            .catalog
-            .uuid,
-        catalog
+            .applied(),
+        18 - 12
     );
+    assert_eq!(Catalog::all().exec(&mut db).await.unwrap().len(), 2);
+    assert_eq!(
+        sql::query("SELECT uuid FROM file")
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let row = sql::query("SELECT catalog_uuid FROM file WHERE uuid=?")
+        .bind(old_file)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(row[0].as_record_unwrap()[0], catalog.to_string());
     cleanup(&url, &mut db).await;
 }
 
@@ -641,27 +650,35 @@ async fn catalog_uploaded_migration_defaults_to_unacknowledged_and_preserves_met
     let file_uuid = Uuid::new_v4();
     sql::statement("INSERT INTO file (uuid, fullname, filename, catalog_uuid) VALUES (?, '/existing', 'existing', ?)")
         .bind(file_uuid).bind(uuid).exec(&mut db).await.unwrap();
-    let report = initialize(&url).await.unwrap();
-    assert_eq!(report.applied(), MIGRATIONS.migrations().len() - 9);
+    let report = MigrationSet::new(&migrations.migrations()[..18])
+        .apply(&db)
+        .await
+        .unwrap();
+    assert_eq!(report.applied(), 18 - 9);
     let existing = db.get_catalog(uuid).await.unwrap().unwrap();
     assert!(!existing.uploaded);
     assert_eq!(existing.url, "s3://bucket/existing");
     assert_eq!(existing.size, 42);
-    assert_eq!(
-        db.get_file(FileKey::Id(file_uuid))
-            .await
-            .unwrap()
-            .unwrap()
-            .catalog,
-        existing
-    );
+    let row = sql::query("SELECT catalog_uuid FROM file WHERE uuid=?")
+        .bind(file_uuid)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(row[0].as_record_unwrap()[0], existing.uuid.to_string());
     Catalog::filter_by_uuid(uuid)
         .update()
         .uploaded(true)
         .exec(&mut db)
         .await
         .unwrap();
-    assert_eq!(initialize(&url).await.unwrap().applied(), 0);
+    assert_eq!(
+        MigrationSet::new(&migrations.migrations()[..18])
+            .apply(&db)
+            .await
+            .unwrap()
+            .applied(),
+        0
+    );
     assert!(db.get_catalog(uuid).await.unwrap().unwrap().uploaded);
     let created = db
         .upsert_catalog(&CatalogInput::new("/new", "s3://bucket/new", 0, "bin"))
@@ -739,6 +756,7 @@ async fn run_config_migration_preserves_annotations_and_job_references() {
     let now = Timestamp::now();
     let node_id = Uuid::new_v4();
     let node_run = NodeRun::create()
+        .uuid(Uuid::new_v4())
         .run_id(run.uuid)
         .data_id(run.data_id)
         .graph_id(run.graph_id)
@@ -839,8 +857,8 @@ async fn node_run_ineffective_migration_preserves_history_and_defaults_to_zero()
         .unwrap();
     assert_eq!(preserved.ineffective, 0);
     assert_eq!(preserved.status, "Succeeded");
-    sql::statement("INSERT INTO node_run (run_id, data_id, graph_id, node_id, revision) VALUES (?, ?, ?, ?, 1)")
-        .bind(run.uuid).bind(run.data_id).bind(run.graph_id).bind(node)
+    sql::statement("INSERT INTO node_run (uuid, run_id, data_id, graph_id, node_id, revision) VALUES (?, ?, ?, ?, ?, 1)")
+        .bind(Uuid::new_v4()).bind(run.uuid).bind(run.data_id).bind(run.graph_id).bind(node)
         .exec(&mut db).await.unwrap();
     let current = NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, 1)
         .get(&mut db)
@@ -878,10 +896,10 @@ async fn initialization_creates_the_database_and_tracks_migrations() {
         .await
         .unwrap();
     let file_id = db
-        .upsert_file(&FileInput::new("/data/key", "key", catalog_id))
+        .upsert_file(&FileInput::new(Uuid::new_v4(), "key", catalog_id))
         .await
         .unwrap();
-    let loaded = db.get_file(FileKey::Id(file_id)).await.unwrap().unwrap();
+    let loaded = db.get_file(file_id).await.unwrap().unwrap();
     assert_eq!(loaded.file.uuid, file_id);
     assert_eq!(loaded.catalog.uuid, catalog_id);
     let now = Timestamp::now();
@@ -1035,6 +1053,145 @@ async fn duplicate_runs_fail_migration_without_deleting_rows_and_can_be_retried(
             .exec(&mut db)
             .await
             .is_err()
+    );
+    cleanup(&url, &mut db).await;
+}
+
+#[tokio::test]
+async fn node_run_uuid_and_file_owner_migrations_preserve_rows_and_encoded_paths() {
+    let Some(url) = database_url() else { return };
+    let mut db = legacy_database(&url).await;
+    let migrations: &'static MigrationSet = &MIGRATIONS;
+    MigrationSet::new(&migrations.migrations()[..18])
+        .apply(&db)
+        .await
+        .unwrap();
+    let graph_id = Uuid::new_v4();
+    let node = Uuid::new_v4();
+    let run = create_run(&mut db, Uuid::new_v4(), graph_id, 3).await;
+    let name = "make/数据 %";
+    let graph = serde_json::json!({"nodes":[{"id":node,"name":name}]});
+    sql::statement("INSERT INTO graph (uuid, name, version, graph) VALUES (?, 'flow', 3, ?)")
+        .bind(graph_id)
+        .bind(graph.to_string())
+        .exec(&mut db)
+        .await
+        .unwrap();
+    sql::statement("INSERT INTO node_run (run_id,data_id,graph_id,version,node_id,revision,status) VALUES (?,?,?,3,?,2,'Succeeded')")
+        .bind(run.uuid).bind(run.data_id).bind(graph_id).bind(node).exec(&mut db).await.unwrap();
+    let old_row = sql::query("SELECT id,created_at,updated_at FROM node_run WHERE run_id=?")
+        .bind(run.uuid)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    const ENCODING: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    let encoded = percent_encoding::utf8_percent_encode(name, ENCODING).to_string();
+    let key = format!("/prefix/{}/flow/3/{encoded}/2/value.bin", run.uuid);
+    let catalog = Uuid::new_v4();
+    let file = Uuid::new_v4();
+    sql::statement(
+        "INSERT INTO catalog (uuid,`key`,url,size,format,uploaded) VALUES (?,?,?,12,'bin',TRUE)",
+    )
+    .bind(catalog)
+    .bind(key.clone())
+    .bind(format!("s3://bucket{key}"))
+    .exec(&mut db)
+    .await
+    .unwrap();
+    sql::statement("INSERT INTO file (uuid,fullpath,filename,catalog_uuid,created_at,updated_at) VALUES (?,?,'value.bin',?,'2025-01-01','2025-03-01')")
+        .bind(file).bind(key.clone()).bind(catalog).exec(&mut db).await.unwrap();
+    assert_eq!(initialize(&url).await.unwrap().applied(), 3);
+    let node_run = NodeRun::filter_by_run_id_and_node_id_and_revision(run.uuid, node, 2)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert!(!node_run.uuid.is_nil());
+    let after = sql::query("SELECT id,created_at,updated_at FROM node_run WHERE run_id=?")
+        .bind(run.uuid)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(old_row, after);
+    let loaded = db.get_file(file).await.unwrap().unwrap();
+    assert_eq!(loaded.file.node_run_id, node_run.uuid);
+    assert_eq!(loaded.file.catalog_uuid, catalog);
+    assert_eq!(loaded.catalog.key, key);
+    assert_eq!(
+        loaded.file.created_at,
+        "2025-01-01T00:00:00Z".parse::<Timestamp>().unwrap()
+    );
+    assert_eq!(
+        loaded.file.updated_at,
+        "2025-03-01T00:00:00Z".parse::<Timestamp>().unwrap()
+    );
+    assert!(
+        serde_json::to_value(loaded.file)
+            .unwrap()
+            .get("fullpath")
+            .is_none()
+    );
+    assert_eq!(initialize(&url).await.unwrap().applied(), 0);
+    assert_eq!(
+        NodeRun::filter_by_id(node_run.id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .uuid,
+        node_run.uuid
+    );
+    cleanup(&url, &mut db).await;
+}
+
+#[tokio::test]
+async fn unresolved_file_ownership_blocks_path_removal_and_can_be_mapped_before_retry() {
+    let Some(url) = database_url() else { return };
+    let mut db = legacy_database(&url).await;
+    let migrations: &'static MigrationSet = &MIGRATIONS;
+    MigrationSet::new(&migrations.migrations()[..18])
+        .apply(&db)
+        .await
+        .unwrap();
+    let catalog = Uuid::new_v4();
+    let file = Uuid::new_v4();
+    sql::statement("INSERT INTO catalog (uuid,`key`,url,size,format) VALUES (?,'/standalone','s3://bucket/standalone',0,'bin')").bind(catalog).exec(&mut db).await.unwrap();
+    sql::statement("INSERT INTO file (uuid,fullpath,filename,catalog_uuid) VALUES (?,'/standalone','standalone',?)").bind(file).bind(catalog).exec(&mut db).await.unwrap();
+    assert!(initialize(&url).await.is_err());
+    let rows = sql::query("SELECT fullpath,node_run_id FROM file WHERE uuid=?")
+        .bind(file)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].as_record_unwrap()[0], "/standalone");
+    let run = create_run(&mut db, Uuid::new_v4(), Uuid::new_v4(), 1).await;
+    let now = Timestamp::now();
+    let owner = NodeRun::create()
+        .uuid(Uuid::new_v4())
+        .run_id(run.uuid)
+        .data_id(run.data_id)
+        .graph_id(run.graph_id)
+        .version(1)
+        .node_id(Uuid::new_v4())
+        .revision(0)
+        .status("Succeeded")
+        .created_at(now)
+        .updated_at(now)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    sql::statement("UPDATE file SET node_run_id=? WHERE uuid=?")
+        .bind(owner.uuid)
+        .bind(file)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(initialize(&url).await.unwrap().applied(), 1);
+    assert_eq!(
+        db.get_file(file).await.unwrap().unwrap().file.node_run_id,
+        owner.uuid
     );
     cleanup(&url, &mut db).await;
 }

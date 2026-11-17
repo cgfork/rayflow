@@ -209,6 +209,7 @@ async fn graph_state_and_run_detail_return_only_latest_effective_node_runs() {
         (second, 2, "Ready", 1),
     ] {
         NodeRun::create()
+            .uuid(Uuid::new_v4())
             .run_id(run.uuid)
             .data_id(run.data_id)
             .graph_id(run.graph_id)
@@ -290,6 +291,7 @@ async fn run_detail_reads_the_selected_version_and_latest_node_revision() {
     }
     for (revision, status) in [(1, "Succeeded"), (2, "Pending"), (3, "Failed")] {
         NodeRun::create()
+            .uuid(Uuid::new_v4())
             .run_id(runs[0].uuid)
             .data_id(runs[0].data_id)
             .graph_id(definition.id)
@@ -454,6 +456,7 @@ async fn poll_commits_or_rolls_back_agent_observations_with_job_delivery() {
     for lease in [Some(30_000), None] {
         let node_id = Uuid::new_v4();
         let node = NodeRun::create()
+            .uuid(Uuid::new_v4())
             .run_id(run.uuid)
             .data_id(run.data_id)
             .graph_id(run.graph_id)
@@ -547,14 +550,33 @@ async fn poll_commits_or_rolls_back_agent_observations_with_job_delivery() {
     assert_eq!(agent.resource().cpu_cores, 2);
 }
 
+#[derive(Clone)]
+struct FixtureGraph(DAG);
+impl GraphStore<Uuid> for FixtureGraph {
+    type G = DAG;
+    type Err = std::convert::Infallible;
+    async fn load(&mut self, _: Uuid, _: Option<u64>) -> Result<DAG, Self::Err> {
+        Ok(self.0.clone())
+    }
+    async fn graphs(
+        &mut self,
+        page: graph::PageRequest,
+        graph_id: Option<Uuid>,
+    ) -> Result<graph::Page<DAG>, Self::Err> {
+        Ok(page.select(
+            std::iter::once((1, self.0.clone()))
+                .filter(|(_, graph)| graph_id.is_none_or(|id| graph.id == id)),
+        ))
+    }
+}
+
 #[tokio::test]
 async fn graph_list_uses_the_configured_store() {
     let Some((_app, db)) = setup().await else {
         return;
     };
-    let mut store = server::Graphs::new();
     let definition = graph("in-memory");
-    store.insert(definition.clone());
+    let store = FixtureGraph(definition.clone());
     let app = App::new(db, Config::default(), store);
     let response = server::router(app)
         .oneshot(

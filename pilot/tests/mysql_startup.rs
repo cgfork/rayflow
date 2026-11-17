@@ -11,9 +11,11 @@ use runtime::{
     command::{NodeRun, Run},
 };
 use scheduler::{Job, actuator::Status};
-use server::StaticGraphStore;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+#[allow(dead_code)]
+mod support;
 
 #[tokio::test]
 async fn startup_models_support_leadership_and_database_graph_execution() {
@@ -31,9 +33,8 @@ async fn startup_models_support_leadership_and_database_graph_execution() {
     db.reset_db().await.unwrap();
     db.push_schema().await.unwrap();
 
-    let template_id = Uuid::from_u128(0x00000001_0000_0000_0000_000000000000);
     let graph_id = Uuid::new_v4();
-    let mut graph = StaticGraphStore::new().graph(template_id).unwrap().clone();
+    let mut graph = support::graph_template();
     graph.id = graph_id;
     for node in &mut graph.nodes {
         node.node_type = "docker".into();
@@ -58,7 +59,7 @@ async fn startup_models_support_leadership_and_database_graph_execution() {
     let data_id = Uuid::new_v4();
     let response = server::router(app)
         .oneshot(
-            Request::post("/runs/start")
+            Request::post("/api/v1/runs/start")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({"data_id": data_id, "graph_id": graph_id}).to_string(),

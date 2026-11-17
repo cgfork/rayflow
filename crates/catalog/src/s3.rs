@@ -18,7 +18,7 @@ use jiff::Timestamp;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, percent_encode};
 
 use crate::{
-    Catalog, CatalogSystem, FileKey, FileSystem, FileWithCatalog, ObjectStorage, PresignOperation,
+    Catalog, CatalogSystem, FileSystem, FileWithCatalog, ObjectStorage, PresignOperation,
     PresignedUrl,
 };
 
@@ -246,8 +246,19 @@ impl<S: CatalogSystem> CatalogSystem for S3<S> {
             .await
             .map_err(Error::FileSystem)
     }
+    async fn get_catalog_by_key<'a>(
+        &'a mut self,
+        key: &str,
+    ) -> Result<Option<Self::CatalogData<'a>>, Self::Err>
+    where
+        Self: 'a,
+    {
+        self.filesystem
+            .get_catalog_by_key(key)
+            .await
+            .map_err(Error::FileSystem)
+    }
 }
-
 impl<S: FileSystem> FileSystem for S3<S> {
     type FileId<'a>
         = S::FileId<'a>
@@ -291,13 +302,27 @@ impl<S: FileSystem> FileSystem for S3<S> {
 
     async fn get_file<'a>(
         &'a mut self,
-        key: FileKey<'_, Self::FileId<'a>>,
-    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Self::CatalogData<'a>>>, Self::Err>
+        id: Self::FileId<'a>,
+    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Option<Self::CatalogData<'a>>>>, Self::Err>
     where
         Self: 'a,
     {
         self.filesystem
-            .get_file(key)
+            .get_file(id)
+            .await
+            .map_err(Error::FileSystem)
+    }
+
+    async fn get_file_by_node_run_filename<'a>(
+        &'a mut self,
+        node_run_id: uuid::Uuid,
+        filename: &str,
+    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Option<Self::CatalogData<'a>>>>, Self::Err>
+    where
+        Self: 'a,
+    {
+        self.filesystem
+            .get_file_by_node_run_filename(node_run_id, filename)
             .await
             .map_err(Error::FileSystem)
     }

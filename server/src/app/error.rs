@@ -20,7 +20,7 @@ pub enum AppError {
     #[error(transparent)]
     Storage(Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
-    StorageConfiguration(#[from] crate::storage::Error),
+    StorageConfiguration(#[from] crate::config::StorageConfigError),
     #[error(transparent)]
     ArtifactPath(#[from] ::catalog::path::PathError),
     #[error("{0}")]
@@ -70,7 +70,10 @@ pub enum AppError {
 
 impl From<event::Error> for AppError {
     fn from(error: event::Error) -> Self {
-        Self::Backend(error.into())
+        match error {
+            event::Error::TaskNotFound(id) => Self::TaskNotFound(id),
+            error => Self::Backend(error.into()),
+        }
     }
 }
 
@@ -208,9 +211,6 @@ fn graph_error(error: &(dyn std::error::Error + 'static)) -> (StatusCode, &'stat
     use StatusCode as Status;
     use graph::store::Error;
 
-    if error.is::<crate::graph::GraphNotFound>() {
-        return (Status::NOT_FOUND, "RAYFLOW_GRAPH_NOT_FOUND");
-    }
     match error.downcast_ref::<Error>() {
         Some(Error::GraphNotFound { .. }) => (Status::NOT_FOUND, "RAYFLOW_GRAPH_NOT_FOUND"),
         Some(Error::DraftNotFound(_)) => (Status::NOT_FOUND, "RAYFLOW_GRAPH_DRAFT_NOT_FOUND"),

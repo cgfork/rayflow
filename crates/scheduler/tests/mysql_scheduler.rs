@@ -300,6 +300,7 @@ async fn orphaned_tasks_do_not_block_a_new_run() {
     };
     let now = jiff::Timestamp::now();
     let orphan = NodeRun::create()
+        .uuid(Uuid::new_v4())
         .run_id(Uuid::new_v4())
         .data_id(Uuid::new_v4())
         .graph_id(Uuid::new_v4())

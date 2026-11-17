@@ -14,7 +14,6 @@ use event::task::Task;
 use event::task_event::TaskEventEntry;
 use pilot::{Pilot, Step};
 use runtime::backend::Backend;
-use server::StaticGraphStore;
 use toasty::Db;
 use uuid::Uuid;
 
@@ -113,12 +112,12 @@ async fn leader_fails_expired_jobs_after_the_configured_gap_and_updates_nodes() 
     );
 }
 
-async fn setup() -> Option<(Db, Backend<StaticGraphStore>)> {
+async fn setup() -> Option<(Db, Backend<Db>)> {
     let url = env::var("DATABASE_URL").ok()?;
     let mut builder = toasty::Db::builder();
-    builder.models(scheduler::models());
+    builder.models(pilot::models());
     let db = builder.connect(&url).await.unwrap();
-    let backend = Backend::new(db, StaticGraphStore::new());
+    let backend = Backend::new(db.clone(), db);
     let db = backend.db().clone();
     db.reset_db().await.expect("reset database");
     db.push_schema().await.expect("push schema");

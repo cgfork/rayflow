@@ -15,7 +15,6 @@ pub mod store;
 use std::{collections::BTreeMap, time::Duration};
 
 use jiff::Timestamp;
-use uuid::Uuid;
 
 pub use metadata::{
     Catalog, CatalogInput, CatalogOptionalData, File, FileInput, FileOptionalData, FileWithCatalog,
@@ -24,16 +23,7 @@ pub use metadata::{
 pub use model::models;
 pub use store::Error;
 
-/// Lookup a logical file by its identity or full path.
-#[derive(Clone, Copy, Debug)]
-pub enum FileKey<'a, I = Uuid> {
-    Id(I),
-    Fullpath(&'a str),
-}
-
 /// Object metadata with identities assigned by a store.
-/// Upserts match catalog keys, returning the canonical ID and preserving creation timestamps.
-/// Catalog writes persist the supplied upload acknowledgement without uploading bytes.
 #[allow(async_fn_in_trait)]
 pub trait CatalogSystem {
     type Err: std::error::Error;
@@ -46,17 +36,12 @@ pub trait CatalogSystem {
     type CatalogOptionalData<'a>: 'a
     where
         Self: 'a;
-
-    /// Apply supplied fields by key. New catalogs require URL, size, and format;
-    /// omitted uploaded defaults to false only when inserting.
     async fn upsert_catalog<'a, C: Into<Self::CatalogOptionalData<'a>>>(
         &'a mut self,
         data: C,
     ) -> Result<Self::CatalogId<'a>, Self::Err>
     where
         Self: 'a;
-
-    /// Update supplied fields by identity; a missing identity is an error.
     async fn update_catalog<'a, C: Into<Self::CatalogOptionalData<'a>>>(
         &'a mut self,
         id: Self::CatalogId<'a>,
@@ -64,17 +49,21 @@ pub trait CatalogSystem {
     ) -> Result<(), Self::Err>
     where
         Self: 'a;
-
     async fn get_catalog<'a>(
         &'a mut self,
         id: Self::CatalogId<'a>,
     ) -> Result<Option<Self::CatalogData<'a>>, Self::Err>
     where
         Self: 'a;
+    async fn get_catalog_by_key<'a>(
+        &'a mut self,
+        key: &str,
+    ) -> Result<Option<Self::CatalogData<'a>>, Self::Err>
+    where
+        Self: 'a;
 }
 
 /// Logical files referencing catalogs managed by [`CatalogSystem`].
-/// Upserts match full paths, returning the canonical ID and preserving creation timestamps.
 #[allow(async_fn_in_trait)]
 pub trait FileSystem: CatalogSystem {
     type FileId<'a>: Id + 'a
@@ -86,16 +75,12 @@ pub trait FileSystem: CatalogSystem {
     type FileOptionalData<'a>: 'a
     where
         Self: 'a;
-
-    /// Apply supplied fields by full path. New files require filename and catalog ID.
     async fn upsert_file<'a, F: Into<Self::FileOptionalData<'a>>>(
         &'a mut self,
         data: F,
     ) -> Result<Self::FileId<'a>, Self::Err>
     where
         Self: 'a;
-
-    /// Update supplied fields by identity; a missing identity is an error.
     async fn update_file<'a, F: Into<Self::FileOptionalData<'a>>>(
         &'a mut self,
         id: Self::FileId<'a>,
@@ -103,12 +88,17 @@ pub trait FileSystem: CatalogSystem {
     ) -> Result<(), Self::Err>
     where
         Self: 'a;
-
-    /// Returns None if either the file or its catalog is missing.
     async fn get_file<'a>(
         &'a mut self,
-        key: FileKey<'_, Self::FileId<'a>>,
-    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Self::CatalogData<'a>>>, Self::Err>
+        id: Self::FileId<'a>,
+    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Option<Self::CatalogData<'a>>>>, Self::Err>
+    where
+        Self: 'a;
+    async fn get_file_by_node_run_filename<'a>(
+        &'a mut self,
+        node_run_id: uuid::Uuid,
+        filename: &str,
+    ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Option<Self::CatalogData<'a>>>>, Self::Err>
     where
         Self: 'a;
 }

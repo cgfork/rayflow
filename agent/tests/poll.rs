@@ -441,7 +441,7 @@ fn job() -> Job {
         "graph_id": task.graph_id, "version": 1, "revision": 1,
         "created_at": now, "updated_at": now
     });
-    value["node_run"] = json!({
+    value["node_run"] = json!({"uuid": Uuid::new_v4(),
         "id": task.node_run_id, "run_id": job.run_id,
         "data_id": task.data_id, "graph_id": task.graph_id,
         "version": 1, "node_id": task.node_id, "revision": 1,

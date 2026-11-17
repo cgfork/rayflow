@@ -24,6 +24,8 @@
 //! * `POST /job/fail` — fail a job and emit `TaskEvent::Fail`.
 //! * `POST /job/terminate` — terminate a job and emit `TaskEvent::Terminate`.
 //! * `GET  /runs/graph_state` — read the current state of a run.
+//! * `POST /runs/{run_id}/files/download` — presign a declared run input/output for browsers.
+//! * `GET  /runs/{run_id}/files/content` — stream a declared file as an attachment.
 //!
 //! Application failures use the mapped HTTP status with a JSON
 //! [`crate::app::ErrorBody`] containing `error_code` (a stable business code)
@@ -32,10 +34,8 @@
 pub mod agent;
 pub mod catalog;
 pub mod graph;
-pub mod graph_draft;
 pub mod job;
 pub mod run;
-pub mod task_event;
 
 use ::graph::GraphStore;
 use ::graph::types::DAG;
@@ -44,14 +44,16 @@ use uuid::Uuid;
 
 use crate::app::App;
 
-pub use graph_draft::{PublishGraphDraftRequest, WriteGraphDraftRequest};
-pub use job::{JobActionRequest, PollJobsRequest, PollJobsResponse};
+pub use graph::{PublishGraphDraftRequest, WriteGraphDraftRequest};
+pub use job::{
+    EmitTaskEventRequest, EmitTaskEventResponse, JobActionRequest, PollJobsRequest,
+    PollJobsResponse,
+};
 pub use run::{
     DryrunRunRequest, DryrunRunResponse, GetGraphStateRequest, GetGraphStateResponse,
     RerunRunRequest, RerunRunResponse, ResumeRunRequest, ResumeRunResponse, StartRunRequest,
     StartRunResponse, UpgradeRunRequest, UpgradeRunResponse,
 };
-pub use task_event::{EmitTaskEventRequest, EmitTaskEventResponse};
 
 /// Builds the API router, backed by `App`.
 pub fn router<S>(state: App<S>) -> Router
@@ -68,9 +70,7 @@ where
     graph::routes::<S>()
         .merge(catalog::routes::<S>())
         .merge(agent::routes::<S>())
-        .merge(graph_draft::routes::<S>())
         .merge(run::routes::<S>())
-        .merge(task_event::routes::<S>())
         .merge(job::routes::<S>())
         .route_layer(axum::middleware::from_fn_with_state(
             auth.clone(),
