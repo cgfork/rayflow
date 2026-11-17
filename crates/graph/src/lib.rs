@@ -14,6 +14,7 @@ use std::{
     hash::Hash,
 };
 
+/// Stable identifier used to address a graph or one of its stored records.
 pub trait Id: Copy + Eq + Hash + Debug + Display {}
 
 pub struct Node<I, N> {

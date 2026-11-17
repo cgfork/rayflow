@@ -27,6 +27,7 @@ impl ResourceCapacity {
     }
 }
 
+/// Polls jobs from an agent-facing scheduling backend.
 #[allow(async_fn_in_trait)]
 pub trait JobPoll<B> {
     type Err: std::error::Error + Send + Sync + 'static;
@@ -38,6 +39,7 @@ pub trait JobPoll<B> {
     ) -> Result<impl Iterator<Item = Job>, Self::Err>;
 }
 
+/// Reports terminal job results back to the scheduling backend.
 #[allow(async_fn_in_trait)]
 pub trait Report<B> {
     type Err: std::error::Error + Send + Sync + 'static;
