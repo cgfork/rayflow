@@ -22,7 +22,7 @@ pub enum AppError {
     #[error(transparent)]
     StorageConfiguration(#[from] crate::storage::Error),
     #[error(transparent)]
-    ArtifactPath(#[from] ::catalog::artifact::PathError),
+    ArtifactPath(#[from] ::catalog::path::PathError),
     #[error("{0}")]
     InvalidRequest(String),
     #[error("run not found: {0}")]

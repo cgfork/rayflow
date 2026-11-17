@@ -315,7 +315,7 @@ async fn s3_preserves_identity_data_and_optional_data_gats() {
     );
     for operation in [PresignOperation::Upload, PresignOperation::Download] {
         let signed = store
-            .presign(id, operation, Duration::from_secs(60))
+            .presign(id, operation.clone(), Duration::from_secs(60))
             .await
             .unwrap();
         assert_eq!(signed.operation, operation);
@@ -367,7 +367,6 @@ async fn s3_preserves_identity_data_and_optional_data_gats() {
 fn object_storage_contract_signs_preloaded_records_and_multipart_operations() {
     use catalog::{
         ObjectStorage, PresignOperation,
-        artifact::MultipartAction,
         s3::{Config, Credentials},
     };
     use std::time::Duration;
@@ -391,17 +390,13 @@ fn object_storage_contract_signs_preloaded_records_and_multipart_operations() {
         .unwrap();
     assert!(signed.url.contains("/bucket/uncommitted?"));
     assert!(storage.supports_multipart());
+    let operation = PresignOperation::UploadPart {
+        upload_id: "id+/part".into(),
+        part_number: 2,
+    };
     let part = storage
-        .presign_multipart_catalog(
-            &record,
-            &MultipartAction::Part {
-                upload_id: "id+/part".into(),
-                part_number: 2,
-            },
-            Duration::from_secs(60),
-        )
-        .unwrap()
+        .presign_catalog(&record, operation.clone(), Duration::from_secs(60))
         .unwrap();
-    assert_eq!(part.operation, PresignOperation::UploadPart);
+    assert_eq!(part.operation, operation);
     assert!(part.url.contains("partNumber=2"));
 }

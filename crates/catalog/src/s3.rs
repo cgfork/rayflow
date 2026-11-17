@@ -158,41 +158,38 @@ impl<S> S3<S> {
     }
 }
 
-fn multipart_uri<E>(
+fn request_uri<E>(
     endpoint: &str,
     location: &str,
-    action: &crate::artifact::MultipartAction,
-) -> Result<(String, PresignOperation), Error<E>> {
-    use crate::artifact::MultipartAction;
-    if !action.is_valid() {
+    operation: &PresignOperation,
+) -> Result<String, Error<E>> {
+    if !operation.is_valid() {
         return Err(Error::InvalidMultipart);
     }
     let uri = object_uri(endpoint, location)?;
+    if !operation.is_multipart() {
+        return Ok(uri);
+    }
     let mut uri = url::Url::parse(&uri).map_err(|_| Error::InvalidObjectUrl)?;
-    let operation = match action {
-        MultipartAction::Create => {
+    match operation {
+        PresignOperation::CreateMultipart => {
             uri.query_pairs_mut().append_pair("uploads", "");
-            PresignOperation::CreateMultipart
         }
-        MultipartAction::Part {
+        PresignOperation::UploadPart {
             upload_id,
             part_number,
         } => {
             uri.query_pairs_mut()
                 .append_pair("partNumber", &part_number.to_string())
                 .append_pair("uploadId", upload_id);
-            PresignOperation::UploadPart
         }
-        MultipartAction::Complete { upload_id } | MultipartAction::Abort { upload_id } => {
+        PresignOperation::CompleteMultipart { upload_id }
+        | PresignOperation::AbortMultipart { upload_id } => {
             uri.query_pairs_mut().append_pair("uploadId", upload_id);
-            if matches!(action, MultipartAction::Complete { .. }) {
-                PresignOperation::CompleteMultipart
-            } else {
-                PresignOperation::AbortMultipart
-            }
         }
-    };
-    Ok((uri.into(), operation))
+        _ => unreachable!("ordinary operations return before multipart query construction"),
+    }
+    Ok(uri.into())
 }
 
 impl<S: CatalogSystem> CatalogSystem for S3<S> {
@@ -311,24 +308,6 @@ impl<S: FileSystem> ObjectStorage for S3<S> {
         true
     }
 
-    /// Authorize exactly one multipart operation on an already-resolved object.
-    fn presign_multipart_catalog(
-        &self,
-        catalog: &(impl Catalog + ?Sized),
-        action: &crate::artifact::MultipartAction,
-        expires_in: Duration,
-    ) -> Result<Option<PresignedUrl>, Self::Err> {
-        let (uri, operation) = multipart_uri(&self.config.endpoint, catalog.url(), action)?;
-        sign_request(
-            &self.config,
-            uri.as_str(),
-            operation,
-            expires_in,
-            SystemTime::now(),
-        )
-        .map(Some)
-    }
-
     /// Sign already-loaded object data without a second filesystem lookup.
     fn presign_catalog(
         &self,
@@ -336,7 +315,7 @@ impl<S: FileSystem> ObjectStorage for S3<S> {
         operation: PresignOperation,
         expires_in: Duration,
     ) -> Result<PresignedUrl, Self::Err> {
-        let uri = object_uri(&self.config.endpoint, catalog.url())?;
+        let uri = request_uri(&self.config.endpoint, catalog.url(), &operation)?;
         sign_request(&self.config, &uri, operation, expires_in, SystemTime::now())
     }
 
@@ -358,7 +337,7 @@ impl<S: FileSystem> ObjectStorage for S3<S> {
             .await
             .map_err(Error::FileSystem)?
             .ok_or(Error::CatalogNotFound(missing_id))?;
-        let uri = object_uri(&self.config.endpoint, catalog.url())?;
+        let uri = request_uri(&self.config.endpoint, catalog.url(), &operation)?;
         sign_request(&self.config, &uri, operation, expires_in, SystemTime::now())
     }
 }

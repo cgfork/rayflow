@@ -4,9 +4,10 @@
 //! the MySQL [`CatalogSystem`] and [`FileSystem`] implementations on a database
 //! or transaction.
 
-pub mod artifact;
+pub mod directory;
 pub mod metadata;
 pub mod model;
+pub mod path;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod store;
@@ -113,27 +114,46 @@ pub trait FileSystem: CatalogSystem {
 }
 
 /// HTTP operation authorized by an object storage signature.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PresignOperation {
-    /// Upload an object's bytes with HTTP PUT.
     Upload,
-    /// Download an object's bytes with HTTP GET.
     Download,
     CreateMultipart,
-    UploadPart,
-    CompleteMultipart,
-    AbortMultipart,
+    UploadPart { upload_id: String, part_number: u32 },
+    CompleteMultipart { upload_id: String },
+    AbortMultipart { upload_id: String },
 }
 
 impl PresignOperation {
-    pub const fn method(self) -> &'static str {
+    pub const fn method(&self) -> &'static str {
         match self {
-            Self::Upload | Self::UploadPart => "PUT",
+            Self::Upload | Self::UploadPart { .. } => "PUT",
             Self::Download => "GET",
-            Self::CreateMultipart | Self::CompleteMultipart => "POST",
-            Self::AbortMultipart => "DELETE",
+            Self::CreateMultipart | Self::CompleteMultipart { .. } => "POST",
+            Self::AbortMultipart { .. } => "DELETE",
         }
+    }
+
+    pub const fn is_multipart(&self) -> bool {
+        !matches!(self, Self::Upload | Self::Download)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        let id = match self {
+            Self::UploadPart {
+                upload_id,
+                part_number,
+            } => {
+                if !(1..=10_000).contains(part_number) {
+                    return false;
+                }
+                upload_id
+            }
+            Self::CompleteMultipart { upload_id } | Self::AbortMultipart { upload_id } => upload_id,
+            _ => return true,
+        };
+        !id.is_empty() && id.len() <= 2048 && !id.chars().any(char::is_control)
     }
 }
 
@@ -167,16 +187,6 @@ pub trait ObjectStorage: FileSystem {
 
     fn supports_multipart(&self) -> bool {
         false
-    }
-
-    /// Return None when the provider cannot authorize multipart operations.
-    fn presign_multipart_catalog(
-        &self,
-        _catalog: &(impl Catalog + ?Sized),
-        _action: &artifact::MultipartAction,
-        _expires_in: Duration,
-    ) -> Result<Option<PresignedUrl>, Self::Err> {
-        Ok(None)
     }
 
     async fn presign<'a>(

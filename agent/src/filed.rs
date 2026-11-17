@@ -4,16 +4,17 @@
 //! without fleet credentials. Upload state survives restarts and success is
 //! reported only after every output and directory manifest has been published.
 
-use catalog::{
-    PresignOperation,
-    artifact::{
-        CommitUploadRequest, DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DirectoryEntry,
-        DirectoryManifest, DownloadRequest, EntryKind, MAX_MANIFEST_BYTES, MultipartAction,
-        MultipartRequest, PrepareUploadRequest, Scope, Transfer, validate_relative_path,
-    },
+use crate::{client::Transfer, transfer::UploadContext};
+use catalog::PresignOperation;
+use catalog::directory::{
+    DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DirectoryEntry, DirectoryManifest, EntryKind,
+    MAX_MANIFEST_BYTES,
 };
+use catalog::path::validate_relative_path;
 use graph::types::{DAG, Kind, Node, Output};
 use scheduler::Job;
+mod scope;
+use scope::Scope;
 use std::{
     io,
     path::{Path, PathBuf},
@@ -103,12 +104,11 @@ impl Filed {
                 }
                 continue;
             };
-            let request = DownloadRequest {
-                job_id,
-                agent_id: self.agent_id,
-                key,
-            };
-            let Some(transfer) = self.client.download_input(&request).await? else {
+            let Some(transfer) = self
+                .client
+                .download_input(job_id, self.agent_id, &key)
+                .await?
+            else {
                 if input.required {
                     return Err(artifact(format!(
                         "required input is unavailable: {}",
@@ -129,19 +129,15 @@ impl Filed {
                     match entry.kind {
                         EntryKind::Directory => fs::create_dir_all(&path).await?,
                         EntryKind::File => {
-                            let member_request = DownloadRequest {
-                                key: format!(
-                                    "{}{path}",
-                                    request.key.strip_suffix(DIRECTORY_MANIFEST).ok_or_else(
-                                        || artifact("directory manifest key is invalid")
-                                    )?,
-                                    path = entry.path
-                                ),
-                                ..request.clone()
-                            };
+                            let member_key = format!(
+                                "{}{path}",
+                                key.strip_suffix(DIRECTORY_MANIFEST)
+                                    .ok_or_else(|| artifact("directory manifest key is invalid"))?,
+                                path = entry.path
+                            );
                             let member = self
                                 .client
-                                .download_input(&member_request)
+                                .download_input(job_id, self.agent_id, &member_key)
                                 .await?
                                 .ok_or_else(|| {
                                     artifact(format!(
@@ -254,24 +250,19 @@ impl Filed {
         if !metadata.is_file() {
             return Err(artifact("output is not a regular file"));
         }
-        let request = PrepareUploadRequest {
-            job_id,
-            agent_id: self.agent_id,
-            key: key.to_owned(),
-            size: metadata.len(),
-            format: format.to_owned(),
-        };
-        let transfer = self.client.prepare_upload(&request).await?;
+        let transfer = self
+            .client
+            .prepare_upload(job_id, self.agent_id, key, metadata.len(), format)
+            .await?;
         if transfer.presigned.operation != PresignOperation::Upload {
             return Err(artifact("server returned the wrong upload operation"));
         }
         if self.s3.supports(&transfer) {
-            let multipart = MultipartRequest {
+            let multipart = UploadContext {
                 job_id,
                 agent_id: self.agent_id,
                 key: key.to_owned(),
-                catalog_uuid: transfer.catalog.uuid,
-                action: MultipartAction::Create,
+                catalog_id: transfer.catalog.uuid,
             };
             let checkpoint = file_fs
                 .state_dir(job_id)
@@ -297,14 +288,14 @@ impl Filed {
                 .map_err(reqwest::Error::without_url)?;
         }
         self.client
-            .commit_upload(&CommitUploadRequest {
+            .commit_upload(
                 job_id,
-                agent_id: request.agent_id,
-                key: request.key,
-                catalog_uuid: transfer.catalog.uuid,
-                size: request.size,
-                format: request.format,
-            })
+                self.agent_id,
+                key,
+                transfer.catalog.uuid,
+                metadata.len(),
+                format,
+            )
             .await
     }
 

@@ -59,6 +59,7 @@ dependencies = [
  "futures-util",
  "graph",
  "jiff",
+ "percent-encoding",
  "quick-xml",
  "reqwest",
  "scheduler",

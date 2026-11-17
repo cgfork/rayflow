@@ -234,7 +234,15 @@ fn fleet_catalog_routes_are_limited_to_transfer_operations() {
     assert!(super::agent_route(&axum::http::Method::GET, &run_path));
     assert!(!super::agent_route(&axum::http::Method::POST, &run_path));
     assert!(!super::agent_route(&axum::http::Method::GET, "/runs"));
-    for action in ["prepare", "commit", "download", "multipart"] {
+    for action in [
+        "prepare",
+        "commit",
+        "download",
+        "multipart/create",
+        "multipart/upload",
+        "multipart/complete",
+        "multipart/abort",
+    ] {
         assert!(super::agent_route(
             &axum::http::Method::POST,
             &format!("/catalog/{action}")
@@ -249,6 +257,7 @@ fn fleet_catalog_routes_are_limited_to_transfer_operations() {
         "/files",
         "/catalog/complete",
         "/catalog/remove",
+        "/catalog/multipart",
         "/jobs/not-a-uuid/artifacts/prepare",
         "/jobs/00000000-0000-0000-0000-000000000000/artifacts/complete",
         "/jobs/00000000-0000-0000-0000-000000000000/artifacts/remove",

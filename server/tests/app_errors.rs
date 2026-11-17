@@ -44,7 +44,7 @@ async fn application_errors_return_json_messages_and_stable_business_codes() {
             "RAYFLOW_INVALID_STORAGE_CONFIGURATION",
         ),
         (
-            E::ArtifactPath(catalog::artifact::PathError),
+            E::ArtifactPath(catalog::path::PathError),
             S::BAD_REQUEST,
             "RAYFLOW_INVALID_ARTIFACT_PATH",
         ),

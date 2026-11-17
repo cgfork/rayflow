@@ -1,4 +1,9 @@
-use agent::{client::Client, errors::Error, filed::Filed, settings::Settings};
+use agent::{
+    client::{Client, Transfer},
+    errors::Error,
+    filed::Filed,
+    settings::Settings,
+};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -7,14 +12,8 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use catalog::{
-    PresignOperation, PresignedUrl,
-    artifact::{
-        CommitUploadRequest, DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DownloadRequest,
-        PrepareUploadRequest, Transfer,
-    },
-    model::Catalog,
-};
+use catalog::directory::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST};
+use catalog::{PresignOperation, PresignedUrl, model::Catalog};
 use event::task::Task;
 use graph::types::{DAG, Input, Kind, Node, Output};
 use jiff::Timestamp;
@@ -70,10 +69,14 @@ async fn prepare(
 ) -> Json<Transfer> {
     fleet(&headers);
     assert!(body.get("catalog_uuid").is_none());
-    let request: PrepareUploadRequest = serde_json::from_value(body).unwrap();
+    let request = body;
     let mut data = api.data.lock().unwrap();
-    assert!(!request.job_id.is_nil());
-    let key = request.key;
+    assert!(
+        !serde_json::from_value::<Uuid>(request["job_id"].clone())
+            .unwrap()
+            .is_nil()
+    );
+    let key = request["key"].as_str().unwrap().to_owned();
     let uuid = *data
         .identities
         .entry(key.clone())
@@ -82,8 +85,8 @@ async fn prepare(
         uuid,
         key.clone(),
         format!("s3://bucket/{uuid}"),
-        request.size,
-        request.format,
+        request["size"].as_u64().unwrap(),
+        request["format"].as_str().unwrap(),
     );
     data.prepared.push((key, uuid));
     data.catalogs.insert(catalog.uuid, catalog.clone());
@@ -92,30 +95,43 @@ async fn prepare(
 async fn commit(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(request): Json<CommitUploadRequest>,
+    Json(request): Json<serde_json::Value>,
 ) -> StatusCode {
     fleet(&headers);
     let mut data = api.data.lock().unwrap();
     assert_eq!(
-        data.objects[&request.catalog_uuid].len() as u64,
-        request.size
+        data.objects[&serde_json::from_value::<Uuid>(request["catalog_uuid"].clone()).unwrap()]
+            .len() as u64,
+        request["size"].as_u64().unwrap()
     );
-    assert!(!request.job_id.is_nil());
-    let key = request.key;
-    data.published.insert(key.clone(), request.catalog_uuid);
+    assert!(
+        !serde_json::from_value::<Uuid>(request["job_id"].clone())
+            .unwrap()
+            .is_nil()
+    );
+    let key = request["key"].as_str().unwrap().to_owned();
+    data.published.insert(
+        key.clone(),
+        serde_json::from_value(request["catalog_uuid"].clone()).unwrap(),
+    );
     data.commits.push(key);
     StatusCode::NO_CONTENT
 }
 async fn download(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(request): Json<DownloadRequest>,
+    Json(request): Json<serde_json::Value>,
 ) -> axum::response::Response {
     fleet(&headers);
-    assert!(!request.job_id.is_nil());
+    assert!(
+        !serde_json::from_value::<Uuid>(request["job_id"].clone())
+            .unwrap()
+            .is_nil()
+    );
     let mut data = api.data.lock().unwrap();
-    data.downloads.push(request.key.clone());
-    match data.published.get(&request.key) {
+    let key = request["key"].as_str().unwrap().to_owned();
+    data.downloads.push(key.clone());
+    match data.published.get(&key) {
         Some(id) => Json(transfer(
             &api,
             data.catalogs[id].clone(),

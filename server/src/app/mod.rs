@@ -203,7 +203,7 @@ mod tests {
             "storage.bucket must be an S3 bucket name"
         );
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
-        let error = AppError::from(::catalog::artifact::PathError);
+        let error = AppError::from(::catalog::path::PathError);
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
     }
 

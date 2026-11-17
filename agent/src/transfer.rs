@@ -9,10 +9,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use catalog::{
-    PresignOperation, PresignedUrl,
-    artifact::{MultipartAction, MultipartRequest, Transfer},
-};
+use catalog::{PresignOperation, PresignedUrl};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use quick_xml::{Reader, events::Event};
 use reqwest::{Response, StatusCode, header};
@@ -23,7 +20,20 @@ use tokio::{
     time::sleep,
 };
 
-use crate::{client::Client, errors::Error, read_json, write_json};
+use crate::{
+    client::{Client, Transfer},
+    errors::Error,
+    read_json, write_json,
+};
+
+/// Agent-side identity of a prepared output, reused across provider operations.
+#[derive(Clone, Debug)]
+pub(crate) struct UploadContext {
+    pub job_id: uuid::Uuid,
+    pub agent_id: uuid::Uuid,
+    pub key: String,
+    pub catalog_id: uuid::Uuid,
+}
 
 const MIB: u64 = 1024 * 1024;
 const MAX_PART: u64 = 5 * 1024 * MIB;
@@ -113,15 +123,8 @@ impl S3TransferClient {
             && transfer.catalog.size >= self.config.multipart_threshold
     }
 
-    async fn request(
-        &self,
-        signed: &PresignedUrl,
-        operation: PresignOperation,
-    ) -> Result<reqwest::RequestBuilder, Error> {
-        if signed.operation != operation {
-            return Err(failed("unexpected signed storage operation"));
-        }
-        let method = reqwest::Method::from_bytes(operation.method().as_bytes()).unwrap();
+    async fn request(&self, signed: &PresignedUrl) -> Result<reqwest::RequestBuilder, Error> {
+        let method = reqwest::Method::from_bytes(signed.operation.method().as_bytes()).unwrap();
         let mut request = self.http.request(method, &signed.url);
         for (name, value) in &signed.headers {
             request = request.header(name, value);
@@ -153,33 +156,49 @@ impl S3TransferClient {
     async fn signed(
         &self,
         api: &Client,
-        request: &MultipartRequest,
-        action: MultipartAction,
+        request: &UploadContext,
+        operation: PresignOperation,
     ) -> Result<PresignedUrl, Error> {
-        api.multipart(&MultipartRequest {
-            action,
-            ..request.clone()
-        })
-        .await
+        let signed = match &operation {
+            PresignOperation::CreateMultipart => api.multipart_create(request).await?,
+            PresignOperation::UploadPart {
+                upload_id,
+                part_number,
+            } => {
+                api.multipart_upload(request, upload_id, *part_number)
+                    .await?
+            }
+            PresignOperation::CompleteMultipart { upload_id } => {
+                api.multipart_complete(request, upload_id).await?
+            }
+            PresignOperation::AbortMultipart { upload_id } => {
+                api.multipart_abort(request, upload_id).await?
+            }
+            _ => return Err(failed("expected a multipart operation")),
+        };
+        if signed.operation != operation {
+            return Err(failed("server returned a different multipart operation"));
+        }
+        Ok(signed)
     }
 
     async fn abort(
         &self,
         api: &Client,
-        request: &MultipartRequest,
+        request: &UploadContext,
         upload_id: &str,
     ) -> Result<(), Error> {
         let signed = self
             .signed(
                 api,
                 request,
-                MultipartAction::Abort {
+                PresignOperation::AbortMultipart {
                     upload_id: upload_id.into(),
                 },
             )
             .await?;
         let response = self
-            .request(&signed, PresignOperation::AbortMultipart)
+            .request(&signed)
             .await?
             .send()
             .await
@@ -194,10 +213,10 @@ impl S3TransferClient {
 
     /// Completed part ETags are checkpointed atomically. A process restart resumes
     /// the same upload only if the source file size, mtime, and part size still match.
-    pub async fn upload(
+    pub(crate) async fn upload(
         &self,
         api: &Client,
-        request: &MultipartRequest,
+        request: &UploadContext,
         transfer: &Transfer,
         path: &Path,
         checkpoint: &Path,
@@ -265,15 +284,17 @@ impl S3TransferClient {
     async fn create(
         &self,
         api: &Client,
-        request: &MultipartRequest,
+        request: &UploadContext,
         size: u64,
         modified: SystemTime,
         part_size: u64,
         checkpoint: &Path,
     ) -> Result<UploadState, Error> {
-        let signed = self.signed(api, request, MultipartAction::Create).await?;
+        let signed = self
+            .signed(api, request, PresignOperation::CreateMultipart)
+            .await?;
         let response = self
-            .request(&signed, PresignOperation::CreateMultipart)
+            .request(&signed)
             .await?
             .send()
             .await
@@ -301,7 +322,7 @@ impl S3TransferClient {
     async fn upload_parts(
         &self,
         api: &Client,
-        request: &MultipartRequest,
+        request: &UploadContext,
         path: &Path,
         state: &mut UploadState,
         checkpoint: &Path,
@@ -336,7 +357,7 @@ impl S3TransferClient {
                             .signed(
                                 api,
                                 request,
-                                MultipartAction::Part {
+                                PresignOperation::UploadPart {
                                     upload_id: upload_id.clone(),
                                     part_number: number,
                                 },
@@ -348,7 +369,7 @@ impl S3TransferClient {
                             file.take(length),
                         ));
                         let response = self
-                            .request(&signed, PresignOperation::UploadPart)
+                            .request(&signed)
                             .await?
                             .header(header::CONTENT_LENGTH, length)
                             .body(body)
@@ -402,13 +423,13 @@ impl S3TransferClient {
             .signed(
                 api,
                 request,
-                MultipartAction::Complete {
+                PresignOperation::CompleteMultipart {
                     upload_id: state.upload_id.clone(),
                 },
             )
             .await?;
         let response = self
-            .request(&signed, PresignOperation::CompleteMultipart)
+            .request(&signed)
             .await?
             .header(header::CONTENT_TYPE, "application/xml")
             .body(body)
@@ -470,7 +491,7 @@ impl S3TransferClient {
         identity: Option<&str>,
     ) -> Result<String, Error> {
         let mut request = self
-            .request(&transfer.presigned, PresignOperation::Download)
+            .request(&transfer.presigned)
             .await?
             .header(header::RANGE, format!("bytes={start}-{end}"));
         if let Some(identity) = identity {

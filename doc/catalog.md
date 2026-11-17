@@ -172,6 +172,12 @@ rows become readable. Duplicate URLs or full paths across historical rows must
 be resolved before upgrading; the migrations fail instead of merging identities
 or discarding records.
 
+The agent constructs job-specific keys with its private `Scope` helper. Directory
+manifest types live in `catalog::directory`, and claim-scoped HTTP request/response
+types live in `server::api::catalog`. The catalog crate contains metadata,
+provider signing contracts, and generic relative-path validation in
+`catalog::path`; it does not depend on job transfer payloads.
+
 ## Presigned uploads and downloads
 
 `ObjectStorage: FileSystem` adds:
@@ -187,12 +193,28 @@ async fn presign<'a>(
 
 `PresignOperation::Upload` authorizes HTTP PUT; `Download` authorizes HTTP GET.
 The result contains the URL, operation, required headers, and actual expiry.
-The same trait provides synchronous `presign_catalog` for already-loaded data,
-`supports_multipart`, and optional `presign_multipart_catalog`. Unsupported
-providers return false/None for multipart support. Loaded-record signing performs
-no persistence I/O, so upload preparation can sign uncommitted catalog data
-without moving lookups outside its transaction. Server handlers use only this
-contract; provider construction is confined to storage configuration.
+The same trait provides synchronous `presign_catalog` for already-loaded data
+and `supports_multipart`. Loaded-record signing performs no persistence I/O, so
+upload preparation can sign uncommitted catalog data without moving lookups
+outside its transaction. Server handlers use only this contract; provider
+construction is confined to storage configuration.
+
+`PresignOperation` carries all signing parameters. In addition to `Upload`,
+`Download`, and `CreateMultipart`, its variants include:
+
+```rust,ignore
+UploadPart { upload_id: String, part_number: u32 },
+CompleteMultipart { upload_id: String },
+AbortMultipart { upload_id: String },
+```
+
+The same signing methods handle whole objects and multipart operations. The
+server selects this enum from the multipart endpoint and its request fields;
+HTTP payload types are not part of `ObjectStorage`. Whole-object operation JSON remains
+`"upload"` or `"download"`; a signed part operation includes its parameters, for
+example `{"upload_part":{"upload_id":"...","part_number":1}}`. Agents verify
+that the signed response matches the requested upload ID and part number.
+
 Provider adapters implement this trait using their configured endpoints and
 credentials. Enable `s3` for the S3-compatible adapter below. OSS signing is not
 implemented. Adapters reject unsupported schemes (including `file://`), invalid
@@ -285,9 +307,9 @@ signing dependencies.
 
 ## HTTP API and agent transfers
 
-The catalog HTTP API has four POST endpoints under
-`/api/v1/catalog/prepare`, `/api/v1/catalog/commit`, `/api/v1/catalog/download`,
-and `/api/v1/catalog/multipart`. All request parameters
+The catalog HTTP API has seven POST endpoints: prepare, commit, and download
+under `/api/v1/catalog`, plus create, upload, complete, and abort under
+`/api/v1/catalog/multipart`. All request parameters
 are in JSON bodies; these URLs have no path parameters.
 
 Configure storage on the **server**, using an existing S3-compatible bucket and
@@ -347,7 +369,10 @@ and filename, with no leading slash:
 | `/api/v1/catalog/prepare` | `size`, `format` | `{catalog, presigned}` for PUT; uploaded is false |
 | `/api/v1/catalog/commit` | `catalog_uuid`, `size`, `format` | Published file; uploaded is true |
 | `/api/v1/catalog/download` | None | `{catalog, presigned}` for GET |
-| `/api/v1/catalog/multipart` | `catalog_uuid`, `action` | A signed S3 multipart request |
+| `/api/v1/catalog/multipart/create` | `catalog_uuid` | Signed initiation request |
+| `/api/v1/catalog/multipart/upload` | `catalog_uuid`, `upload_id`, `part_number` | Signed part upload request |
+| `/api/v1/catalog/multipart/complete` | `catalog_uuid`, `upload_id` | Signed completion request |
+| `/api/v1/catalog/multipart/abort` | `catalog_uuid`, `upload_id` | Signed abort request |
 
 The agent sends prepare, uploads the bytes using the returned URL and headers,
 then sends commit with the same key and metadata plus `catalog.uuid`. Prepare
@@ -375,7 +400,7 @@ before startup.
 Each catalog request requires an active, unexpired claim owned by `agent_id`.
 Keys must stay within that claim's run; path traversal and absolute keys are
 rejected. Agents are responsible for declared input/output bindings within the
-run. With authentication enabled, fleet credentials can call the four POST
+run. With authentication enabled, fleet credentials can call the seven POST
 routes and read graph definitions and individual run states. Browser writes
 also require `X-Rayflow-Request: 1`. Transfers return 503 when storage is absent,
 409 for a lost claim, and 404 for unavailable artifacts. Object requests use a
@@ -411,17 +436,32 @@ size when needed to stay within 10,000 parts. `storage.multipart_enabled: false`
 (or `RAYFLOW_STORAGE__MULTIPART_ENABLED=false`) disables the provider capability;
 `transfer.enabled: false` disables it for one agent.
 
-For uploads, the agent asks `POST /api/v1/catalog/multipart` for each signed
-operation. Its JSON includes `job_id`, `agent_id`, `key`, `catalog_uuid`, and an
-`action` object:
+For uploads, the agent uses four separate POST endpoints. Every body includes
+`job_id`, `agent_id`, `key`, and `catalog_uuid`:
+
+- `/api/v1/catalog/multipart/create` needs no additional fields.
+- `/api/v1/catalog/multipart/upload` adds `upload_id` and `part_number`.
+- `/api/v1/catalog/multipart/complete` adds `upload_id`.
+- `/api/v1/catalog/multipart/abort` adds `upload_id`.
+
+For example, a part authorization request has this flat JSON body:
 
 ```json
-{"operation":"part","upload_id":"provider-upload-id","part_number":1}
+{
+  "job_id": "<job UUID>",
+  "agent_id": "<agent UUID>",
+  "key": "<run-scoped file key>",
+  "catalog_uuid": "<UUID returned by prepare>",
+  "upload_id": "<ID returned by storage initiation>",
+  "part_number": 1
+}
 ```
 
-Other actions are `{"operation":"create"}`, `{"operation":"complete", "upload_id":"..."}`,
-and `{"operation":"abort", "upload_id":"..."}`. Each request rechecks the
-active claim, run-scoped key, prepared catalog identity, and signing lifetime.
+The endpoint selects the operation; there is no `action` field. The former
+`POST /api/v1/catalog/multipart` endpoint is removed. Each endpoint returns a
+signed provider request and rechecks the active claim, run-scoped key, prepared
+catalog identity, and signing lifetime. Provider completion is followed by the
+separate catalog commit that publishes the file atomically.
 Part bytes travel directly to storage. Completed ETags are persisted under the
 job's transfer checkpoint directory; after a process restart, an unchanged
 source resumes those parts. A changed size, modification time, or part size

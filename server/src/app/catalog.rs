@@ -1,12 +1,14 @@
+use crate::api::catalog::{
+    CommitUploadRequest, DownloadRequest, MultipartRequest, PrepareUploadRequest, Transfer,
+};
 use catalog::{
     CatalogInput, CatalogOptionalData, CatalogSystem, FileInput, FileKey, FileSystem,
     ObjectStorage, PresignOperation,
-    artifact::{
-        CommitUploadRequest, DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DownloadRequest,
-        MAX_MANIFEST_BYTES, MultipartRequest, PrepareUploadRequest, Transfer,
-        validate_relative_path,
-    },
     model::{Catalog, File},
+};
+use catalog::{
+    directory::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST, MAX_MANIFEST_BYTES},
+    path::validate_relative_path,
 };
 use jiff::Timestamp;
 use scheduler::{Job, actuator::Status};
@@ -20,8 +22,9 @@ impl<S> App<S> {
     pub async fn multipart_artifact(
         &self,
         request: MultipartRequest,
+        operation: PresignOperation,
     ) -> Result<catalog::PresignedUrl, AppError> {
-        if !request.action.is_valid() {
+        if !operation.is_multipart() || !operation.is_valid() {
             return Err(AppError::InvalidRequest(
                 "invalid multipart operation".into(),
             ));
@@ -60,15 +63,15 @@ impl<S> App<S> {
         let ttl = config
             .presign_ttl
             .min(std::time::Duration::from_secs(remaining as u64));
-        config
-            .object_storage(self.db.clone())?
-            .presign_multipart_catalog(&catalog, &request.action, ttl)
-            .map_err(|error| AppError::Storage(Box::new(error)))?
-            .ok_or_else(|| {
-                AppError::InvalidRequest(
-                    "storage provider does not support multipart uploads".into(),
-                )
-            })
+        let storage = config.object_storage(self.db.clone())?;
+        if !storage.supports_multipart() {
+            return Err(AppError::InvalidRequest(
+                "storage provider does not support multipart uploads".into(),
+            ));
+        }
+        storage
+            .presign_catalog(&catalog, operation, ttl)
+            .map_err(|error| AppError::Storage(Box::new(error)))
     }
 
     /// Creates upload metadata for the key supplied by the agent.

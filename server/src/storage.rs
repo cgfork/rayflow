@@ -2,7 +2,7 @@
 
 use catalog::{
     ObjectStorage,
-    artifact::{PathError, validate_relative_path},
+    path::{PathError, validate_relative_path},
     s3::{Config, Credentials},
 };
 use serde::Deserialize;

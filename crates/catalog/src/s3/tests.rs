@@ -17,78 +17,82 @@ fn config() -> Config {
 
 #[test]
 fn multipart_signatures_bind_the_upload_id_part_and_method() {
-    use crate::artifact::MultipartAction;
     let id = "upload+/=&? snow";
     let mut signatures = std::collections::BTreeSet::new();
-    for (action, method) in [
-        (MultipartAction::Create, "POST"),
+    for (operation, method) in [
+        (PresignOperation::CreateMultipart, "POST"),
         (
-            MultipartAction::Part {
+            PresignOperation::UploadPart {
                 upload_id: id.into(),
                 part_number: 1,
             },
             "PUT",
         ),
         (
-            MultipartAction::Part {
+            PresignOperation::UploadPart {
                 upload_id: id.into(),
                 part_number: 2,
             },
             "PUT",
         ),
         (
-            MultipartAction::Complete {
+            PresignOperation::CompleteMultipart {
                 upload_id: id.into(),
             },
             "POST",
         ),
         (
-            MultipartAction::Abort {
+            PresignOperation::AbortMultipart {
                 upload_id: id.into(),
             },
             "DELETE",
         ),
     ] {
         let config = config();
-        let (uri, operation) = multipart_uri::<Infallible>(
+        let uri = request_uri::<Infallible>(
             &config.endpoint,
             "s3://bucket/key%20with%20space",
-            &action,
+            &operation,
         )
         .unwrap();
         assert_eq!(operation.method(), method);
-        let signed =
-            sign_request::<Infallible>(&config, &uri, operation, Duration::from_secs(60), now())
-                .unwrap();
+        let signed = sign_request::<Infallible>(
+            &config,
+            &uri,
+            operation.clone(),
+            Duration::from_secs(60),
+            now(),
+        )
+        .unwrap();
         let params = query(&signed);
         assert!(signatures.insert(params["X-Amz-Signature"].clone()));
-        match action {
-            MultipartAction::Create => assert_eq!(params["uploads"], ""),
-            MultipartAction::Part { part_number, .. } => {
+        match operation {
+            PresignOperation::CreateMultipart => assert_eq!(params["uploads"], ""),
+            PresignOperation::UploadPart { part_number, .. } => {
                 assert_eq!(params["uploadId"], id);
                 assert_eq!(params["partNumber"], part_number.to_string());
             }
             _ => assert_eq!(params["uploadId"], id),
         }
     }
-    for action in [
-        MultipartAction::Part {
+    for operation in [
+        PresignOperation::UploadPart {
             upload_id: id.into(),
             part_number: 0,
         },
-        MultipartAction::Part {
+        PresignOperation::UploadPart {
             upload_id: id.into(),
             part_number: 10_001,
         },
-        MultipartAction::Complete {
+        PresignOperation::CompleteMultipart {
             upload_id: "".into(),
         },
-        MultipartAction::Abort {
+        PresignOperation::AbortMultipart {
             upload_id: "id\nheader".into(),
         },
     ] {
         assert!(matches!(
-            multipart_uri::<Infallible>(&config().endpoint, "s3://bucket/key", &action),
+            request_uri::<Infallible>(&config().endpoint, "s3://bucket/key", &operation),
             Err(Error::InvalidMultipart)
         ));
     }

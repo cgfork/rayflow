@@ -2,11 +2,8 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use catalog::{
-    CatalogSystem, FileKey, FileSystem,
-    artifact::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST},
-    model::Catalog,
-};
+use catalog::directory::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST};
+use catalog::{CatalogSystem, FileKey, FileSystem, model::Catalog};
 use event::task::Task;
 use graph::{
     GraphStore,
@@ -343,40 +340,88 @@ async fn multipart_signing_requires_the_active_claim_and_matching_catalog() {
     .await;
     assert_eq!(status, StatusCode::OK, "{transfer}");
     assert_eq!(transfer["multipart"], true);
-    let mut request = json!({"agent_id": f.agent, "key": key, "catalog_uuid": transfer["catalog"]["uuid"], "action": {"operation": "part", "upload_id": "test+/id", "part_number": 2}});
-    let (status, signed) = action(&f, f.producer.uuid, "multipart", request.clone()).await;
+    let mut request = json!({"agent_id": f.agent, "key": key, "catalog_uuid": transfer["catalog"]["uuid"], "upload_id": "test+/id", "part_number": 2});
+    let (status, signed) = action(&f, f.producer.uuid, "multipart/upload", request.clone()).await;
     assert_eq!(status, StatusCode::OK, "{signed}");
-    assert_eq!(signed["operation"], "upload_part");
+    assert_eq!(
+        serde_json::from_value::<catalog::PresignOperation>(signed["operation"].clone()).unwrap(),
+        catalog::PresignOperation::UploadPart {
+            upload_id: "test+/id".into(),
+            part_number: 2
+        }
+    );
     let url = url::Url::parse(signed["url"].as_str().unwrap()).unwrap();
     let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
     assert_eq!(params["uploadId"], "test+/id");
     assert_eq!(params["partNumber"], "2");
+    for (endpoint, operation) in [
+        ("create", catalog::PresignOperation::CreateMultipart),
+        (
+            "complete",
+            catalog::PresignOperation::CompleteMultipart {
+                upload_id: "test+/id".into(),
+            },
+        ),
+        (
+            "abort",
+            catalog::PresignOperation::AbortMultipart {
+                upload_id: "test+/id".into(),
+            },
+        ),
+    ] {
+        let mut body =
+            json!({"agent_id":f.agent,"key":key,"catalog_uuid":transfer["catalog"]["uuid"]});
+        if endpoint != "create" {
+            body["upload_id"] = json!("test+/id");
+        }
+        let (status, signed) =
+            action(&f, f.producer.uuid, &format!("multipart/{endpoint}"), body).await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {signed}");
+        assert_eq!(
+            serde_json::from_value::<catalog::PresignOperation>(signed["operation"].clone())
+                .unwrap(),
+            operation
+        );
+    }
+    for endpoint in ["create", "upload", "complete", "abort"] {
+        assert_eq!(
+            self::request(
+                &f,
+                "GET",
+                &format!("/api/v1/catalog/multipart/{endpoint}"),
+                json!({})
+            )
+            .await
+            .0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
     request["key"] = json!(format!("{}/flow/2/producer/9/other", f.run));
     assert_eq!(
-        action(&f, f.producer.uuid, "multipart", request.clone())
+        action(&f, f.producer.uuid, "multipart/upload", request.clone())
             .await
             .0,
         StatusCode::BAD_REQUEST
     );
     request["key"] = json!(format!("{}/flow/2/producer/9/result", Uuid::new_v4()));
     assert_eq!(
-        action(&f, f.producer.uuid, "multipart", request.clone())
+        action(&f, f.producer.uuid, "multipart/upload", request.clone())
             .await
             .0,
         StatusCode::BAD_REQUEST
     );
     request["key"] = json!(key);
-    request["action"]["part_number"] = json!(0);
+    request["part_number"] = json!(0);
     assert_eq!(
-        action(&f, f.producer.uuid, "multipart", request.clone())
+        action(&f, f.producer.uuid, "multipart/upload", request.clone())
             .await
             .0,
         StatusCode::BAD_REQUEST
     );
-    request["action"]["part_number"] = json!(2);
+    request["part_number"] = json!(2);
     request["agent_id"] = json!(Uuid::new_v4());
     assert_eq!(
-        action(&f, f.producer.uuid, "multipart", request.clone())
+        action(&f, f.producer.uuid, "multipart/upload", request.clone())
             .await
             .0,
         StatusCode::CONFLICT
@@ -388,7 +433,7 @@ async fn multipart_signing_requires_the_active_claim_and_matching_catalog() {
         App::new(f.db.clone(), disabled, Versions(vec![])),
     );
     assert_eq!(
-        action(&f, f.producer.uuid, "multipart", request.clone())
+        action(&f, f.producer.uuid, "multipart/upload", request.clone())
             .await
             .0,
         StatusCode::BAD_REQUEST
@@ -401,7 +446,9 @@ async fn multipart_signing_requires_the_active_claim_and_matching_catalog() {
         .await
         .unwrap();
     assert_eq!(
-        action(&f, f.producer.uuid, "multipart", request).await.0,
+        action(&f, f.producer.uuid, "multipart/upload", request)
+            .await
+            .0,
         StatusCode::CONFLICT
     );
 }
@@ -542,6 +589,7 @@ async fn catalog_api_exposes_only_transfer_operations() {
         "/files?fullpath=example".to_owned(),
         format!("/files/{id}"),
         "/api/v1/catalog/complete".into(),
+        "/api/v1/catalog/multipart".into(),
         format!("/api/v1/jobs/{}/artifacts/prepare", f.producer.uuid),
         format!("/api/v1/jobs/{}/artifacts/commit", f.producer.uuid),
         format!("/api/v1/jobs/{}/artifacts/download", f.producer.uuid),

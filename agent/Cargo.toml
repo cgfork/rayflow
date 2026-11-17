@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+percent-encoding = "2"
 quick-xml = { version = "0.38", features = ["serialize"] }
 catalog = { workspace = true }
 bollard = { workspace = true }

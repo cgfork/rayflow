@@ -74,32 +74,26 @@ struct Api {
     data: Arc<Mutex<Data>>,
 }
 
-async fn sign(
-    State(api): State<Api>,
-    headers: HeaderMap,
-    Json(body): Json<MultipartRequest>,
-) -> Json<PresignedUrl> {
+fn signed(api: Api, headers: HeaderMap, operation: PresignOperation) -> Json<PresignedUrl> {
     assert_eq!(headers[header::AUTHORIZATION], "Bearer fleet-token");
-    let (operation, query) = match body.action {
-        MultipartAction::Create => (PresignOperation::CreateMultipart, "action=create".into()),
-        MultipartAction::Part {
+    let query = match &operation {
+        PresignOperation::CreateMultipart => "action=create".into(),
+        PresignOperation::UploadPart {
             upload_id,
             part_number,
         } => {
             assert_eq!(upload_id, "test-upload");
-            (PresignOperation::UploadPart, format!("part={part_number}"))
+            format!("part={part_number}")
         }
-        MultipartAction::Complete { upload_id } => {
+        PresignOperation::CompleteMultipart { upload_id } => {
             assert_eq!(upload_id, "test-upload");
-            (
-                PresignOperation::CompleteMultipart,
-                "action=complete".into(),
-            )
+            "action=complete".into()
         }
-        MultipartAction::Abort { upload_id } => {
+        PresignOperation::AbortMultipart { upload_id } => {
             assert_eq!(upload_id, "test-upload");
-            (PresignOperation::AbortMultipart, "action=abort".into())
+            "action=abort".into()
         }
+        _ => panic!("unexpected operation"),
     };
     Json(PresignedUrl {
         url: format!("{}/object?{query}", api.url),
@@ -107,6 +101,54 @@ async fn sign(
         headers: Default::default(),
         expires_at: jiff::Timestamp::now() + Duration::from_secs(60),
     })
+}
+
+async fn sign_create(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(_body): Json<serde_json::Value>,
+) -> Json<PresignedUrl> {
+    signed(api, headers, PresignOperation::CreateMultipart)
+}
+async fn sign_upload(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Json<PresignedUrl> {
+    signed(
+        api,
+        headers,
+        PresignOperation::UploadPart {
+            upload_id: body["upload_id"].as_str().unwrap().into(),
+            part_number: u32::try_from(body["part_number"].as_u64().unwrap()).unwrap(),
+        },
+    )
+}
+async fn sign_complete(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Json<PresignedUrl> {
+    signed(
+        api,
+        headers,
+        PresignOperation::CompleteMultipart {
+            upload_id: body["upload_id"].as_str().unwrap().into(),
+        },
+    )
+}
+async fn sign_abort(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Json<PresignedUrl> {
+    signed(
+        api,
+        headers,
+        PresignOperation::AbortMultipart {
+            upload_id: body["upload_id"].as_str().unwrap().into(),
+        },
+    )
 }
 
 async fn object(
@@ -232,7 +274,10 @@ impl Fixture {
             })),
         };
         let router = Router::new()
-            .route("/api/v1/catalog/multipart", post(sign))
+            .route("/api/v1/catalog/multipart/create", post(sign_create))
+            .route("/api/v1/catalog/multipart/upload", post(sign_upload))
+            .route("/api/v1/catalog/multipart/complete", post(sign_complete))
+            .route("/api/v1/catalog/multipart/abort", post(sign_abort))
             .route("/object", axum::routing::any(object))
             .layer(axum::extract::DefaultBodyLimit::max(6 * 1024 * 1024))
             .with_state(api.clone());
@@ -289,13 +334,12 @@ impl Fixture {
         }
     }
 
-    fn request(&self) -> MultipartRequest {
-        MultipartRequest {
+    fn request(&self) -> UploadContext {
+        UploadContext {
             job_id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             key: "key".into(),
-            catalog_uuid: Uuid::new_v4(),
-            action: MultipartAction::Create,
+            catalog_id: Uuid::new_v4(),
         }
     }
 
