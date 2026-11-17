@@ -99,7 +99,7 @@ async fn graph_lists_paginate_drafts_and_published_versions() {
         let (status, draft) = request(
             &app,
             Method::PUT,
-            &format!("/graphs/{}/draft", definition.id),
+            &format!("/api/v1/graphs/{}/draft", definition.id),
             json!({ "graph": definition, "actor": "editor" }),
         )
         .await;
@@ -117,14 +117,14 @@ async fn graph_lists_paginate_drafts_and_published_versions() {
         let (status, published) = request(
             &app,
             Method::POST,
-            &format!("/graphs/{}/publish", first.id),
+            &format!("/api/v1/graphs/{}/publish", first.id),
             json!({ "actor": "publisher" }),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{published}");
         assert_eq!(published["version"], version);
     }
-    let page = get(&app, "/graph_drafts?limit=1").await;
+    let page = get(&app, "/api/v1/graph_drafts?limit=1").await;
     assert_eq!(page["items"].as_array().unwrap().len(), 1);
     assert_eq!(page["items"][0]["id"], second.id.to_string());
     assert_eq!(page["items"][0]["version"], 0);
@@ -133,12 +133,19 @@ async fn graph_lists_paginate_drafts_and_published_versions() {
     assert_eq!(page["items"][0], serde_json::to_value(&second).unwrap());
     let next = get(
         &app,
-        &format!("/graph_drafts?limit=1&before={}", page["next_cursor"]),
+        &format!(
+            "/api/v1/graph_drafts?limit=1&before={}",
+            page["next_cursor"]
+        ),
     )
     .await;
     assert_eq!(next["items"][0]["id"], first.id.to_string());
     assert_eq!(next["next_cursor"], Value::Null);
-    let published = get(&app, &format!("/graphs?limit=1&graph_id={}", first.id)).await;
+    let published = get(
+        &app,
+        &format!("/api/v1/graphs?limit=1&graph_id={}", first.id),
+    )
+    .await;
     assert_eq!(published["items"][0]["version"], 2);
     assert_eq!(
         published["items"][0]["nodes"],
@@ -147,17 +154,17 @@ async fn graph_lists_paginate_drafts_and_published_versions() {
     assert_eq!(published["items"][0]["node_count"], first.nodes.len());
     let older = get(
         &app,
-        &format!("/graphs?limit=1&before={}", published["next_cursor"]),
+        &format!("/api/v1/graphs?limit=1&before={}", published["next_cursor"]),
     )
     .await;
     assert_eq!(older["items"][0]["version"], 1);
     for path in [
-        "/graphs?limit=0",
-        "/graph_drafts?limit=201",
-        "/runs?limit=0",
-        "/jobs?limit=201",
-        "/agents?limit=0",
-        "/jobs?status=Unknown",
+        "/api/v1/graphs?limit=0",
+        "/api/v1/graph_drafts?limit=201",
+        "/api/v1/runs?limit=0",
+        "/api/v1/jobs?limit=201",
+        "/api/v1/agents?limit=0",
+        "/api/v1/jobs?status=Unknown",
     ] {
         let (status, _) = request(&app, Method::GET, path, Value::Null).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
@@ -217,10 +224,10 @@ async fn graph_state_and_run_detail_return_only_latest_effective_node_runs() {
             .unwrap();
     }
     let state_path = format!(
-        "/runs/graph_state?data_id={}&graph_id={}",
+        "/api/v1/runs/graph_state?data_id={}&graph_id={}",
         run.data_id, run.graph_id
     );
-    let detail_path = format!("/runs/{}", run.uuid);
+    let detail_path = format!("/api/v1/runs/{}", run.uuid);
     let state = get(&app, &state_path).await;
     let detail = get(&app, &detail_path).await;
     assert_eq!(state, detail["state"]);
@@ -296,22 +303,26 @@ async fn run_detail_reads_the_selected_version_and_latest_node_revision() {
             .await
             .unwrap();
     }
-    let old = get(&app, &format!("/runs/{}", runs[0].uuid)).await;
+    let old = get(&app, &format!("/api/v1/runs/{}", runs[0].uuid)).await;
     assert_eq!(old["graph"]["name"], "version-zero");
     assert_eq!(old["state"]["uuid"], runs[0].uuid.to_string());
     assert_eq!(old["state"]["version"], first.version);
     assert_eq!(old["state"]["nodes"][0]["status"], "Pending");
     assert_eq!(old["current"], true);
-    let current = get(&app, &format!("/runs/{}", runs[1].uuid)).await;
+    let current = get(&app, &format!("/api/v1/runs/{}", runs[1].uuid)).await;
     assert_eq!(current["current"], true);
     assert_eq!(current["graph"]["name"], "version-one");
     assert!(current["state"]["nodes"].as_array().unwrap().is_empty());
-    let page = get(&app, &format!("/runs?limit=1&graph_id={}", definition.id)).await;
+    let page = get(
+        &app,
+        &format!("/api/v1/runs?limit=1&graph_id={}", definition.id),
+    )
+    .await;
     assert_eq!(page["items"][0]["uuid"], runs[1].uuid.to_string());
     let (status, _) = request(
         &app,
         Method::GET,
-        &format!("/runs/{}", Uuid::new_v4()),
+        &format!("/api/v1/runs/{}", Uuid::new_v4()),
         Value::Null,
     )
     .await;
@@ -339,12 +350,12 @@ async fn job_list_combines_status_owner_and_run_filters_without_claiming() {
     }
     let page = get(
         &app,
-        &format!("/jobs?status=Polled&agent_id={agent_id}&run_id={run_id}&limit=1"),
+        &format!("/api/v1/jobs?status=Polled&agent_id={agent_id}&run_id={run_id}&limit=1"),
     )
     .await;
     assert_eq!(page["items"].as_array().unwrap().len(), 1);
     assert_eq!(page["items"][0]["agent_id"], agent_id.to_string());
-    let queue = get(&app, "/jobs?status=Scheduled").await;
+    let queue = get(&app, "/api/v1/jobs?status=Scheduled").await;
     assert_eq!(queue["items"].as_array().unwrap().len(), 1);
     assert_eq!(queue["items"][0]["agent_id"], Value::Null);
 }
@@ -357,19 +368,19 @@ async fn agent_instances_are_observed_from_valid_polls_and_become_offline() {
     let id = Uuid::new_v4();
     let body = json!({ "agent_id": id, "batch": 0, "wait_ms": 0,
         "resources": { "cpu_cores": 0, "memory_bytes": 1024 } });
-    let (status, _) = request(&app, Method::POST, "/jobs/poll", body.clone()).await;
+    let (status, _) = request(&app, Method::POST, "/api/v1/jobs/poll", body.clone()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        get(&app, "/agents").await["items"]
+        get(&app, "/api/v1/agents").await["items"]
             .as_array()
             .unwrap()
             .is_empty()
     );
     let mut valid = body;
     valid["batch"] = json!(1);
-    let (status, _) = request(&app, Method::POST, "/jobs/poll", valid).await;
+    let (status, _) = request(&app, Method::POST, "/api/v1/jobs/poll", valid).await;
     assert_eq!(status, StatusCode::OK);
-    let first = get(&app, "/agents?online=true").await;
+    let first = get(&app, "/api/v1/agents?online=true").await;
     assert_eq!(first["items"][0]["uuid"], id.to_string());
     assert_eq!(first["items"][0]["online"], true);
     let capacity = ResourceCapacity {
@@ -381,7 +392,7 @@ async fn agent_instances_are_observed_from_valid_polls_and_become_offline() {
     let (left, right) = tokio::join!(app.poll(&mut first_poll, 1), app.poll(&mut second_poll, 1));
     left.unwrap();
     right.unwrap();
-    let updated = get(&app, "/agents?online=true&limit=1").await;
+    let updated = get(&app, "/api/v1/agents?online=true&limit=1").await;
     assert_eq!(updated["items"].as_array().unwrap().len(), 1);
     assert_eq!(updated["next_cursor"], Value::Null);
     assert_eq!(updated["items"][0]["id"], first["items"][0]["id"]);
@@ -398,12 +409,12 @@ async fn agent_instances_are_observed_from_valid_polls_and_become_offline() {
         .await
         .unwrap();
     assert!(
-        get(&app, "/agents?online=true").await["items"]
+        get(&app, "/api/v1/agents?online=true").await["items"]
             .as_array()
             .unwrap()
             .is_empty()
     );
-    let offline = get(&app, "/agents?online=false").await;
+    let offline = get(&app, "/api/v1/agents?online=false").await;
     assert_eq!(offline["items"][0]["online"], false);
     assert_eq!(offline["items"][0]["uuid"], id.to_string());
 }
@@ -547,7 +558,7 @@ async fn graph_list_uses_the_configured_store() {
     let app = App::new(db, Config::default(), store);
     let response = server::router(app)
         .oneshot(
-            Request::get(format!("/graphs?graph_id={}", definition.id))
+            Request::get(format!("/api/v1/graphs?graph_id={}", definition.id))
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -46,8 +46,17 @@ impl<S> App<S> {
         S: GraphStore<Uuid, G = DAG> + Clone,
         S::Err: Send + Sync + 'static,
     {
+        self.inspect_run_at(id, None).await
+    }
+
+    /// Inspect effective node runs up to a revision, retaining each producer's graph version.
+    pub async fn inspect_run_at(&self, id: Uuid, revision: Option<u64>) -> Result<RunView, AppError>
+    where
+        S: GraphStore<Uuid, G = DAG> + Clone,
+        S::Err: Send + Sync + 'static,
+    {
         let mut db = self.db.clone();
-        let run = Run::filter_by_uuid(id)
+        let mut run = Run::filter_by_uuid(id)
             .first()
             .exec(&mut db)
             .await?
@@ -59,6 +68,14 @@ impl<S> App<S> {
             .await?;
         let current = latest.is_some_and(|latest| latest.uuid == run.uuid);
         let graph = self.read_graph(run.graph_id, Some(run.version)).await?;
+        if let Some(revision) = revision {
+            if revision > run.revision {
+                return Err(AppError::InvalidRequest(
+                    "revision exceeds the current run revision".into(),
+                ));
+            }
+            run.revision = revision;
+        }
         let state = self
             .run_with(run.data_id, run.graph_id)
             .graph_state_at(run, &graph)
@@ -84,6 +101,8 @@ pub struct NodeState {
     pub graph_id: Uuid,
     /// Node identifier from the node run.
     pub node_id: Uuid,
+    /// Graph version recorded when this node run was created.
+    pub version: u64,
     /// Revision the node run was read at.
     pub revision: u64,
     /// Node status, e.g. `Succeeded`.
@@ -110,6 +129,7 @@ impl NodeState {
             data_id: node_run.data_id,
             graph_id: node_run.graph_id,
             node_id: node_run.node_id,
+            version: node_run.version,
             revision: node_run.revision,
             status: node_run.status,
             ineffective: node_run.ineffective,

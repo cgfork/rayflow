@@ -1,11 +1,14 @@
 //! Docker-backed `Containerd` implementation.
 
-use std::pin::Pin;
+use std::{
+    path::{Path, PathBuf},
+    pin::Pin,
+};
 
 use bollard::{
     Docker,
     errors::Error as DockerError,
-    models::{ContainerCreateBody, ContainerStateStatusEnum, HostConfig},
+    models::{ContainerCreateBody, ContainerStateStatusEnum, HostConfig, Mount, MountType},
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
     },
@@ -25,6 +28,8 @@ use super::{Container, ContainerAction, ContainerEvent, ContainerState, Containe
 /// different specifications through [`Containerd::Spec`](super::Containerd::Spec).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerSpec {
+    #[serde(default)]
+    pub files: Option<DockerFiles>,
     /// Deterministic Docker name used to reconnect after an agent restart.
     pub name: String,
     /// Image reference that must be available before creation.
@@ -41,6 +46,12 @@ pub struct DockerSpec {
     pub memory_bytes: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerFiles {
+    pub inputs: PathBuf,
+    pub outputs: PathBuf,
+}
+
 impl TryFrom<&scheduler::Job> for DockerSpec {
     type Error = Error;
 
@@ -53,6 +64,7 @@ impl TryFrom<&scheduler::Job> for DockerSpec {
             .filter(|image| !image.trim().is_empty())
             .ok_or(Error::MissingImage)?;
         Ok(Self {
+            files: None,
             name: format!("rayflow-{}", job.uuid),
             image: image.to_owned(),
             command: config
@@ -238,6 +250,28 @@ impl Containerd for DockerContainerd {
         DockerSpec::try_from(job)
     }
 
+    fn spec_with_files<'a>(
+        &'a self,
+        job: &'a scheduler::Job,
+        inputs: &Path,
+        outputs: &Path,
+    ) -> Result<Self::Spec<'a>, Error> {
+        let mut spec = DockerSpec::try_from(job)?;
+        spec.files = Some(DockerFiles {
+            inputs: inputs.to_path_buf(),
+            outputs: outputs.to_path_buf(),
+        });
+        let env = spec.env.get_or_insert_with(Vec::new);
+        env.retain(|value| {
+            !value.starts_with("RAYFLOW_INPUT_DIR=") && !value.starts_with("RAYFLOW_OUTPUT_DIR=")
+        });
+        env.extend([
+            "RAYFLOW_INPUT_DIR=/data/inputs".into(),
+            "RAYFLOW_OUTPUT_DIR=/data/outputs".into(),
+        ]);
+        Ok(spec)
+    }
+
     async fn prepare(&self, spec: Self::Spec<'_>) -> Result<(), Error> {
         match self.docker.inspect_image(&spec.image).await {
             Ok(_) => return Ok(()),
@@ -266,6 +300,24 @@ impl Containerd for DockerContainerd {
             env: spec.env.clone(),
             working_dir: spec.working_dir.clone(),
             host_config: Some(HostConfig {
+                mounts: spec.files.as_ref().map(|files| {
+                    vec![
+                        Mount {
+                            typ: Some(MountType::BIND),
+                            source: Some(files.inputs.to_string_lossy().into_owned()),
+                            target: Some("/data/inputs".into()),
+                            read_only: Some(true),
+                            ..Default::default()
+                        },
+                        Mount {
+                            typ: Some(MountType::BIND),
+                            source: Some(files.outputs.to_string_lossy().into_owned()),
+                            target: Some("/data/outputs".into()),
+                            read_only: Some(false),
+                            ..Default::default()
+                        },
+                    ]
+                }),
                 nano_cpus: (spec.cpu_cores > 0)
                     .then_some(i64::from(spec.cpu_cores) * 1_000_000_000),
                 memory: (memory > 0).then_some(memory),

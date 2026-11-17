@@ -15,11 +15,17 @@ use crate::errors::Error;
 #[derive(Clone, Deserialize)]
 pub struct Settings {
     pub id: Uuid,
+    /// Server base URL; the client appends `/api/v1` to API requests.
     pub server_url: String,
     /// Fleet credential when server authentication is enabled.
     #[serde(default)]
     pub auth_token: Option<String>,
     pub workdir: PathBuf,
+    /// Root for job input/output bytes, separate from durable job metadata.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
+    #[serde(default)]
+    pub transfer: crate::transfer::Config,
     pub resources: ResourceCapacity,
     pub batch: usize,
     #[serde(with = "jiff::fmt::serde::unsigned_duration::required")]
@@ -34,6 +40,7 @@ impl std::fmt::Debug for Settings {
             .field("id", &self.id)
             .field("server_url", &self.server_url)
             .field("workdir", &self.workdir)
+            .field("data_dir", &self.data_dir)
             .field("resources", &self.resources)
             .field("batch", &self.batch)
             .field("poll_interval", &self.poll_interval)
@@ -63,6 +70,7 @@ impl Settings {
         let settings: Self = Builder::builder()
             .set_default("server_url", "http://127.0.0.1:8080")?
             .set_default("workdir", ".rayflow/jobs")?
+            .set_default("data_dir", ".rayflow/data")?
             .set_default(
                 "resources.cpu_cores",
                 std::thread::available_parallelism()
@@ -95,11 +103,14 @@ impl Settings {
         workdir: impl Into<PathBuf>,
         resources: ResourceCapacity,
     ) -> Self {
+        let workdir = workdir.into();
         Self {
             id,
             server_url: server_url.into(),
             auth_token: None,
-            workdir: workdir.into(),
+            data_dir: workdir.join("data"),
+            transfer: Default::default(),
+            workdir,
             resources,
             batch: 64,
             poll_interval: Duration::from_secs(1),
@@ -108,6 +119,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
+        self.transfer.validate()?;
         if self.id.is_nil() {
             return Err(Error::Settings("id must be a non-nil UUID"));
         }
@@ -119,6 +131,9 @@ impl Settings {
         }
         if self.workdir.as_os_str().is_empty() {
             return Err(Error::Settings("workdir must not be empty"));
+        }
+        if self.data_dir.as_os_str().is_empty() {
+            return Err(Error::Settings("data_dir must not be empty"));
         }
         for duration in [self.poll_interval, self.request_timeout] {
             if duration.is_zero() || Instant::now().checked_add(duration).is_none() {
@@ -142,6 +157,10 @@ impl Settings {
     }
 }
 
+fn default_data_dir() -> PathBuf {
+    ".rayflow/data".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,8 +177,10 @@ mod tests {
         settings.validate().unwrap();
         assert_eq!(settings.poll_interval, Duration::from_millis(250));
         assert_eq!(settings.request_timeout, Duration::from_secs(10));
+        assert_eq!(settings.data_dir, PathBuf::from(".rayflow/data"));
 
         let source = [
+            ("RAYFLOW_AGENT_DATA_DIR".to_owned(), "/srv/data".to_owned()),
             (
                 "RAYFLOW_AGENT_SERVER_URL".to_owned(),
                 "https://example.com/api".to_owned(),
@@ -180,6 +201,7 @@ mod tests {
             .unwrap();
         settings.validate().unwrap();
         assert_eq!(settings.server_url, "https://example.com/api");
+        assert_eq!(settings.data_dir, PathBuf::from("/srv/data"));
         assert_eq!(settings.poll_interval, Duration::from_secs(2));
         assert_eq!(settings.resources.cpu_cores, 8);
         assert_eq!(settings.resources.memory_bytes, 4096);
@@ -217,6 +239,7 @@ mod tests {
             ("poll_interval", "0s"),
             ("request_timeout", "0s"),
             ("workdir", ""),
+            ("data_dir", ""),
             ("server_url", "file:///tmp/socket"),
             ("server_url", "http://localhost?query=1"),
             ("server_url", "http://localhost#fragment"),

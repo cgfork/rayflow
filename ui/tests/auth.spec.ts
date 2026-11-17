@@ -5,9 +5,9 @@ async function backend(page: Page) {
   let expired = false;
   const user = { id: 'stable-user-id', name: 'Alice Example', provider: 'local', subject: 'alice' };
   await page.route('https://fonts.googleapis.com/**', (route) => route.abort());
-  await page.route('**/api/**', async (route) => {
+  await page.route('**/api/v1/**', async (route) => {
     const request = route.request();
-    const path = new URL(request.url()).pathname.replace('/api', '');
+    const path = new URL(request.url()).pathname.replace('/api/v1', '');
     if (path === '/auth/providers') return route.fulfill({ json: { enabled: true, company_name: 'Example Company', providers: [
       { id: 'local', label: 'Rayflow account', kind: 'password' }, { id: 'ldap', label: 'Company directory', kind: 'password' },
       { id: 'oidc', label: 'Company SSO', kind: 'redirect' },
@@ -34,7 +34,7 @@ test('signs in, restores the session, and signs out without editable audit ident
   await backend(page);
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Welcome to Example Company' })).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Continue with company SSO' })).toHaveAttribute('href', '/api/auth/oidc/login');
+  await expect(page.getByRole('link', { name: 'Continue with company SSO' })).toHaveAttribute('href', '/api/v1/auth/oidc/login');
   await page.getByLabel('Account type').selectOption('ldap');
   await page.getByLabel('Username').fill('alice');
   await page.getByLabel('Password', { exact: true }).fill('wrong');
@@ -68,7 +68,7 @@ test('expired sessions return to login and company login failures remain recover
 
 test('login works on narrow screens and configuration failures do not reveal the console', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
-  await page.route('**/api/auth/providers', (route) => route.fulfill({ status: 503, json: { error: 'Authentication unavailable' } }));
+  await page.route('**/api/v1/auth/providers', (route) => route.fulfill({ status: 503, json: { error: 'Authentication unavailable' } }));
   await page.goto('/');
   await expect(page.getByRole('alert')).toContainText('Authentication unavailable');
   await expect(page.getByRole('button', { name: 'Retry connection' })).toBeVisible();

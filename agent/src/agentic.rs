@@ -24,6 +24,7 @@ use crate::{
     client::{Client, PollRequest, PollResponse},
     containerd::{Containerd, docker::DockerContainerd},
     errors::Error,
+    filed::Filed,
     settings::Settings,
 };
 
@@ -36,6 +37,7 @@ use crate::{
 pub struct Agentic<C = DockerContainerd, R = Client> {
     agentd: Agentd<C, R>,
     client: Client,
+    filed: Filed,
     settings: Settings,
     active: Mutex<HashSet<Uuid>>,
     reporting: Mutex<()>,
@@ -49,10 +51,11 @@ impl Agentic {
     pub async fn new(settings: Settings) -> Result<Self, Error> {
         settings.validate()?;
         let client = Client::new(&settings)?;
-        let agentd = Agentd::open(
+        let agentd = Agentd::open_with_data_dir(
             DockerContainerd::connect_with_defaults()?,
             client.clone(),
             &settings.workdir,
+            &settings.data_dir,
         )
         .await?;
         Self::with_agent(agentd, client, settings)
@@ -71,7 +74,13 @@ where
         settings: Settings,
     ) -> Result<Self, Error> {
         settings.validate()?;
+        if agentd.data_dir() != settings.data_dir {
+            return Err(Error::Settings(
+                "agent daemon and filed must use the same data_dir",
+            ));
+        }
         Ok(Self {
+            filed: Filed::new(client.clone(), &settings)?,
             agentd,
             client,
             settings,
@@ -179,7 +188,10 @@ where
             return;
         }
         let result = match self.agentd.prepare(job.clone()).await {
-            Ok(()) => self.agentd.start(job_id).await,
+            Ok(()) => match self.download_inputs(job_id).await {
+                Ok(()) => self.agentd.start(job_id).await,
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         match result {
@@ -198,6 +210,29 @@ where
                 }
             }
             sleep(self.settings.poll_interval).await;
+        }
+    }
+
+    async fn download_inputs(&self, job_id: Uuid) -> Result<(), Error> {
+        let job_fs = self.agentd.job_fs(job_id);
+        let node = job_fs.node().await?;
+        let job = job_fs.job().await?;
+        loop {
+            match self.filed.download_inputs(&job, &node).await {
+                Err(Error::Http(error))
+                    if job.expired_at.is_some_and(|at| at > jiff::Timestamp::now())
+                        && (error.is_timeout()
+                            || error.is_connect()
+                            || error.is_body()
+                            || error.status().is_some_and(|s| {
+                                s.is_server_error() || s == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            })) =>
+                {
+                    tracing::warn!(%job_id, %error, "input download failed; retrying");
+                    sleep(self.settings.poll_interval).await;
+                }
+                result => return result,
+            }
         }
     }
 
@@ -221,7 +256,32 @@ where
     }
 
     async fn report_result(&self, result: &AgentResult) -> Result<(), Error> {
-        match self.report(result.job_id, result.outcome).await {
+        let mut outcome = result.outcome;
+        let mut lost = false;
+        if outcome == JobOutcome::Succeeded {
+            match self
+                .filed
+                .upload_outputs(
+                    &self.agentd.job_fs(result.job_id).job().await?,
+                    &self.agentd.job_fs(result.job_id).node().await?,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(Error::ClaimLost(_)) => lost = true,
+                Err(Error::Artifact(message)) => {
+                    tracing::error!(job_id = %result.job_id, %message, "job outputs are invalid");
+                    self.agentd.fail_artifacts(result.job_id).await?;
+                    outcome = JobOutcome::Failed;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        match if lost {
+            Err(Error::ClaimLost(result.job_id))
+        } else {
+            self.report(result.job_id, outcome).await
+        } {
             Ok(()) | Err(Error::ClaimLost(_)) => {}
             Err(error) => return Err(error),
         }

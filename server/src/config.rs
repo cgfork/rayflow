@@ -29,6 +29,9 @@ fn default_poll_retry_interval() -> Duration {
 /// Runtime configuration for the API server.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Config {
+    /// Optional S3-compatible storage for job inputs and outputs.
+    #[serde(default)]
+    pub storage: Option<crate::storage::StorageConfig>,
     /// User authentication; disabled for backwards-compatible local development.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
@@ -53,6 +56,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            storage: None,
             auth: crate::auth::AuthConfig::default(),
             addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             database_url: String::new(),
@@ -98,7 +102,14 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        self.auth.validate().map_err(ConfigError::Message)?;
+        if let Some(storage) = &self.storage {
+            storage
+                .validate()
+                .map_err(|error| ConfigError::Foreign(Box::new(error)))?;
+        }
+        self.auth
+            .validate()
+            .map_err(|error| ConfigError::Foreign(Box::new(error)))?;
         if self.poll_timeout < Duration::from_millis(2) {
             return Err(ConfigError::Message(
                 "poll_timeout must be at least 2ms".to_owned(),

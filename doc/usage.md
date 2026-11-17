@@ -208,14 +208,22 @@ use compatible lease and poll settings.
 ### Agent
 
 The agent requires a stable, non-nil UUID. The other settings have defaults:
+`server_url` is the server base URL; the agent appends `/api/v1` automatically.
 
 ```yaml
 id: 12345678-1234-4234-8234-123456789abc
 server_url: http://127.0.0.1:8080
 workdir: .rayflow/jobs
+data_dir: .rayflow/data
 batch: 64
 poll_interval: 1s
 request_timeout: 60s
+transfer:
+  enabled: true
+  multipart_threshold: 67108864
+  part_size: 8388608
+  concurrency: 4
+  max_attempts: 3
 resources:
   cpu_cores: 4
   memory_bytes: 4294967296
@@ -234,7 +242,9 @@ RAYFLOW_AGENT_ID=12345678-1234-4234-8234-123456789abc \
   cargo run -p agent
 ```
 
-Each agent needs a unique stable ID and a persistent workdir. The agent uses
+Each agent needs a unique stable ID, a persistent workdir, and a persistent
+`data_dir` for artifacts. Set `RAYFLOW_AGENT_DATA_DIR` to override the latter.
+The agent uses
 Docker's standard environment variables, including `DOCKER_HOST`, when a
 non-default Docker endpoint is required.
 
@@ -248,8 +258,8 @@ npm ci --prefix ui
 npm run dev --prefix ui
 ```
 
-Open `http://127.0.0.1:5173`. Vite forwards `/api/*` requests to
-`http://127.0.0.1:8080/*`. To use another API server:
+Open `http://127.0.0.1:5173`. Vite forwards `/api/v1/*` requests to
+`http://127.0.0.1:8080/api/v1/*`. To use another API server:
 
 ```sh
 RAYFLOW_API_URL=http://127.0.0.1:8081 npm run dev --prefix ui
@@ -328,8 +338,8 @@ and API behind your existing access controls.
 npm run build --prefix ui
 ```
 
-Serve `ui/dist/` at the site's root and proxy `/api/` to the Rayflow server,
-stripping the `/api` prefix. The Rust server does not serve the UI assets.
+Serve `ui/dist/` at the site's root and proxy `/api/v1/` to the Rayflow server,
+preserving the `/api/v1` prefix. Alternatively, build the server with `embed-ui` to serve the UI assets directly.
 `RAYFLOW_API_URL` configures only the Vite development proxy. For example, inside
 an nginx `server` block:
 
@@ -340,8 +350,8 @@ location / {
     try_files $uri $uri/ /index.html;
 }
 
-location /api/ {
-    proxy_pass http://127.0.0.1:8080/;
+location /api/v1/ {
+    proxy_pass http://127.0.0.1:8080;
     proxy_read_timeout 90s;
 }
 ```
@@ -374,43 +384,72 @@ is absent.
 
 ## HTTP API
 
+Application operations return errors with an HTTP status and a JSON body:
+
+```json
+{
+  "error_code": "RAYFLOW_RUN_NOT_FOUND",
+  "error": "run not found: 00000000-0000-0000-0000-000000000001"
+}
+```
+
+`error_code` is the stable business identifier; use it to decide how to handle
+an error. `error` is the human-readable message and may include resource IDs or
+validation details. Existing clients can keep displaying `error`. The status
+and code also reflect errors wrapped by storage, runtime, or scheduler adapters.
+
+| HTTP status | Business error codes |
+| --- | --- |
+| `400 Bad Request` | `RAYFLOW_INVALID_REQUEST`, `RAYFLOW_GRAPH_ID_MISMATCH`, `RAYFLOW_INVALID_GRAPH`, `RAYFLOW_INVALID_UPGRADE_VERSION`, `RAYFLOW_INVALID_UPGRADE_NODE`, `RAYFLOW_INVALID_TASK_EVENT` |
+| `400 Bad Request` | `RAYFLOW_INVALID_CATALOG_URL`, `RAYFLOW_INVALID_CATALOG_FIELD`, `RAYFLOW_MISSING_CATALOG_FIELD`, `RAYFLOW_INVALID_ARTIFACT_PATH`, `RAYFLOW_INVALID_STORAGE_CONFIGURATION`, `RAYFLOW_INVALID_OBJECT_URL`, `RAYFLOW_INVALID_PRESIGN_EXPIRY`, `RAYFLOW_INVALID_MULTIPART_OPERATION` |
+| `404 Not Found` | `RAYFLOW_RUN_NOT_FOUND`, `RAYFLOW_NODE_RUN_NOT_FOUND`, `RAYFLOW_NODE_NOT_FOUND`, `RAYFLOW_TASK_NOT_FOUND`, `RAYFLOW_JOB_NOT_FOUND`, `RAYFLOW_GRAPH_NOT_FOUND`, `RAYFLOW_GRAPH_DRAFT_NOT_FOUND` |
+| `404 Not Found` | `RAYFLOW_ARTIFACT_NOT_FOUND`, `RAYFLOW_CATALOG_NOT_FOUND`, `RAYFLOW_FILE_NOT_FOUND`, `RAYFLOW_COMMAND_NOT_FOUND`, `RAYFLOW_TASK_EVENT_NOT_FOUND` |
+| `409 Conflict` | `RAYFLOW_JOB_CONFLICT`, `RAYFLOW_RUN_ALREADY_STARTED`, `RAYFLOW_INVALID_TRANSITION`, `RAYFLOW_CONCURRENT_UPDATE` |
+| `500 Internal Server Error` | `RAYFLOW_DATABASE_ERROR`, `RAYFLOW_GRAPH_ERROR`, `RAYFLOW_GRAPH_METADATA_MISMATCH`, `RAYFLOW_GRAPH_DRAFT_METADATA_MISMATCH`, `RAYFLOW_GRAPH_VERSION_OVERFLOW`, `RAYFLOW_STORAGE_ERROR` |
+| `500 Internal Server Error` | `RAYFLOW_INVALID_JOB_TIMEOUT_GAP`, `RAYFLOW_INVALID_JOB_LEASE`, `RAYFLOW_JOB_LEASE_NOT_FOUND` |
+| `503 Service Unavailable` | `RAYFLOW_STORAGE_UNAVAILABLE`, `RAYFLOW_STORAGE_CREDENTIALS_EXPIRED` |
+
+The lease errors above indicate invalid or missing persisted job configuration.
+Rust consumers can inspect `AppError::status_code()` and `AppError::code()`;
+Axum handlers use its `IntoResponse` implementation to serialize the same mapping.
+
 The service endpoints are:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/` | Reports `rayflow`. |
-| `GET` | `/health` | Liveness probe; returns `ok`. |
-| `GET` | `/graphs` | List published graph versions; optional `graph_id` filter. |
-| `GET` | `/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
-| `GET` | `/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
-| `GET` | `/graph_drafts` | List editable DAGs. |
-| `GET` | `/runs` | List runs; optional `graph_id` filter. |
-| `GET` | `/runs/{run_id}` | Inspect the exact run UUID, its state, and its pinned graph. |
-| `POST` | `/runs/start` | Start a run; body has `data_id`, `graph_id`, and optional `nodes`. |
-| `POST` | `/runs/rerun` | Rerun one node; body has `data_id`, `graph_id`, and `node`. |
-| `POST` | `/runs/upgrade` | Upgrade an existing run; body has `data_id`, `graph_id`, the newer published `version`, and a `node` selected from the shared nodes. |
-| `POST` | `/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
-| `POST` | `/runs/dryrun` | Prepare targets while mocking predecessors; body has `data_id`, `graph_id`, and optional `nodes`. |
-| `GET` | `/runs/graph_state` | Read state with `data_id` and `graph_id` query parameters. |
-| `GET` | `/graphs/{graph_id}/draft` | Read the editable graph draft. |
-| `PUT` | `/graphs/{graph_id}/draft` | Create or replace the draft. |
-| `POST` | `/graphs/{graph_id}/publish` | Validate and publish the draft as the next graph version. |
-| `POST` | `/task_events` | Emit an event for an existing task; body has `task_id` and `event`. |
-| `GET` | `/jobs` | List jobs; optional `status`, `agent_id`, and `run_id` filters. |
-| `GET` | `/agents` | List agent instances; optional `online=true` or `online=false`. |
-| `POST` | `/jobs/poll` | Long-poll and claim jobs that fit an agent's resources. |
-| `POST` | `/job/cancel` | Cancel a claimed job. |
-| `POST` | `/job/yield` | Yield a claimed job and defer the node. |
-| `POST` | `/job/succeed` | Complete a claimed job successfully. |
-| `POST` | `/job/fail` | Report a claimed job failure. |
-| `POST` | `/job/terminate` | Terminate a claimed job. |
+| `GET` | `/` | Embedded UI, or `rayflow` without `embed-ui`. |
+| `GET` | `/health`, `/api/v1/health` | Liveness probe; returns `ok`. |
+| `GET` | `/api/v1/graphs` | List published graph versions; optional `graph_id` filter. |
+| `GET` | `/api/v1/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
+| `GET` | `/api/v1/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
+| `GET` | `/api/v1/graph_drafts` | List editable DAGs. |
+| `GET` | `/api/v1/runs` | List runs; optional `graph_id` filter. |
+| `GET` | `/api/v1/runs/{run_id}` | Inspect the exact run UUID, its state, and its pinned graph. |
+| `POST` | `/api/v1/runs/start` | Start a run; body has `data_id`, `graph_id`, and optional `nodes`. |
+| `POST` | `/api/v1/runs/rerun` | Rerun one node; body has `data_id`, `graph_id`, and `node`. |
+| `POST` | `/api/v1/runs/upgrade` | Upgrade an existing run; body has `data_id`, `graph_id`, the newer published `version`, and a `node` selected from the shared nodes. |
+| `POST` | `/api/v1/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
+| `POST` | `/api/v1/runs/dryrun` | Prepare targets while mocking predecessors; body has `data_id`, `graph_id`, and optional `nodes`. |
+| `GET` | `/api/v1/runs/graph_state` | Read state with `data_id` and `graph_id` query parameters. |
+| `GET` | `/api/v1/graphs/{graph_id}/draft` | Read the editable graph draft. |
+| `PUT` | `/api/v1/graphs/{graph_id}/draft` | Create or replace the draft. |
+| `POST` | `/api/v1/graphs/{graph_id}/publish` | Validate and publish the draft as the next graph version. |
+| `POST` | `/api/v1/task_events` | Emit an event for an existing task; body has `task_id` and `event`. |
+| `GET` | `/api/v1/jobs` | List jobs; optional `status`, `agent_id`, and `run_id` filters. |
+| `GET` | `/api/v1/agents` | List agent instances; optional `online=true` or `online=false`. |
+| `POST` | `/api/v1/jobs/poll` | Long-poll and claim jobs that fit an agent's resources. |
+| `POST` | `/api/v1/job/cancel` | Cancel a claimed job. |
+| `POST` | `/api/v1/job/yield` | Yield a claimed job and defer the node. |
+| `POST` | `/api/v1/job/succeed` | Complete a claimed job successfully. |
+| `POST` | `/api/v1/job/fail` | Report a claimed job failure. |
+| `POST` | `/api/v1/job/terminate` | Terminate a claimed job. |
 
 Run commands and task events return `202 Accepted` with the appended entry ID.
 In Runtime, click **Upgrade** on a run or its detail page. Select a newer
 published version and an eligible shared restart node, then confirm. The UI
 uses the graph's shared-node calculation and the same node-state rules as rerun.
 Shared nodes include all upstream ancestors of the fork point, including the root.
-To upgrade a run, send `POST /runs/upgrade` with a body such as:
+To upgrade a run, send `POST /api/v1/runs/upgrade` with a body such as:
 
 ```json
 {
@@ -430,7 +469,7 @@ plus the selected node's records from earlier revisions, are marked
 `ineffective = 1`. Their historical statuses remain available, but
 their results cannot satisfy dependencies until those nodes run again. New node
 runs default to `ineffective = 0`. Ancestors and other branches remain unchanged.
-`GET /runs/graph_state` and the state in `GET /runs/{run_id}` include only effective
+`GET /api/v1/runs/graph_state` and the state in `GET /api/v1/runs/{run_id}` include only effective
 node runs, choosing each node's latest effective revision at or before the run's
 current revision. Invalidated history remains stored but is omitted from graph state.
 `node_run.version`
@@ -460,7 +499,7 @@ whether the selected run is the latest version for its data/graph pair.
 Example start request:
 
 ```sh
-curl -X POST http://127.0.0.1:8080/runs/start \
+curl -X POST http://127.0.0.1:8080/api/v1/runs/start \
   -H 'content-type: application/json' \
   -d '{
     "data_id": "00000000-0000-0000-0000-000000000001",
@@ -474,10 +513,10 @@ revision, graph edges, and each node's current state.
 
 ### Graph drafts
 
-Write a complete draft with `PUT /graphs/{graph_id}/draft`:
+Write a complete draft with `PUT /api/v1/graphs/{graph_id}/draft`:
 
 ```sh
-curl -X PUT http://127.0.0.1:8080/graphs/00000001-0000-0000-0000-000000000000/draft \
+curl -X PUT http://127.0.0.1:8080/api/v1/graphs/00000001-0000-0000-0000-000000000000/draft \
   -H 'content-type: application/json' \
   -d '{
     "actor": "editor",
@@ -498,7 +537,7 @@ curl -X PUT http://127.0.0.1:8080/graphs/00000001-0000-0000-0000-000000000000/dr
 ```
 
 Draft reads and writes return the DAG directly. Drafts may be
-temporarily invalid while they are being edited. `POST /graphs/{graph_id}/publish`
+temporarily invalid while they are being edited. `POST /api/v1/graphs/{graph_id}/publish`
 accepts `{ "actor": "publisher" }`, validates the graph (including the cycle
 and single-root rules), assigns the next version, and returns the immutable
 published DAG directly. The version is the maximum published version for that
@@ -507,7 +546,7 @@ the published version. Publishing does not delete the draft.
 
 ## Long polling and claims
 
-`POST /jobs/poll` accepts this request shape:
+`POST /api/v1/jobs/poll` accepts this request shape:
 
 ```json
 {
@@ -539,7 +578,7 @@ server and pilot do not provide a fallback lease.
 Terminal job actions accept `{ "job_id": "...", "agent_id": "..." }` and append
 the corresponding task event. Repeating a terminal action does not append a
 duplicate event. A yielded job releases its claim and moves the node to
-`Pending`; `POST /runs/resume` creates the next task.
+`Pending`; `POST /api/v1/runs/resume` creates the next task.
 
 ### Agent instances
 
@@ -576,12 +615,32 @@ an exclusive OS lock while a job is being coordinated. On startup, `Agentic`
 discovers existing directories, reconnects to containers by UUID, and retries
 unreported results. Keep this directory across agent restarts.
 
+## Agent inputs and outputs
+
+`FileFs` stores bytes separately from `JobFs` under
+`<data_dir>/<graph_run_uuid>/<node_id>/<revision>/`, with `inputs/`, `outputs/`,
+and internal transfer checkpoints. The graph run UUID isolates executions of
+the same graph. Job completion retains this data for downstream work; remove
+completed run directories when they are no longer needed.
+
+Declare outputs on the producer node and bind downstream inputs with
+`source: "producer.output_name"`. In containers, read from
+`$RAYFLOW_INPUT_DIR/<input.file_name>` and write to
+`$RAYFLOW_OUTPUT_DIR/<output.file_name>` (respectively `/data/inputs` and
+`/data/outputs`). Directory outputs include an internal `.rayflow-directory.json`
+manifest. The agent downloads inputs before execution and uploads outputs before
+reporting success, with durable checkpoints for retries.
+
+Configure the server's S3-compatible storage before running nodes with artifacts.
+See [Catalog and object storage](catalog.md#http-api-and-agent-transfers) for
+configuration, endpoints, key format, directory manifests, and local retention.
+
 ## Database changes
 
 For a new database, apply `rayflow.sql` directly. Existing deployments must be
 migrated before restarting binaries when schema changes are introduced. The
 current schema includes versioned graph rows, editable graph drafts,
-`run_config.version`, pinned node configuration, resource requirements, agent
+`run.version` and `run.revision`, pinned node configuration, resource requirements, agent
 claims, persisted job expiry, and `agent_instance` observations. Create the
 `agent_instance` table using its definition in `rayflow.sql` before running the
 updated server; polling now writes this table. No existing rows need backfilling.
@@ -589,3 +648,31 @@ updated server; polling now writes this table. No existing rows need backfilling
 If a migration is needed, inspect the current `rayflow.sql` and apply an
 equivalent `ALTER TABLE` using a backup and a maintenance window. Do not assume
 that an old table name or status value is compatible with the current models.
+
+Migration 9 removes `version` and `revision` from `run_config`, including its
+revision uniqueness index. Run annotation rows and job references are preserved.
+Apply it with `./init-db.sh` before using the updated binaries. New jobs use the
+newest annotation snapshot for their run; execution version and revision remain
+on `run`.
+
+Migration 10 adds the catalog `uploaded` acknowledgement, initially false for
+both new and existing records. Job upload commit sets it true; job downloads
+require it. See [upload acknowledgement](catalog.md#metadata-operations) for
+handling previously stored objects.
+
+Migration 11 changes catalog URLs to `VARCHAR(750)` and adds the unique
+`(url, deleted_at)` key. Before upgrading, resolve any URLs longer than 750
+characters or duplicate URL/deletion pairs while preserving catalog UUIDs and
+file references. The migration does not merge or delete records. Upload prepare
+now creates or reuses the catalog by URL; only commit requires the returned
+catalog UUID. Deploy matching server and agent binaries.
+
+Migrations 12 and 13 remove `deleted_at` from catalog and file metadata. URLs and
+full names become unique across all rows. Resolve historical duplicates before
+upgrading. Rows are preserved, and retained historical rows become readable.
+
+Migrations 14–16 align the authentication tables with the SQL conventions and
+add auto-incrementing numeric primary IDs. The former `auth_user.id` becomes
+unique `user_id`, preserving existing sessions and audit identities. Token and
+state hashes retain unique keys. Apply migrations before deploying matching
+server binaries.

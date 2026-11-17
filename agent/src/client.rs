@@ -12,6 +12,15 @@ pub struct Client {
     server_url: String,
 }
 
+/// Storage metadata and authorization returned by the catalog API.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Transfer {
+    pub catalog: catalog::model::Catalog,
+    pub presigned: catalog::PresignedUrl,
+    #[serde(default)]
+    pub multipart: bool,
+}
+
 #[derive(Serialize)]
 pub struct PollRequest {
     pub agent_id: Uuid,
@@ -25,7 +34,176 @@ pub struct PollResponse {
     pub jobs: Vec<Job>,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct RunView {
+    pub state: RunState,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RunState {
+    pub uuid: Uuid,
+    pub nodes: Vec<NodeState>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NodeState {
+    pub node_id: Uuid,
+    pub version: u64,
+    pub revision: u64,
+    pub status: String,
+    pub ineffective: u32,
+}
+
 impl Client {
+    fn multipart_body(context: &crate::transfer::UploadContext) -> serde_json::Value {
+        serde_json::json!({"job_id": context.job_id, "agent_id": context.agent_id, "key": context.key, "catalog_uuid": context.catalog_id})
+    }
+
+    pub(crate) async fn multipart_create(
+        &self,
+        context: &crate::transfer::UploadContext,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        Ok(self
+            .artifact_request(
+                context.job_id,
+                "multipart/create",
+                &Self::multipart_body(context),
+            )
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub(crate) async fn multipart_upload(
+        &self,
+        context: &crate::transfer::UploadContext,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        let mut body = Self::multipart_body(context);
+        body["upload_id"] = serde_json::json!(upload_id);
+        body["part_number"] = serde_json::json!(part_number);
+        Ok(self
+            .artifact_request(context.job_id, "multipart/upload", &body)
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub(crate) async fn multipart_complete(
+        &self,
+        context: &crate::transfer::UploadContext,
+        upload_id: &str,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        let mut body = Self::multipart_body(context);
+        body["upload_id"] = serde_json::json!(upload_id);
+        Ok(self
+            .artifact_request(context.job_id, "multipart/complete", &body)
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub(crate) async fn multipart_abort(
+        &self,
+        context: &crate::transfer::UploadContext,
+        upload_id: &str,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        let mut body = Self::multipart_body(context);
+        body["upload_id"] = serde_json::json!(upload_id);
+        Ok(self
+            .artifact_request(context.job_id, "multipart/abort", &body)
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub(crate) async fn run_state(&self, run_id: Uuid, revision: u64) -> Result<RunState, Error> {
+        let view: RunView = self
+            .http
+            .get(format!("{}/runs/{run_id}", self.server_url))
+            .query(&[("revision", revision)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if view.state.uuid != run_id {
+            return Err(Error::Artifact("server returned a different run".into()));
+        }
+        Ok(view.state)
+    }
+    /// Upserts pending catalog metadata and returns its signed PUT URL.
+    pub async fn prepare_upload(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        key: &str,
+        size: u64,
+        format: &str,
+    ) -> Result<Transfer, Error> {
+        let body = serde_json::json!({"job_id": job_id, "agent_id": agent_id, "key": key, "size": size, "format": format});
+        Ok(self
+            .artifact_request(job_id, "prepare", &body)
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub async fn commit_upload(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        key: &str,
+        catalog_uuid: Uuid,
+        size: u64,
+        format: &str,
+    ) -> Result<(), Error> {
+        let body = serde_json::json!({"job_id":job_id,"agent_id":agent_id,"key":key,"catalog_uuid":catalog_uuid,"size":size,"format":format});
+        self.artifact_request(job_id, "commit", &body).await?;
+        Ok(())
+    }
+
+    pub async fn download_input(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        key: &str,
+    ) -> Result<Option<Transfer>, Error> {
+        let body = serde_json::json!({"job_id":job_id,"agent_id":agent_id,"key":key});
+        let response = self
+            .http
+            .post(format!("{}/catalog/download", self.server_url))
+            .json(&body)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(Error::ClaimLost(job_id));
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.json().await?))
+    }
+
+    async fn artifact_request(
+        &self,
+        job_id: Uuid,
+        action: &str,
+        request: &impl Serialize,
+    ) -> Result<reqwest::Response, Error> {
+        let response = self
+            .http
+            .post(format!("{}/catalog/{action}", self.server_url))
+            .json(request)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(Error::ClaimLost(job_id));
+        }
+        Ok(response.error_for_status()?)
+    }
+
     pub fn new(settings: &Settings) -> Result<Self, Error> {
         if settings.request_timeout.is_zero() {
             return Err(Error::Settings("request timeout must be positive"));
@@ -46,7 +224,7 @@ impl Client {
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(settings.request_timeout)
                 .build()?,
-            server_url: settings.server_url.trim_end_matches('/').to_owned(),
+            server_url: format!("{}/api/v1", settings.server_url.trim_end_matches('/')),
         })
     }
 

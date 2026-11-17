@@ -100,7 +100,7 @@ async fn handle(
         )
             .into_response(),
         path if path.starts_with("/images/") => Json(json!({"Id": "image"})).into_response(),
-        "/jobs/poll" => {
+        "/api/v1/jobs/poll" => {
             if state.unavailable.load(Ordering::SeqCst)
                 || state.fail_poll.swap(false, Ordering::SeqCst)
             {
@@ -210,7 +210,7 @@ async fn handle(
             state.names.lock().unwrap().retain(|_, value| value != &id);
             StatusCode::NO_CONTENT.into_response()
         }
-        "/job/succeed" | "/job/fail" => {
+        "/api/v1/job/succeed" | "/api/v1/job/fail" => {
             if state.unavailable.load(Ordering::SeqCst)
                 || state.fail_report.swap(false, Ordering::SeqCst)
             {
@@ -463,12 +463,12 @@ async fn client_polls_and_reports_without_an_agent() {
         async move {
             sender.send((uri.path().to_owned(), body)).unwrap();
             match uri.path() {
-                "/jobs/poll" => Json(json!({
+                "/api/v1/jobs/poll" => Json(json!({
                     "jobs": [job],
                 }))
                 .into_response(),
-                "/job/fail" => StatusCode::NO_CONTENT.into_response(),
-                "/job/succeed" => StatusCode::CONFLICT.into_response(),
+                "/api/v1/job/fail" => StatusCode::NO_CONTENT.into_response(),
+                "/api/v1/job/succeed" => StatusCode::CONFLICT.into_response(),
                 _ => StatusCode::NOT_FOUND.into_response(),
             }
         }
@@ -496,7 +496,7 @@ async fn client_polls_and_reports_without_an_agent() {
     assert_eq!(response.jobs.len(), 1);
     assert_eq!(response.jobs[0].uuid, job_id);
     let (path, body) = requests.try_recv().unwrap();
-    assert_eq!(path, "/jobs/poll");
+    assert_eq!(path, "/api/v1/jobs/poll");
     assert_eq!(
         body,
         json!({ "agent_id": agent_id, "batch": 3, "resources": resources, "active_jobs": [active_job] })
@@ -504,12 +504,12 @@ async fn client_polls_and_reports_without_an_agent() {
 
     client.fail(agent_id, job_id).await.unwrap();
     let (path, body) = requests.try_recv().unwrap();
-    assert_eq!(path, "/job/fail");
+    assert_eq!(path, "/api/v1/job/fail");
     assert_eq!(body, json!({ "agent_id": agent_id, "job_id": job_id }));
 
     let error = client.succeed(agent_id, job_id).await.unwrap_err();
     assert!(matches!(error, agent::errors::Error::ClaimLost(id) if id == job_id));
-    assert_eq!(requests.try_recv().unwrap().0, "/job/succeed");
+    assert_eq!(requests.try_recv().unwrap().0, "/api/v1/job/succeed");
     assert!(workdir.path().read_dir().unwrap().next().is_none());
     server.abort();
 }
@@ -522,7 +522,7 @@ async fn polling_continues_during_parallel_starts_and_execution_without_duplicat
             let mut agent = RunningAgent::new(jobs.clone(), 0, false, true).await;
             agent.event("/start").await;
             agent.event("/start").await;
-            let poll = agent.event("/jobs/poll").await;
+            let poll = agent.event("/api/v1/jobs/poll").await;
             let active: HashSet<Uuid> =
                 serde_json::from_value::<Vec<Uuid>>(poll.body["active_jobs"].clone())
                     .unwrap()
@@ -533,15 +533,15 @@ async fn polling_continues_during_parallel_starts_and_execution_without_duplicat
 
             agent.state.start.add_permits(2);
             agent.wait_running(2).await;
-            let poll = agent.event("/jobs/poll").await;
+            let poll = agent.event("/api/v1/jobs/poll").await;
             assert_eq!(poll.body["active_jobs"].as_array().unwrap().len(), 2);
             agent.finish_jobs();
-            agent.event("/job/succeed").await;
-            agent.event("/job/succeed").await;
-            agent.event("/job/succeed").await;
+            agent.event("/api/v1/job/succeed").await;
+            agent.event("/api/v1/job/succeed").await;
+            agent.event("/api/v1/job/succeed").await;
             timeout(Duration::from_secs(5), async {
                 loop {
-                    let poll = agent.event("/jobs/poll").await;
+                    let poll = agent.event("/api/v1/jobs/poll").await;
                     if poll.body["active_jobs"].as_array().unwrap().is_empty() {
                         break;
                     }
@@ -563,12 +563,12 @@ async fn polling_retries_errors_and_reports_nonzero_exit_codes() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let mut agent = RunningAgent::new(vec![job()], 7, true, false).await;
-            agent.event("/jobs/poll").await;
+            agent.event("/api/v1/jobs/poll").await;
             agent.event("/start").await;
             agent.state.start.add_permits(1);
             agent.wait_running(1).await;
             agent.finish_jobs();
-            agent.event("/job/fail").await;
+            agent.event("/api/v1/job/fail").await;
             assert!(!agent.agent.is_finished());
         })
         .await;
@@ -584,9 +584,9 @@ async fn successful_polls_do_not_extend_the_execution_timeout() {
             agent.event("/start").await;
             agent.state.start.add_permits(1);
             agent.wait_running(1).await;
-            agent.event("/jobs/poll").await;
+            agent.event("/api/v1/jobs/poll").await;
             agent.event("/kill").await;
-            agent.event("/job/fail").await;
+            agent.event("/api/v1/job/fail").await;
             let result: Value = serde_json::from_slice(
                 &std::fs::read(
                     agent
@@ -616,10 +616,10 @@ async fn a_server_outage_kills_at_expiry_and_retries_the_failure_report() {
             agent.wait_running(1).await;
             agent.state.unavailable.store(true, Ordering::SeqCst);
             agent.event("/kill").await;
-            agent.event("/job/fail").await;
+            agent.event("/api/v1/job/fail").await;
             assert!(agent.state.completed.lock().unwrap().is_empty());
             agent.state.unavailable.store(false, Ordering::SeqCst);
-            agent.event("/job/fail").await;
+            agent.event("/api/v1/job/fail").await;
             assert!(!agent.agent.is_finished());
         })
         .await;
@@ -636,7 +636,7 @@ async fn startup_finishing_after_expiry_kills_the_container() {
             tokio::time::sleep(Duration::from_millis(350)).await;
             agent.state.start.add_permits(1);
             agent.event("/kill").await;
-            agent.event("/job/fail").await;
+            agent.event("/api/v1/job/fail").await;
             assert!(!agent.agent.is_finished());
         })
         .await;
@@ -649,7 +649,7 @@ async fn expired_job_fails_without_starting_a_container() {
             let mut job = job();
             job.expired_at = Some(Timestamp::now() - Duration::from_secs(1));
             let mut agent = RunningAgent::new(vec![job], 0, false, false).await;
-            agent.event("/job/fail").await;
+            agent.event("/api/v1/job/fail").await;
             assert!(
                 agent
                     .state
@@ -781,7 +781,7 @@ async fn shutdown_detaches_and_restart_recovers_a_running_container() {
             fixture.restart().await;
             fixture.wait_running(1).await;
             fixture.finish_jobs();
-            fixture.event("/job/succeed").await;
+            fixture.event("/api/v1/job/succeed").await;
             assert_eq!(fixture.state.creates.load(Ordering::SeqCst), 1);
         })
         .await;
@@ -826,7 +826,7 @@ async fn recovery_finds_running_container_when_metadata_was_not_written() {
             assert_eq!(fixture.state.creates.load(Ordering::SeqCst), 1);
             assert_eq!(metadata.id, format!("rayflow-{}", job.uuid));
             fixture.finish_jobs();
-            fixture.event("/job/succeed").await;
+            fixture.event("/api/v1/job/succeed").await;
         })
         .await;
 }
@@ -842,7 +842,7 @@ async fn recovery_retries_a_durable_result_without_starting_again() {
             fixture.wait_running(1).await;
             fixture.state.unavailable.store(true, Ordering::SeqCst);
             fixture.finish_jobs();
-            fixture.event("/job/fail").await;
+            fixture.event("/api/v1/job/fail").await;
             assert_eq!(
                 fixture
                     .job_fs(job.uuid)
@@ -854,13 +854,13 @@ async fn recovery_retries_a_durable_result_without_starting_again() {
             );
 
             fixture.restart().await;
-            fixture.event("/job/fail").await;
+            fixture.event("/api/v1/job/fail").await;
             fixture.state.unavailable.store(false, Ordering::SeqCst);
-            fixture.event("/job/fail").await;
+            fixture.event("/api/v1/job/fail").await;
             assert_eq!(fixture.state.creates.load(Ordering::SeqCst), 1);
             fixture.wait_cleaned(job.uuid).await;
             fixture.restart().await;
-            fixture.event("/jobs/poll").await;
+            fixture.event("/api/v1/jobs/poll").await;
             assert_eq!(fixture.state.creates.load(Ordering::SeqCst), 1);
         })
         .await;
@@ -892,7 +892,7 @@ async fn recovery_enforces_persisted_expiry_during_an_api_outage() {
 
             fixture.restart().await;
             fixture.event("/kill").await;
-            fixture.event("/job/fail").await;
+            fixture.event("/api/v1/job/fail").await;
             assert_eq!(
                 fixture
                     .job_fs(job.uuid)
@@ -904,7 +904,7 @@ async fn recovery_enforces_persisted_expiry_during_an_api_outage() {
             );
             assert_eq!(fixture.state.creates.load(Ordering::SeqCst), 1);
             fixture.state.unavailable.store(false, Ordering::SeqCst);
-            fixture.event("/job/fail").await;
+            fixture.event("/api/v1/job/fail").await;
         })
         .await;
 }
@@ -948,7 +948,7 @@ async fn native_events_finish_jobs_and_reconnect_after_stream_closes() {
                 .to_owned(),
         )
         .unwrap();
-            fixture.event("/job/fail").await;
+            fixture.event("/api/v1/job/fail").await;
             assert_eq!(fixture.state.creates.load(Ordering::SeqCst), 1);
         })
         .await;

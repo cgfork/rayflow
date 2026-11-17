@@ -6,7 +6,7 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`/api${path}`, {
+  const response = await fetch(`/api/v1${path}`, {
     ...options,
     credentials: 'same-origin',
     headers: { 'X-Rayflow-Request': '1', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },

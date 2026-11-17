@@ -620,8 +620,6 @@ mod tests {
             .unwrap();
         let run_config = RunConfig::create()
             .run_id(run.uuid)
-            .version(run.version)
-            .revision(1)
             .annotation(toasty::stmt::Json(std::collections::HashMap::new()))
             .created_at(now)
             .updated_at(now)

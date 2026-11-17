@@ -37,6 +37,57 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "authentication",
         include_str!("../migrations/0007_authentication.sql"),
     ),
+    MigrationFile::new(8, "catalog", include_str!("../migrations/0008_catalog.sql")),
+    MigrationFile::new(
+        9,
+        "run_config_execution_fields",
+        include_str!("../migrations/0009_run_config_execution_fields.sql"),
+    ),
+    MigrationFile::new(
+        10,
+        "catalog_uploaded",
+        include_str!("../migrations/0010_catalog_uploaded.sql"),
+    ),
+    MigrationFile::new(
+        11,
+        "catalog_url",
+        include_str!("../migrations/0011_catalog_url.sql"),
+    ),
+    MigrationFile::new(
+        12,
+        "catalog_remove_deleted_at",
+        include_str!("../migrations/0012_catalog_remove_deleted_at.sql"),
+    ),
+    MigrationFile::new(
+        13,
+        "file_remove_deleted_at",
+        include_str!("../migrations/0013_file_remove_deleted_at.sql"),
+    ),
+    MigrationFile::new(
+        14,
+        "auth_user",
+        include_str!("../migrations/0014_auth_user.sql"),
+    ),
+    MigrationFile::new(
+        15,
+        "auth_session",
+        include_str!("../migrations/0015_auth_session.sql"),
+    ),
+    MigrationFile::new(
+        16,
+        "auth_login_flow",
+        include_str!("../migrations/0016_auth_login_flow.sql"),
+    ),
+    MigrationFile::new(
+        17,
+        "catalog_key",
+        include_str!("../migrations/0017_catalog_key.sql"),
+    ),
+    MigrationFile::new(
+        18,
+        "file_fullpath",
+        include_str!("../migrations/0018_file_fullpath.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

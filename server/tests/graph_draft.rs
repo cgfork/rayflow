@@ -192,7 +192,7 @@ async fn graph_draft_api_round_trips_and_publishes() {
     };
     let graph_id = Uuid::new_v4();
     let draft = graph(graph_id);
-    let path = format!("/graphs/{graph_id}/draft");
+    let path = format!("/api/v1/graphs/{graph_id}/draft");
 
     let response = router(app.clone())
         .oneshot(
@@ -234,7 +234,7 @@ async fn graph_draft_api_round_trips_and_publishes() {
     assert_eq!(stored.updated_by, "editor");
     assert_eq!(stored.created_by, "editor");
 
-    let publish_path = format!("/graphs/{graph_id}/publish");
+    let publish_path = format!("/api/v1/graphs/{graph_id}/publish");
     let response = router(app.clone())
         .oneshot(
             Request::post(&publish_path)
@@ -258,7 +258,7 @@ async fn graph_draft_api_round_trips_and_publishes() {
     assert_eq!(stored.updated_by, "publisher");
     assert_eq!(stored.created_by, "publisher");
 
-    let graph_path = format!("/graphs/{graph_id}?version=1");
+    let graph_path = format!("/api/v1/graphs/{graph_id}?version=1");
     let response = router(app)
         .oneshot(Request::get(&graph_path).body(Body::empty()).unwrap())
         .await
@@ -280,14 +280,20 @@ async fn graph_draft_api_rejects_invalid_publish_and_missing_drafts() {
     };
     let graph_id = Uuid::new_v4();
     let draft = graph(graph_id);
-    let path = format!("/graphs/{graph_id}/draft");
-    let publish_path = format!("/graphs/{graph_id}/publish");
+    let path = format!("/api/v1/graphs/{graph_id}/draft");
+    let publish_path = format!("/api/v1/graphs/{graph_id}/publish");
 
     let response = router(app.clone())
         .oneshot(Request::get(&path).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error_code"], "RAYFLOW_GRAPH_DRAFT_NOT_FOUND");
+    assert_eq!(body["error"], format!("graph draft not found: {graph_id}"));
 
     let mut invalid = draft;
     invalid
@@ -320,4 +326,10 @@ async fn graph_draft_api_rejects_invalid_publish_and_missing_drafts() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error_code"], "RAYFLOW_INVALID_GRAPH");
+    assert_eq!(body["error"], "invalid graph: graph contains a cycle");
 }

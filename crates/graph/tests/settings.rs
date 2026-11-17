@@ -3,7 +3,7 @@ use std::time::Duration;
 use graph::{
     Diff,
     types::{DAG, Input, Kind, Node, NodeSettings, Output, Resource},
-    validator::validate_workflow,
+    validator::{ValidationError, WorkflowValidationError, validate_workflow},
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -32,6 +32,17 @@ fn workflow() -> DAG {
         nodes: vec![node("start")],
         ..DAG::default()
     }
+}
+
+#[test]
+fn workflow_validation_retains_structural_errors() {
+    let mut graph = workflow();
+    let id = graph.nodes[0].id;
+    graph.edges.push((id, id));
+    assert_eq!(
+        validate_workflow(&graph),
+        Err(WorkflowValidationError::Structure(ValidationError::Cycle))
+    );
 }
 
 #[test]

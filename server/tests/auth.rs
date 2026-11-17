@@ -81,7 +81,7 @@ async fn login(router: &Router) -> (String, User) {
     let (status, headers, value) = request(
         router,
         "POST",
-        "/auth/login",
+        "/api/v1/auth/login",
         json!({"provider":"local", "username":"alice", "password":"correct password"}),
         None,
         true,
@@ -104,7 +104,13 @@ async fn login_protects_direct_api_requests_and_records_verified_audit_identity(
     let Some((router, app, mut db)) = setup().await else {
         return;
     };
-    for path in ["/graphs", "/runs", "/agents", "/jobs", "/auth/me"] {
+    for path in [
+        "/api/v1/graphs",
+        "/api/v1/runs",
+        "/api/v1/agents",
+        "/api/v1/jobs",
+        "/api/v1/auth/me",
+    ] {
         assert_eq!(
             request(&router, "GET", path, Value::Null, None, false)
                 .await
@@ -113,8 +119,15 @@ async fn login_protects_direct_api_requests_and_records_verified_audit_identity(
             "{path}"
         );
     }
-    let (status, _, providers) =
-        request(&router, "GET", "/auth/providers", Value::Null, None, false).await;
+    let (status, _, providers) = request(
+        &router,
+        "GET",
+        "/api/v1/auth/providers",
+        Value::Null,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(providers["company_name"], "Example company");
     assert!(!providers.to_string().contains("password_hash"));
@@ -124,7 +137,7 @@ async fn login_protects_direct_api_requests_and_records_verified_audit_identity(
         request(
             &router,
             "GET",
-            "/auth/me",
+            "/api/v1/auth/me",
             Value::Null,
             Some(&cookie),
             false
@@ -134,9 +147,16 @@ async fn login_protects_direct_api_requests_and_records_verified_audit_identity(
         user.id
     );
     assert_eq!(
-        request(&router, "GET", "/graphs", Value::Null, Some(&cookie), false)
-            .await
-            .0,
+        request(
+            &router,
+            "GET",
+            "/api/v1/graphs",
+            Value::Null,
+            Some(&cookie),
+            false
+        )
+        .await
+        .0,
         StatusCode::OK
     );
     let graph = graph::types::DAG {
@@ -160,7 +180,7 @@ async fn login_protects_direct_api_requests_and_records_verified_audit_identity(
         node_count: 1,
         ..Default::default()
     };
-    let path = format!("/graphs/{}/draft", graph.id);
+    let path = format!("/api/v1/graphs/{}/draft", graph.id);
     let (status, _, value) = request(
         &router,
         "PUT",
@@ -178,7 +198,7 @@ async fn login_protects_direct_api_requests_and_records_verified_audit_identity(
     let (status, _, published) = request(
         &router,
         "POST",
-        &format!("/graphs/{}/publish", graph.id),
+        &format!("/api/v1/graphs/{}/publish", graph.id),
         json!({"actor":"forged-publisher"}),
         Some(&cookie),
         true,
@@ -203,7 +223,7 @@ async fn login_protects_direct_api_requests_and_records_verified_audit_identity(
         request(
             &fail_closed,
             "GET",
-            "/graphs",
+            "/api/v1/graphs",
             Value::Null,
             Some(&cookie),
             false
@@ -225,7 +245,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
         request(
             &router,
             "POST",
-            "/auth/login",
+            "/api/v1/auth/login",
             credentials.clone(),
             None,
             false
@@ -243,7 +263,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
             request(
                 &router,
                 "POST",
-                "/auth/login",
+                "/api/v1/auth/login",
                 json!({"provider":"local", "username":username, "password":password}),
                 None,
                 true
@@ -258,7 +278,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
         request(
             &router,
             "POST",
-            "/auth/logout",
+            "/api/v1/auth/logout",
             json!({}),
             Some(&cookie),
             false
@@ -270,7 +290,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
     let (status, headers, _) = request(
         &router,
         "POST",
-        "/auth/login",
+        "/api/v1/auth/login",
         credentials,
         Some(&cookie),
         true,
@@ -288,7 +308,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
         request(
             &router,
             "GET",
-            "/auth/me",
+            "/api/v1/auth/me",
             Value::Null,
             Some(&cookie),
             false
@@ -307,7 +327,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
         request(
             &router,
             "GET",
-            "/auth/me",
+            "/api/v1/auth/me",
             Value::Null,
             Some(rotated),
             false
@@ -320,7 +340,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
     let response = request(
         &router,
         "POST",
-        "/auth/logout",
+        "/api/v1/auth/logout",
         json!({}),
         Some(&cookie),
         true,
@@ -337,7 +357,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
         request(
             &router,
             "GET",
-            "/auth/me",
+            "/api/v1/auth/me",
             Value::Null,
             Some(&cookie),
             false
@@ -346,7 +366,7 @@ async fn credentials_csrf_expiry_rotation_and_logout_are_enforced() {
         .0,
         StatusCode::UNAUTHORIZED
     );
-    let cross_origin = Request::post("/auth/logout")
+    let cross_origin = Request::post("/api/v1/auth/logout")
         .header("x-rayflow-request", "1")
         .header(header::ORIGIN, "https://evil.example")
         .body(Body::empty())
@@ -363,16 +383,20 @@ async fn fleet_credentials_cannot_access_management_or_bypass_login() {
         return;
     };
     for (method, path, expected) in [
-        ("GET", "/graphs", StatusCode::OK),
+        ("GET", "/api/v1/graphs", StatusCode::OK),
         (
             "GET",
-            "/graphs/00000000-0000-0000-0000-000000000000/draft",
+            "/api/v1/graphs/00000000-0000-0000-0000-000000000000/draft",
             StatusCode::FORBIDDEN,
         ),
-        ("GET", "/runs", StatusCode::FORBIDDEN),
-        ("POST", "/runs/start", StatusCode::FORBIDDEN),
-        ("POST", "/task_events", StatusCode::FORBIDDEN),
-        ("POST", "/jobs/poll", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ("GET", "/api/v1/runs", StatusCode::FORBIDDEN),
+        ("POST", "/api/v1/runs/start", StatusCode::FORBIDDEN),
+        ("POST", "/api/v1/task_events", StatusCode::FORBIDDEN),
+        (
+            "POST",
+            "/api/v1/jobs/poll",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
     ] {
         let request = Request::builder()
             .method(method)
@@ -389,7 +413,7 @@ async fn fleet_credentials_cannot_access_management_or_bypass_login() {
             "{path}"
         );
     }
-    let request = Request::get("/graphs")
+    let request = Request::get("/api/v1/graphs")
         .header(header::AUTHORIZATION, "Bearer wrong")
         .body(Body::empty())
         .unwrap();

@@ -61,7 +61,7 @@ async fn explicit_job_actions_send_ids_and_preserve_http_errors() {
                     if error.status().unwrap().as_u16() == status)),
             }
             let (path, body) = requests.try_recv().unwrap();
-            assert_eq!(path, format!("/job/{action}"));
+            assert_eq!(path, format!("/api/v1/job/{action}"));
             assert_eq!(body, json!({ "agent_id": agent_id, "job_id": job_id }));
         }
     }
@@ -98,7 +98,7 @@ async fn graphs_reads_one_page_directly_and_preserves_cursor_and_errors() {
     let response_status = Arc::new(AtomicU16::new(200));
     let status = response_status.clone();
     let router = Router::new().route(
-        "/graphs",
+        "/api/v1/graphs",
         axum::routing::get(move |uri: Uri| {
             let sender = sender.clone();
             let definition = definition.clone();
@@ -173,7 +173,7 @@ async fn graphs_reads_one_page_directly_and_preserves_cursor_and_errors() {
         .unwrap();
     assert!(empty.items.is_empty());
     assert_eq!(empty.next_cursor, None);
-    assert_eq!(requests.try_recv().unwrap().path(), "/graphs");
+    assert_eq!(requests.try_recv().unwrap().path(), "/api/v1/graphs");
     assert!(requests.try_recv().is_err());
 
     response_status.store(503, Ordering::SeqCst);

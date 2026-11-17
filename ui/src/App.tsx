@@ -46,7 +46,7 @@ export default function App({ user, logout }: { user: User | null; logout: () =>
     let timer: ReturnType<typeof setTimeout>;
     async function check() {
       try {
-        const response = await fetch('/api/health', { signal: controller.signal });
+        const response = await fetch('/api/v1/health', { signal: controller.signal });
         const body = await response.text();
         if (!controller.signal.aborted) setConnected(response.ok && body.trim() === 'ok');
       } catch { if (!controller.signal.aborted) setConnected(false); }

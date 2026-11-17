@@ -173,7 +173,7 @@ start server env RAYFLOW_ADDR="127.0.0.1:$api_port" "$target_dir/debug/server"
 wait_for_health "$api_url/health"
 start pilot "$target_dir/debug/pilot"
 start ui env RAYFLOW_API_URL="$api_url" npm run dev --prefix ui -- --port "$ui_port" --strictPort
-wait_for_health "$ui_url/api/health"
+wait_for_health "$ui_url/api/v1/health"
 if "$with_agent"; then
     start agent env RAYFLOW_AGENT_ID="$agent_id" RAYFLOW_AGENT_SERVER_URL="$api_url" "$target_dir/debug/agent"
 fi

@@ -72,7 +72,7 @@ export default function Auth() {
     {loading ? <p role="status">Loading sign-in…</p> : <>
       {error && <p className="login-error" role="alert">{error}</p>}
       {!config ? <button className="button primary" onClick={() => { setError(''); setRetry((value) => value + 1); }}>Retry connection</button> : <>
-        {config.providers.some((item) => item.kind === 'redirect') && <a className="button primary sso-button" href="/api/auth/oidc/login">Continue with company SSO<ArrowRight size={16} /></a>}
+        {config.providers.some((item) => item.kind === 'redirect') && <a className="button primary sso-button" href="/api/v1/auth/oidc/login">Continue with company SSO<ArrowRight size={16} /></a>}
         {passwords.length > 0 && <form onSubmit={login}>
           {config.providers.some((item) => item.kind === 'redirect') && <div className="login-divider">or use your account</div>}
           {passwords.length > 1 && <label>Account type<select value={provider} onChange={(event) => setProvider(event.target.value)} disabled={busy}>{passwords.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>}

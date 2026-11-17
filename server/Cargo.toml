@@ -5,7 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+embed-ui = ["dep:rust-embed", "dep:mime_guess"]
+
 [dependencies]
+rust-embed = { version = "8", optional = true, features = ["debug-embed"] }
+mime_guess = { version = "2", optional = true }
+catalog = { workspace = true, features = ["s3"] }
 event = { workspace = true }
 axum = { workspace = true }
 fastrand = { workspace = true }

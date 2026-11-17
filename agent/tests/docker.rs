@@ -96,6 +96,7 @@ impl Drop for MockDaemon {
 
 fn spec() -> DockerSpec {
     DockerSpec {
+        files: None,
         name: "rayflow-test".into(),
         image: "alpine:latest".into(),
         command: Some(vec!["sh".into(), "-c".into(), "echo hello".into()]),
@@ -132,6 +133,24 @@ fn docker_spec_reads_configuration_from_the_pinned_job() {
     assert_eq!(actual.env, Some(vec!["MODE=test".into()]));
     assert_eq!(actual.working_dir, Some("/tmp".into()));
     assert_eq!((actual.cpu_cores, actual.memory_bytes), (2, 2048));
+    let provider = DockerContainerd::new(
+        Docker::connect_with_http("http://127.0.0.1:2375", 5, API_DEFAULT_VERSION).unwrap(),
+    );
+    let file_spec = provider
+        .spec_with_files(
+            &configured,
+            std::path::Path::new("/srv/inputs"),
+            std::path::Path::new("/srv/outputs"),
+        )
+        .unwrap();
+    assert_eq!(
+        file_spec.env.unwrap(),
+        vec![
+            "MODE=test",
+            "RAYFLOW_INPUT_DIR=/data/inputs",
+            "RAYFLOW_OUTPUT_DIR=/data/outputs"
+        ]
+    );
     value["node_config"]["config"]["command"] = json!("invalid");
     let invalid: scheduler::Job = serde_json::from_value(value.clone()).unwrap();
     assert!(DockerSpec::try_from(&invalid).is_err());
@@ -307,4 +326,33 @@ fn docker_provider_and_container_are_thread_safe() {
     fn assert_container<T: Container + Send + Sync>() {}
     assert_provider::<DockerContainerd>();
     assert_container::<DockerContainer>();
+}
+
+#[tokio::test]
+async fn mounts_declared_artifacts_with_read_only_inputs() {
+    let mut daemon = MockDaemon::new(vec![(
+        StatusCode::CREATED,
+        json!({"Id":"with-files","Warnings":[]}),
+    )])
+    .await;
+    let provider = DockerContainerd::new(daemon.docker.clone());
+    let mut spec = spec();
+    spec.files = Some(agent::containerd::docker::DockerFiles {
+        inputs: "/srv/data/run/node/2/inputs".into(),
+        outputs: "/srv/data/run/node/2/outputs".into(),
+    });
+    provider.create(spec).await.unwrap();
+    let body = daemon
+        .request(Method::POST, "/containers/create")
+        .body
+        .unwrap();
+    let mounts = body["HostConfig"]["Mounts"].as_array().unwrap();
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0]["Type"], "bind");
+    assert_eq!(mounts[0]["Source"], "/srv/data/run/node/2/inputs");
+    assert_eq!(mounts[0]["Target"], "/data/inputs");
+    assert_eq!(mounts[0]["ReadOnly"], true);
+    assert_eq!(mounts[1]["Source"], "/srv/data/run/node/2/outputs");
+    assert_eq!(mounts[1]["Target"], "/data/outputs");
+    assert_eq!(mounts[1]["ReadOnly"], false);
 }

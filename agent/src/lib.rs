@@ -17,9 +17,12 @@ pub mod agentic;
 pub mod client;
 pub mod containerd;
 pub mod errors;
+pub mod filed;
+pub mod filefs;
 pub mod graphfs;
 pub mod jobfs;
 pub mod settings;
+pub mod transfer;
 
 pub use agentd::{AgentResult, Agentd, JobOutcome, StopReason};
 pub use agentic::Agentic;

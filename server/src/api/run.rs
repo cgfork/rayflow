@@ -43,16 +43,22 @@ async fn list_runs<S>(
     app.list_runs(page, query.graph_id).await.map(Json)
 }
 
+#[derive(Debug, Deserialize)]
+struct InspectRunQuery {
+    revision: Option<u64>,
+}
+
 async fn inspect_run<S>(
     State(app): State<App<S>>,
     Path(id): Path<Uuid>,
+    Query(query): Query<InspectRunQuery>,
 ) -> Result<Json<RunView>, AppError>
 where
     S: GraphStore<Uuid, G = DAG> + Clone,
     S::load(..): Send,
     S::Err: Send + Sync + 'static,
 {
-    app.inspect_run(id).await.map(Json)
+    app.inspect_run_at(id, query.revision).await.map(Json)
 }
 
 /// Request body for `POST /runs/start`.

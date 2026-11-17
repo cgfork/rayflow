@@ -7,10 +7,9 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     server: {
       proxy: {
-        '/api': {
+        '/api/v1': {
           target: env.RAYFLOW_API_URL || 'http://127.0.0.1:8080',
           changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/api/, ''),
         },
       },
     },
