@@ -36,12 +36,14 @@ pub trait CatalogSystem {
     type CatalogOptionalData<'a>: 'a
     where
         Self: 'a;
+    /// Inserts a catalog or updates the existing record identified by its key.
     async fn upsert_catalog<'a, C: Into<Self::CatalogOptionalData<'a>>>(
         &'a mut self,
         data: C,
     ) -> Result<Self::CatalogId<'a>, Self::Err>
     where
         Self: 'a;
+    /// Applies partial metadata changes to an existing catalog identity.
     async fn update_catalog<'a, C: Into<Self::CatalogOptionalData<'a>>>(
         &'a mut self,
         id: Self::CatalogId<'a>,
@@ -49,12 +51,14 @@ pub trait CatalogSystem {
     ) -> Result<(), Self::Err>
     where
         Self: 'a;
+    /// Loads a catalog by its store-specific identity.
     async fn get_catalog<'a>(
         &'a mut self,
         id: Self::CatalogId<'a>,
     ) -> Result<Option<Self::CatalogData<'a>>, Self::Err>
     where
         Self: 'a;
+    /// Loads a catalog by its globally unique logical key.
     async fn get_catalog_by_key<'a>(
         &'a mut self,
         key: &str,
@@ -75,12 +79,14 @@ pub trait FileSystem: CatalogSystem {
     type FileOptionalData<'a>: 'a
     where
         Self: 'a;
+    /// Inserts or updates a file identified by its node-run and filename pair.
     async fn upsert_file<'a, F: Into<Self::FileOptionalData<'a>>>(
         &'a mut self,
         data: F,
     ) -> Result<Self::FileId<'a>, Self::Err>
     where
         Self: 'a;
+    /// Applies partial metadata changes to an existing file identity.
     async fn update_file<'a, F: Into<Self::FileOptionalData<'a>>>(
         &'a mut self,
         id: Self::FileId<'a>,
@@ -88,12 +94,14 @@ pub trait FileSystem: CatalogSystem {
     ) -> Result<(), Self::Err>
     where
         Self: 'a;
+    /// Loads a file by identity, including its optional catalog edge.
     async fn get_file<'a>(
         &'a mut self,
         id: Self::FileId<'a>,
     ) -> Result<Option<FileWithCatalog<Self::FileData<'a>, Option<Self::CatalogData<'a>>>>, Self::Err>
     where
         Self: 'a;
+    /// Loads a file by its unique `(node_run_id, filename)` key.
     async fn get_file_by_node_run_filename<'a>(
         &'a mut self,
         node_run_id: uuid::Uuid,
