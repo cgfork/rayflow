@@ -1,5 +1,6 @@
 mod agent;
 mod catalog;
+mod error;
 mod graph_draft;
 #[path = "graph.rs"]
 mod graph_read;
@@ -11,14 +12,11 @@ mod state;
 mod task_event;
 
 pub use agent::{AgentInstance, AgentView};
+pub use error::{AppError, ErrorBody};
 pub use offset::Offsets;
 pub use pagination::{Page, PageQuery};
 pub use state::{GraphState, NodeState, RunView};
 
-use axum::Json;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use serde::Serialize;
 use toasty::Db;
 use uuid::Uuid;
 
@@ -100,146 +98,6 @@ impl<S> App<S> {
     }
 }
 
-/// Error returned by an app operation.
-#[derive(Debug, thiserror::Error)]
-pub enum AppError {
-    #[error("object storage is not configured")]
-    StorageUnavailable,
-    #[error("artifact not found: {0}")]
-    ArtifactNotFound(String),
-    #[error(transparent)]
-    Catalog(#[from] ::catalog::Error),
-    #[error(transparent)]
-    Storage(Box<dyn std::error::Error + Send + Sync>),
-    #[error(transparent)]
-    StorageConfiguration(#[from] crate::storage::Error),
-    #[error(transparent)]
-    ArtifactPath(#[from] ::catalog::artifact::PathError),
-    #[error("{0}")]
-    InvalidRequest(String),
-    #[error("run not found: {0}")]
-    RunIdNotFound(Uuid),
-    /// The requested run does not exist.
-    #[error("run not found: data {data_id}, graph {graph_id}")]
-    RunNotFound {
-        /// Data identifier of the run.
-        data_id: Uuid,
-        /// Graph identifier of the run.
-        graph_id: Uuid,
-    },
-    /// The requested node has no run at the run's current revision.
-    #[error("node run not found: {0}")]
-    NodeRunNotFound(Uuid),
-    /// The requested task does not exist.
-    #[error("task not found: {0}")]
-    TaskNotFound(Uuid),
-    #[error("job not found: {0}")]
-    JobNotFound(Uuid),
-    #[error("job claim expired, changed owner, or no longer accepts this status: {0}")]
-    JobConflict(Uuid),
-    /// The requested node is not part of the graph.
-    #[error("node not found in graph: {0}")]
-    NodeNotFound(Uuid),
-    /// The graph identifier in a draft request does not match the graph JSON.
-    #[error("graph id mismatch: expected {expected}, got {actual}")]
-    GraphIdMismatch { expected: Uuid, actual: Uuid },
-    /// The requested graph draft does not exist.
-    #[error("graph draft not found: {0}")]
-    GraphDraftNotFound(Uuid),
-    /// The draft cannot be published because it is not a valid graph.
-    #[error("invalid graph: {0}")]
-    InvalidGraph(#[source] graph::validator::WorkflowValidationError),
-    /// The graph store returned an error.
-    #[error("graph: {0}")]
-    Graph(Box<dyn std::error::Error + Send + Sync>),
-    /// The backend returned an error.
-    #[error(transparent)]
-    Backend(#[from] runtime::Error),
-    /// Job persistence failed.
-    #[error(transparent)]
-    Scheduled(scheduler::Error),
-}
-
-impl From<event::Error> for AppError {
-    fn from(error: event::Error) -> Self {
-        Self::Backend(error.into())
-    }
-}
-
-impl From<scheduler::Error> for AppError {
-    fn from(error: scheduler::Error) -> Self {
-        match error {
-            scheduler::Error::AgentJobNotFound(job_id) => Self::JobNotFound(job_id),
-            scheduler::Error::JobConflict(job_id) => Self::JobConflict(job_id),
-            error => Self::Scheduled(error),
-        }
-    }
-}
-
-impl From<toasty::Error> for AppError {
-    fn from(error: toasty::Error) -> Self {
-        Self::Backend(error.into())
-    }
-}
-
-impl From<graph::store::Error> for AppError {
-    fn from(error: graph::store::Error) -> Self {
-        match error {
-            graph::store::Error::DraftNotFound(graph_id) => Self::GraphDraftNotFound(graph_id),
-            graph::store::Error::InvalidDraft(error) => Self::InvalidGraph(error),
-            error => Self::Graph(Box::new(error)),
-        }
-    }
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let status = match self {
-            AppError::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            AppError::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
-            AppError::Catalog(ref error) => match error {
-                ::catalog::Error::InvalidUrl
-                | ::catalog::Error::InvalidField(_)
-                | ::catalog::Error::MissingField(_) => StatusCode::BAD_REQUEST,
-                ::catalog::Error::CatalogNotFound(_) | ::catalog::Error::FileNotFound(_) => {
-                    StatusCode::NOT_FOUND
-                }
-                ::catalog::Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            },
-            AppError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            AppError::RunIdNotFound(_)
-            | AppError::RunNotFound { .. }
-            | AppError::NodeRunNotFound(_)
-            | AppError::TaskNotFound(_)
-            | AppError::JobNotFound(_)
-            | AppError::NodeNotFound(_)
-            | AppError::GraphDraftNotFound(_) => StatusCode::NOT_FOUND,
-            AppError::InvalidRequest(_)
-            | AppError::StorageConfiguration(_)
-            | AppError::ArtifactPath(_)
-            | AppError::GraphIdMismatch { .. }
-            | AppError::InvalidGraph(_) => StatusCode::BAD_REQUEST,
-            AppError::JobConflict(_) => StatusCode::CONFLICT,
-            AppError::Graph(_) | AppError::Backend(_) | AppError::Scheduled(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        };
-        (
-            status,
-            Json(ErrorBody {
-                error: self.to_string(),
-            }),
-        )
-            .into_response()
-    }
-}
-
-/// Error body returned by an app operation.
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    error: String,
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     use std::convert::Infallible;
@@ -311,6 +169,8 @@ pub(crate) mod test {
 
 #[cfg(test)]
 mod tests {
+    use axum::{http::StatusCode, response::IntoResponse};
+
     use super::*;
 
     #[test]

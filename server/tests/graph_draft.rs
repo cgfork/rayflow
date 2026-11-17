@@ -288,6 +288,12 @@ async fn graph_draft_api_rejects_invalid_publish_and_missing_drafts() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error_code"], "RAYFLOW_GRAPH_DRAFT_NOT_FOUND");
+    assert_eq!(body["error"], format!("graph draft not found: {graph_id}"));
 
     let mut invalid = draft;
     invalid
@@ -320,4 +326,10 @@ async fn graph_draft_api_rejects_invalid_publish_and_missing_drafts() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error_code"], "RAYFLOW_INVALID_GRAPH");
+    assert_eq!(body["error"], "invalid graph: graph contains a cycle");
 }

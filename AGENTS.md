@@ -25,6 +25,7 @@ on those libraries.
 - `server/src/auth/` — optional local/LDAP/OIDC login. Enable `auth.enabled`, initialize providers with `Auth::new` and `App::with_auth`, and apply migrations 7 and 14–16. Auth tables use auto-incrementing numeric primary IDs and unique user/token/state identifiers; the stable identity is `auth_user.user_id`. All API routes enforce sessions or restricted fleet bearer credentials; health stays public. Browser writes require `X-Rayflow-Request: 1`. Audit identity comes from the authenticated user. Nested server auth settings use `RAYFLOW_AUTH__*`; agents use `RAYFLOW_AGENT_AUTH_TOKEN`. See `doc/authentication.md`.
 - `rayflow.sql` — MySQL schema (`catalog`, `file`, `graph`, `task`, `run`, `run_config`, `node_config`, `node_run`, `job`, `command_entry`, `task_event`, `poll_offset`, and `leader_election`). Apply it before using the MySQL backend.
 - `Cargo.toml` — workspace manifest with shared dependency versions.
+- `server/src/app/error.rs` — `AppError` maps application and wrapped domain errors to HTTP statuses and stable `RAYFLOW_*` business codes. JSON failures contain `error_code` and the existing `error` message. `status_code()` and `code()` expose the same mapping to Rust callers.
 
 Tasks are created only when a node run is created or transitions to `Ready`.
 `Start`, `Rerun`, `Dryrun`, `Resume`, and successor activation in `Succeed` add

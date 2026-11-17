@@ -384,6 +384,35 @@ is absent.
 
 ## HTTP API
 
+Application operations return errors with an HTTP status and a JSON body:
+
+```json
+{
+  "error_code": "RAYFLOW_RUN_NOT_FOUND",
+  "error": "run not found: 00000000-0000-0000-0000-000000000001"
+}
+```
+
+`error_code` is the stable business identifier; use it to decide how to handle
+an error. `error` is the human-readable message and may include resource IDs or
+validation details. Existing clients can keep displaying `error`. The status
+and code also reflect errors wrapped by storage, runtime, or scheduler adapters.
+
+| HTTP status | Business error codes |
+| --- | --- |
+| `400 Bad Request` | `RAYFLOW_INVALID_REQUEST`, `RAYFLOW_GRAPH_ID_MISMATCH`, `RAYFLOW_INVALID_GRAPH`, `RAYFLOW_INVALID_UPGRADE_VERSION`, `RAYFLOW_INVALID_UPGRADE_NODE`, `RAYFLOW_INVALID_TASK_EVENT` |
+| `400 Bad Request` | `RAYFLOW_INVALID_CATALOG_URL`, `RAYFLOW_INVALID_CATALOG_FIELD`, `RAYFLOW_MISSING_CATALOG_FIELD`, `RAYFLOW_INVALID_ARTIFACT_PATH`, `RAYFLOW_INVALID_STORAGE_CONFIGURATION`, `RAYFLOW_INVALID_OBJECT_URL`, `RAYFLOW_INVALID_PRESIGN_EXPIRY`, `RAYFLOW_INVALID_MULTIPART_OPERATION` |
+| `404 Not Found` | `RAYFLOW_RUN_NOT_FOUND`, `RAYFLOW_NODE_RUN_NOT_FOUND`, `RAYFLOW_NODE_NOT_FOUND`, `RAYFLOW_TASK_NOT_FOUND`, `RAYFLOW_JOB_NOT_FOUND`, `RAYFLOW_GRAPH_NOT_FOUND`, `RAYFLOW_GRAPH_DRAFT_NOT_FOUND` |
+| `404 Not Found` | `RAYFLOW_ARTIFACT_NOT_FOUND`, `RAYFLOW_CATALOG_NOT_FOUND`, `RAYFLOW_FILE_NOT_FOUND`, `RAYFLOW_COMMAND_NOT_FOUND`, `RAYFLOW_TASK_EVENT_NOT_FOUND` |
+| `409 Conflict` | `RAYFLOW_JOB_CONFLICT`, `RAYFLOW_RUN_ALREADY_STARTED`, `RAYFLOW_INVALID_TRANSITION`, `RAYFLOW_CONCURRENT_UPDATE` |
+| `500 Internal Server Error` | `RAYFLOW_DATABASE_ERROR`, `RAYFLOW_GRAPH_ERROR`, `RAYFLOW_GRAPH_METADATA_MISMATCH`, `RAYFLOW_GRAPH_DRAFT_METADATA_MISMATCH`, `RAYFLOW_GRAPH_VERSION_OVERFLOW`, `RAYFLOW_STORAGE_ERROR` |
+| `500 Internal Server Error` | `RAYFLOW_INVALID_JOB_TIMEOUT_GAP`, `RAYFLOW_INVALID_JOB_LEASE`, `RAYFLOW_JOB_LEASE_NOT_FOUND` |
+| `503 Service Unavailable` | `RAYFLOW_STORAGE_UNAVAILABLE`, `RAYFLOW_STORAGE_CREDENTIALS_EXPIRED` |
+
+The lease errors above indicate invalid or missing persisted job configuration.
+Rust consumers can inspect `AppError::status_code()` and `AppError::code()`;
+Axum handlers use its `IntoResponse` implementation to serialize the same mapping.
+
 The service endpoints are:
 
 | Method | Path | Purpose |

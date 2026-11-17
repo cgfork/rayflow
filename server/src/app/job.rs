@@ -892,6 +892,7 @@ mod tests {
                 invalid.node_config_id
             )
         );
+        assert_eq!(body["error_code"], "RAYFLOW_JOB_LEASE_NOT_FOUND");
         for job in [&valid, &invalid] {
             let unchanged = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
             assert_eq!(unchanged.status, Status::Scheduled);

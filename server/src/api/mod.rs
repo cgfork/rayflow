@@ -24,6 +24,10 @@
 //! * `POST /job/fail` — fail a job and emit `TaskEvent::Fail`.
 //! * `POST /job/terminate` — terminate a job and emit `TaskEvent::Terminate`.
 //! * `GET  /runs/graph_state` — read the current state of a run.
+//!
+//! Application failures use the mapped HTTP status with a JSON
+//! [`crate::app::ErrorBody`] containing `error_code` (a stable business code)
+//! and `error` (the human-readable message).
 
 pub mod agent;
 pub mod catalog;
