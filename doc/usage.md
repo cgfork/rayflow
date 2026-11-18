@@ -61,6 +61,15 @@ MySQL DDL can commit before a migration finishes. A failed migration is not
 recorded as applied, and these initialization migrations can be retried after
 resolving the reported error.
 
+Migration 22 resumes partially completed UUID changes, including existing
+configuration UUID columns, indexes, and temporary job reference columns. If an
+earlier attempt stopped and a retry reports `Duplicate column name 'uuid'`,
+update to the fixed initializer and rerun `./init-db.sh`; existing UUIDs are
+preserved. Legacy zero references for absent optional node or run configurations
+become nil UUIDs. Missing nonzero references, or a missing owning node run,
+still stop the migration before it removes the numeric references; repair those
+references explicitly and retry.
+
 Do not commit credentials in `rayflow.yaml`. Use an environment variable or a
 local, untracked configuration file for `database_url`.
 

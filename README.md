@@ -44,14 +44,24 @@ After configuring the database, start the local API, pilot, and web UI together:
 
 Use `./dev.sh --agent` to include a local Docker agent. Press Ctrl-C to stop.
 
-## Release binary with embedded UI
+## Release builds
 
-Build the UI before enabling the server's optional `embed-ui` feature:
+Build the UI and API server as separate artifacts:
 
 ```sh
-npm ci --prefix ui
-npm run build --prefix ui
-cargo build --release -p server --features embed-ui
+./release.sh
+```
+
+Serve `ui/dist/` with a web server and proxy `/api/v1/` to
+`target/release/server`. See [Production hosting](doc/usage.md#production-hosting).
+The script also builds `target/release/init-db` for database initialization.
+It can run from any working directory and reports the actual Cargo artifact
+paths, including custom target directories and build targets.
+
+To embed the UI into the server executable instead:
+
+```sh
+./release.sh --embed-ui
 ```
 
 The resulting `target/release/server` contains the UI assets and serves the
