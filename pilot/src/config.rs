@@ -172,3 +172,41 @@ impl Config {
         Duration::from_millis(self.gap_timeout_ms)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> Config {
+        Config {
+            database_url: "mysql://root:secret@127.0.0.1/rayflow".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn defaults_have_a_usable_consumer_cadence() {
+        let config = valid();
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.poll_interval(), Duration::from_millis(250));
+        assert_eq!(config.leader_lease(), Duration::from_secs(10));
+        assert_eq!(config.gap_timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn rejects_a_poll_interval_that_can_outlive_the_lease() {
+        let mut config = valid();
+        config.poll_interval_ms = config.leader_lease_ms;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_missing_database_configuration() {
+        let mut config = valid();
+        config.database_url.clear();
+
+        assert!(config.validate().is_err());
+    }
+}

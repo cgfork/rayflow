@@ -1,0 +1,43 @@
+.runtime-heading { --runtime-control-height: 40px; }
+.runtime-heading .page-heading { align-items: flex-start; }
+.runtime-heading .page-heading > :first-child { flex: 1 1 224px; }
+.runtime-heading .page-heading > .actions { flex: 1 1 440px; max-width: 100%; align-items: center; justify-content: flex-end; }
+.runtime-heading .page-heading > .actions > .button,
+.workflow-picker-control { height: var(--runtime-control-height); min-height: var(--runtime-control-height); }
+.runtime-workflow-callout > span:first-of-type { min-width: 0; overflow-wrap: anywhere; }
+.workflow-picker { position: relative; flex: 1 1 288px; width: 100%; max-width: 440px; min-width: 0; }
+.workflow-picker-control { display: flex; align-items: center; gap: var(--space-2); padding: 0 var(--space-2); border: 1px solid var(--input-border); border-radius: var(--radius); background: var(--input-bg); color: var(--muted); cursor: text; transition: background-color .15s, color .15s, border-color .15s; }
+.workflow-picker-control:hover { border-color: var(--muted); }
+.workflow-picker-control:focus-within { border-color: var(--focus); outline: 2px solid var(--focus); outline-offset: 1px; }
+.workflow-picker-control > svg { flex-shrink: 0; }
+.workflow-picker-control input { flex: 1; width: 0; min-width: 48px; padding: var(--space-1) 0; border: 0; background: transparent; outline: none; font-size: var(--font-table); }
+.workflow-picker-selected { display: inline-flex; flex: 0 1 auto; align-items: center; gap: var(--space-1); min-width: 0; max-width: 58%; max-height: calc(var(--runtime-control-height) - 2px); padding: 0 var(--space-1); border: 1px solid var(--border); border-radius: var(--radius-small); background: var(--neutral-soft); color: var(--text); font-size: var(--font-small); }
+.workflow-picker-selected > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.workflow-picker-selected > svg { flex-shrink: 0; }
+.workflow-picker-selected button { display: inline-flex; justify-content: center; align-items: center; flex: 0 0 auto; width: 24px; height: 24px; padding: 0; border: 0; border-radius: var(--radius-small); background: var(--button-bg); color: inherit; }
+.workflow-picker-selected button:hover { background: var(--button-hover); }
+.workflow-picker-selected button:active { background: var(--button-active); }
+.workflow-picker-menu { position: absolute; inset: calc(100% + 8px) 0 auto; z-index: 20; padding: var(--space-1); border: 1px solid var(--border-strong); border-radius: var(--radius-panel); background: var(--surface); }
+.workflow-picker-caption { display: flex; justify-content: space-between; align-items: center; padding: var(--space-2); color: var(--muted); font-size: var(--font-small); font-weight: 600; }
+.workflow-picker-options { max-height: min(280px, 45dvh); overflow-y: auto; }
+.workflow-picker-option { display: flex; align-items: center; gap: var(--space-2); width: 100%; padding: var(--space-2); border: 0; border-radius: var(--radius-small); background: transparent; color: var(--muted); text-align: left; }
+.workflow-picker-option:hover { background: var(--button-hover); color: var(--text); }
+.workflow-picker-option[aria-selected=true] { background: var(--brand-soft); color: var(--brand-strong); }
+.workflow-picker-option.active { outline: 2px solid var(--focus); outline-offset: -2px; }
+.workflow-picker-option:active { background: var(--brand-border); }
+.workflow-picker-option > svg { flex-shrink: 0; }
+.workflow-picker-option > span { flex: 1; min-width: 0; }
+.workflow-picker-option strong { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text); font-size: var(--font-table); font-weight: 600; }
+.workflow-picker-option small { display: block; margin-top: var(--space-1); color: var(--muted); overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--font-small); }
+.workflow-picker-message { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-2); color: var(--muted); font-size: var(--font-table); }
+.workflow-picker-menu .error-banner { margin: 0 0 var(--space-1); padding: var(--space-2); font-size: var(--font-small); }
+
+@media (max-width: 720px) {
+  .runtime-heading .page-heading > .actions { justify-content: flex-start; }
+  .workflow-picker { flex-basis: 100%; max-width: none; }
+}
+@media (pointer: coarse) {
+  .runtime-heading { --runtime-control-height: 44px; }
+  .workflow-picker-option { min-height: 44px; }
+  .workflow-picker-selected button { width: 44px; height: 44px; }
+}

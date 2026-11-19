@@ -7,3 +7,32 @@ export function randomUUID(): string {
   const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
+
+export async function copyUuid(id: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(id);
+      return true;
+    }
+  } catch {
+    // Some browsers restrict access even when the Clipboard API is present.
+  }
+
+  // The console can also be served over HTTP on a remote host.
+  const focused = document.activeElement;
+  const field = document.createElement('textarea');
+  field.value = id;
+  field.readOnly = true;
+  field.tabIndex = -1;
+  field.className = 'workflow-clipboard-fallback';
+  document.body.append(field);
+  try {
+    field.select();
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    field.remove();
+    if (focused instanceof HTMLElement) focused.focus({ preventScroll: true });
+  }
+}

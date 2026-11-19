@@ -230,3 +230,27 @@ impl<B: Executor> crate::Read<uuid::Uuid, B> for TaskEventEntry {
             .ok_or(Error::TaskEventNotFound(id))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yield_maps_to_pending_and_resume_is_distinct() {
+        let node = Uuid::new_v4();
+        assert_eq!(TaskEvent::Yield.command(node), Command::Pend { node });
+        assert_ne!(TaskEvent::Yield.command(node), Command::Resume { node });
+    }
+
+    #[test]
+    fn terminal_events_map_to_terminal_commands() {
+        let node = Uuid::new_v4();
+        assert_eq!(TaskEvent::Succeed.command(node), Command::Succeed { node });
+        assert_eq!(TaskEvent::Fail.command(node), Command::Fail { node });
+        assert_eq!(
+            TaskEvent::Terminate.command(node),
+            Command::Terminate { node }
+        );
+        assert_eq!(TaskEvent::Cancel.command(node), Command::Cancel { node });
+    }
+}

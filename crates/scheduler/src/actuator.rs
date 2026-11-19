@@ -292,13 +292,10 @@ pub struct Job {
     #[index]
     pub run_id: Uuid,
     #[index]
-    #[column(type = "CHAR(36)")]
     pub node_run_id: Uuid,
     #[index]
-    #[column(type = "CHAR(36)")]
     pub node_config_id: Uuid,
     #[index]
-    #[column(type = "CHAR(36)")]
     pub run_config_id: Uuid,
     #[index]
     pub status: Status,

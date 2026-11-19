@@ -23,6 +23,7 @@
 //! * `GET  /runs/graph_state` — read the current state of a run.
 //! * `POST /runs/{run_id}/files/download` — presign a declared run input/output for browsers.
 //! * `GET  /runs/{run_id}/files/content` — stream a declared file as an attachment.
+//! * `POST /users/resolve` — look up display names for user IDs.
 //!
 //! Application failures use the mapped HTTP status with a JSON
 //! [`crate::app::ErrorBody`] containing `error_code` (a stable business code)
@@ -32,6 +33,7 @@ pub mod agent;
 pub mod graph;
 pub mod job;
 pub mod run;
+mod user;
 
 use ::graph::GraphStore;
 use ::graph::types::DAG;
@@ -67,6 +69,7 @@ where
         .merge(agent::routes::<S>())
         .merge(run::routes::<S>())
         .merge(job::routes::<S>())
+        .merge(user::routes::<S>())
         .route_layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             crate::auth::require_auth,

@@ -4,6 +4,7 @@ mod graph;
 mod job;
 mod operation;
 mod run;
+mod user;
 
 pub use agent::{AgentInstance, AgentView};
 pub use error::{AppError, ErrorBody};
@@ -158,3 +159,33 @@ impl<S> App<S> {
 /*
 
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_zero_page_limits() {
+        let query = PageQuery {
+            before: None,
+            limit: Some(0),
+        };
+        assert!(query.request().is_err());
+    }
+
+    #[test]
+    fn applies_default_page_limit() {
+        let query = PageQuery::default();
+        assert_eq!(query.request().unwrap().limit(), 50);
+    }
+
+    #[tokio::test]
+    async fn offsets_only_move_forward() {
+        let offsets = Offsets::new();
+        offsets.set(10);
+        offsets.set(5);
+        assert_eq!(offsets.get(), 10);
+        offsets.wait(10).await;
+        assert_eq!(offsets.get(), 10);
+    }
+}

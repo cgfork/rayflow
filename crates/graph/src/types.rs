@@ -142,13 +142,13 @@ pub struct DAG {
     pub version: u64,
     #[serde(default)]
     pub node_count: usize,
-    #[serde(skip)]
+    #[serde(default)]
     pub updated_at: Timestamp,
-    #[serde(skip)]
+    #[serde(default)]
     pub updated_by: String,
-    #[serde(skip)]
+    #[serde(default)]
     pub created_at: Timestamp,
-    #[serde(skip)]
+    #[serde(default)]
     pub created_by: String,
     /// Nodes in the graph.
     pub nodes: Vec<Node>,

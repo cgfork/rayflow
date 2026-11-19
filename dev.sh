@@ -23,6 +23,7 @@ Environment:
   RAYFLOW_DEV_AGENT_TOKEN Override the shared local fleet token when using --agent.
 
 Logs: .rayflow/dev/{server,pilot,ui,agent}.log
+With authentication enabled, open the UI address configured in auth.public_url.
 With --agent, the local API URL and matching fleet credentials are set automatically.
 The generated fleet token is persisted in .rayflow/dev/agent-token.
 Press Ctrl-C to stop all processes started by this script.
@@ -52,9 +53,25 @@ ui_port="${RAYFLOW_DEV_UI_PORT:-5173}"
 connect_host="$bind_host"
 case "$connect_host" in
     0.0.0.0) connect_host=127.0.0.1 ;;
-    ::) connect_host='[::1]' ;;
-    *:*) connect_host="[$connect_host]" ;;
+    ::) connect_host=::1 ;;
 esac
+
+# HTTP clients differ in which case they prefer. Preserve each existing list.
+local_no_proxy=127.0.0.1,localhost,::1
+case "$connect_host" in
+    127.0.0.1|localhost|::1) ;;
+    *) local_no_proxy+=",$connect_host" ;;
+esac
+upper_no_proxy="${NO_PROXY-${no_proxy:-}}"
+lower_no_proxy="${no_proxy:-${NO_PROXY:-}}"
+export NO_PROXY="${upper_no_proxy:+$upper_no_proxy,}$local_no_proxy"
+# curl treats a wildcard as a bypass for every host only when it stands alone.
+if [[ "$lower_no_proxy" != '*' ]]; then
+    lower_no_proxy="${lower_no_proxy:+$lower_no_proxy,}$local_no_proxy"
+fi
+export no_proxy="$lower_no_proxy"
+
+if [[ "$connect_host" == *:* ]]; then connect_host="[$connect_host]"; fi
 api_url="http://$connect_host:$api_port"
 ui_url="http://$connect_host:$ui_port"
 api_bind="$bind_host:$api_port"
@@ -199,13 +216,17 @@ wait_for_health "$api_url/health"
 start pilot "$target_dir/debug/pilot"
 start ui env RAYFLOW_API_URL="$api_url" npm run dev --prefix ui -- --host "$bind_host" --port "$ui_port" --strictPort
 wait_for_health "$ui_url/api/v1/health"
+browser_url="$(curl --noproxy '*' --fail --silent --show-error --max-time 5 "$ui_url/api/v1/auth/providers" | node -e '
+const { enabled, public_url } = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+process.stdout.write(enabled ? public_url : process.argv[1]);
+' "$ui_url")" || fail 'Unable to read the sign-in settings from the local UI.'
 if "$with_agent"; then
     start agent env RAYFLOW_AGENT_ID="$agent_id" RAYFLOW_AGENT_SERVER_URL="$api_url" "$target_dir/debug/agent"
 fi
 check_processes
 
 printf 'API and UI bind address: %s\n' "$bind_host"
-printf '\nRayflow is running.\n  UI:  %s\n  API: %s\n  Logs: %s\nPress Ctrl-C to stop.\n\n' "$ui_url" "$api_url" "$log_dir"
+printf '\nRayflow is running.\n  UI:  %s\n  API: %s\n  Logs: %s\nPress Ctrl-C to stop.\n\n' "$browser_url" "$api_url" "$log_dir"
 while true; do
     check_processes
     sleep 1

@@ -182,16 +182,24 @@ where
     /// Persists a claimed job, loads its pinned graph version, and prepares
     /// the provider resources needed by the job.
     pub async fn prepare(&self, job: Job) -> Result<(), Error> {
-        let mut job_fs = JobFs::new(job.clone(), self.settings.clone());
+        let mut job_fs = JobFs::new(job, self.settings.clone());
         JobFsTrait::lock(&job_fs).await?;
-        job_fs.load_cached().await?;
-        job_fs.persist_job().await?;
-        let result = self.prepare_locked(&mut job_fs, job).await;
+        let result = async {
+            job_fs.load_cached().await?;
+            self.validate_preparation(&job_fs).await?;
+            job_fs.persist_job().await?;
+            let spec = self
+                .execution_spec(JobFsTrait::job(&job_fs), &job_fs)
+                .await?;
+            self.inner.containerd.prepare(spec).await
+        }
+        .await;
         let unlock = JobFsTrait::unlock(&job_fs).await;
         result.and(unlock)
     }
 
-    async fn prepare_locked<J: JobFsTrait>(&self, job_fs: &mut J, job: Job) -> Result<(), Error> {
+    async fn validate_preparation<J: JobFsTrait>(&self, job_fs: &J) -> Result<(), Error> {
+        let job = JobFsTrait::job(job_fs);
         if let Some(container) = JobFsTrait::container(job_fs) {
             if container.r#type != self.inner.containerd.name() {
                 return Err(Error::Provider(format!(
@@ -238,15 +246,13 @@ where
             )));
         }
 
-        let spec = self.execution_spec(&job, job_fs).await?;
-        self.inner.containerd.prepare(spec).await
+        Ok(())
     }
 
     /// Creates or reconnects to a container, persists its identity, and starts
     /// it without blocking the caller on process completion.
     pub async fn start(&self, job_id: Uuid) -> Result<(), Error> {
-        let mut job_fs = self.persisted_job_fs(job_id).await?;
-        JobFsTrait::lock(&job_fs).await?;
+        let mut job_fs = self.persisted_job_fs_locked(job_id).await?;
         let result = self.start_locked(&mut job_fs).await;
         let unlock = JobFsTrait::unlock(&job_fs).await;
         result.and(unlock)
@@ -436,8 +442,7 @@ where
 
     /// Persists output validation failure before reporting a failed job.
     pub async fn fail_artifacts(&self, job_id: Uuid) -> Result<(), Error> {
-        let mut job_fs = self.persisted_job_fs(job_id).await?;
-        JobFsTrait::lock(&job_fs).await?;
+        let mut job_fs = self.persisted_job_fs_locked(job_id).await?;
         let result = async {
             let mut result = JobFsTrait::job_result(&job_fs)
                 .cloned()
@@ -467,18 +472,22 @@ where
         }
         let _guard = WatchGuard(&self.inner.watching);
         let mut shutdown = self.inner.shutdown.subscribe();
+        let mut recovery = tokio::time::interval(RECOVERY_INTERVAL);
+        recovery.tick().await;
 
         loop {
             let events = self.inner.containerd.events();
             tokio::pin!(events);
-            let mut recovery = tokio::time::interval(RECOVERY_INTERVAL);
-            recovery.tick().await;
             loop {
                 tokio::select! {
+                    biased;
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
                             return Ok(());
                         }
+                    }
+                    _ = recovery.tick() => {
+                        self.reconcile_all().await?;
                     }
                     event = events.next() => match event {
                         Some(Ok(event)) => {
@@ -488,9 +497,6 @@ where
                         }
                         Some(Err(_)) | None => break,
                     },
-                    _ = recovery.tick() => {
-                        self.reconcile_all().await?;
-                    }
                 }
             }
 
@@ -514,8 +520,11 @@ where
     pub async fn jobs(&self) -> Result<Vec<Job>, Error> {
         let mut jobs = Vec::new();
         for job_id in JobFs::job_ids(&self.settings).await? {
-            let job_fs = self.persisted_job_fs(job_id).await?;
-            JobFsTrait::lock(&job_fs).await?;
+            let job_fs = match self.persisted_job_fs_locked(job_id).await {
+                Ok(job_fs) => job_fs,
+                Err(error) if is_not_found(&error) => continue,
+                Err(error) => return Err(error),
+            };
             let read = async {
                 if JobFsTrait::job_result(&job_fs).is_some() {
                     return Ok(None);
@@ -533,8 +542,7 @@ where
 
     /// Reads one durable result, if present, for a job that failed to start.
     pub async fn result(&self, job_id: Uuid) -> Result<Option<AgentResult>, Error> {
-        let job_fs = self.persisted_job_fs(job_id).await?;
-        JobFsTrait::lock(&job_fs).await?;
+        let job_fs = self.persisted_job_fs_locked(job_id).await?;
         let read = async {
             match JobFsTrait::job_result(&job_fs) {
                 Some(result) => {
@@ -590,8 +598,11 @@ where
     pub async fn poll_results(&self) -> Result<Vec<AgentResult>, Error> {
         let mut results = Vec::new();
         for job_id in JobFs::job_ids(&self.settings).await? {
-            let job_fs = self.persisted_job_fs(job_id).await?;
-            JobFsTrait::lock(&job_fs).await?;
+            let job_fs = match self.persisted_job_fs_locked(job_id).await {
+                Ok(job_fs) => job_fs,
+                Err(error) if is_not_found(&error) => continue,
+                Err(error) => return Err(error),
+            };
             let read_result = async {
                 match JobFsTrait::job_result(&job_fs) {
                     Some(result) => {
@@ -626,31 +637,21 @@ where
         }
     }
 
-    /// Removes the provider container and local files after a remote report is
-    /// accepted. Results remain durable until this method succeeds.
+    /// Removes the provider container and local execution metadata after a
+    /// remote report is accepted. Results remain durable until this succeeds.
     pub async fn acknowledge_result(&self, job_id: Uuid) -> Result<(), Error> {
-        let mut job_fs = self.persisted_job_fs(job_id).await?;
-        JobFsTrait::lock(&job_fs).await?;
+        let mut job_fs = self.persisted_job_fs_locked(job_id).await?;
         let result = self.acknowledge_locked(&mut job_fs, job_id).await;
         let unlock = JobFsTrait::unlock(&job_fs).await;
-        let result = result.and(unlock);
-        if result.is_ok() {
-            let _ = fs::remove_dir(JobFsTrait::dir(&job_fs)).await;
-        }
-        result
+        result.and(unlock)
     }
 
-    /// Removes a stopped container and all local files for a job.
+    /// Removes a stopped container and its local execution metadata.
     pub async fn remove(&self, job_id: Uuid) -> Result<(), Error> {
-        let mut job_fs = self.persisted_job_fs(job_id).await?;
-        JobFsTrait::lock(&job_fs).await?;
+        let mut job_fs = self.persisted_job_fs_locked(job_id).await?;
         let result = self.remove_locked(&mut job_fs, job_id).await;
         let unlock = JobFsTrait::unlock(&job_fs).await;
-        let result = result.and(unlock);
-        if result.is_ok() {
-            let _ = fs::remove_dir(JobFsTrait::dir(&job_fs)).await;
-        }
-        result
+        result.and(unlock)
     }
 
     async fn acknowledge_locked<J: JobFsTrait>(
@@ -688,8 +689,7 @@ where
 
     /// Stops a job and persists the requested terminal outcome immediately.
     pub async fn stop(&self, job_id: Uuid, reason: StopReason) -> Result<(), Error> {
-        let mut job_fs = self.persisted_job_fs(job_id).await?;
-        JobFsTrait::lock(&job_fs).await?;
+        let mut job_fs = self.persisted_job_fs_locked(job_id).await?;
         let result = self.stop_locked(&mut job_fs, reason).await;
         let unlock = JobFsTrait::unlock(&job_fs).await;
         result.and(unlock)
@@ -740,8 +740,11 @@ where
     }
 
     async fn reconcile_job(&self, job_id: Uuid) -> Result<(), Error> {
-        let mut job_fs = self.persisted_job_fs(job_id).await?;
-        JobFsTrait::lock(&job_fs).await?;
+        let mut job_fs = match self.persisted_job_fs_locked(job_id).await {
+            Ok(job_fs) => job_fs,
+            Err(error) if is_not_found(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let result = self.reconcile_locked(&mut job_fs).await;
         let unlock = JobFsTrait::unlock(&job_fs).await;
         result.and(unlock)
@@ -907,6 +910,10 @@ where
         JobFs::restore(self.settings.clone(), job_id).await
     }
 
+    async fn persisted_job_fs_locked(&self, job_id: Uuid) -> Result<JobFs, Error> {
+        JobFs::restore_locked(self.settings.clone(), job_id).await
+    }
+
     async fn register_container(&self, container_id: String, job_id: Uuid) {
         self.inner
             .containers
@@ -949,5 +956,32 @@ fn is_not_found(error: &Error) -> bool {
             ..
         }) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_persisted_job_outcomes() {
+        for (value, expected) in [
+            ("succeed", JobOutcome::Succeeded),
+            ("succeeded", JobOutcome::Succeeded),
+            ("fail", JobOutcome::Failed),
+            ("failed", JobOutcome::Failed),
+            ("yield", JobOutcome::Yielded),
+            ("yielded", JobOutcome::Yielded),
+            ("terminate", JobOutcome::Terminated),
+            ("terminated", JobOutcome::Terminated),
+        ] {
+            assert_eq!(JobOutcome::parse(value).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_persisted_outcome() {
+        let error = JobOutcome::parse("paused").unwrap_err();
+        assert!(matches!(error, Error::Agentd(message) if message.contains("paused")));
     }
 }

@@ -2967,23 +2967,28 @@ dependencies = [
 name = "pilot"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "axum",
+ "bollard",
  "config",
  "coordinator",
  "event",
  "graph",
  "jiff",
+ "reqwest",
  "runtime",
  "scheduler",
  "serde",
  "serde_json",
  "server",
+ "tempfile",
  "thiserror 2.0.21",
  "toasty",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

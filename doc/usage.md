@@ -92,6 +92,9 @@ to become ready, then prints their addresses. The default UI address is
 uses the existing `rayflow.yaml` and environment overrides; the script does not
 create or migrate the database.
 
+The launcher adds loopback addresses and the selected local host to its
+services' proxy exclusions so they can reach the local API and UI directly.
+
 For example, select a database explicitly or change the local ports:
 
 ```sh
@@ -138,13 +141,26 @@ cargo fmt
 cargo clippy
 ```
 
-MySQL integration tests skip when `DATABASE_URL` is absent. With a database
-available, run one crate's integration tests serially when they rebuild shared
-tables:
+The pilot and server workflow tests skip when `DATABASE_URL` is absent. They
+create, migrate, and drop a separate schema for each test. Supply credentials
+with permission to create and drop test schemas.
 
 ```sh
-DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow \
-  cargo test -p scheduler -- --test-threads=1
+export DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow
+cargo test -p pilot --test workflow
+cargo test -p server --test workflow_http
+```
+
+The Docker workflow test runs the HTTP server, pilot, and agent together. Set
+`RAYFLOW_TEST_DOCKER_IMAGE` to a locally available image with `sh` and `sleep`.
+The agent's Docker lifecycle test uses the same image.
+Add `127.0.0.1` to `NO_PROXY` if the environment uses an HTTP proxy.
+
+```sh
+export RAYFLOW_TEST_DOCKER_IMAGE=busybox:1.36
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1"
+cargo test -p pilot --test e2e -- --ignored
+cargo test -p agent --test lifecycle -- --ignored
 ```
 
 ## Configuration
@@ -293,9 +309,13 @@ The four sections use the same resource APIs as other clients:
 
 Runtime, job, and agent views refresh every five seconds while visible.
 Lists use cursor pagination; text search and counts cover the displayed page.
-The run dialog offers recent published graphs and also accepts any published
-graph UUID. Publishing snapshots the node settings into versioned execution
-configuration, so each run uses the settings from its pinned graph version.
+Runtime requires a published workflow selected in the header. Search workflows
+by name or ID; the selected workflow stays visible in the search bar. Runs,
+pagination, and refreshes are scoped to that workflow across its published
+versions. Opening Runtime from a published workflow selects it automatically.
+Start a run uses the selected workflow's latest published version. Publishing
+snapshots node settings into versioned execution configuration, so each run
+uses the settings from its pinned graph version.
 
 Node execution settings are stored together under `settings`:
 
@@ -361,29 +381,6 @@ location /api/v1/ {
 
 Use HTTPS for deployments beyond localhost; the editor generates UUIDs with
 the browser's secure-context `crypto.randomUUID()` API.
-
-### UI and management API tests
-
-Browser integration tests start Vite and intercept API requests, so they do not
-require MySQL or a running Rayflow server:
-
-```sh
-cd ui
-npx playwright install chromium
-npm run test:e2e
-```
-
-The server integration tests exercise real HTTP handlers and MySQL persistence,
-including draft publishing, pagination, run versions, filtering, and agent
-observation. Run them from the repository root against a disposable database:
-
-```sh
-DATABASE_URL=mysql://root:password@127.0.0.1:3306/rayflow_test \
-  cargo test -p server --test management
-```
-
-These tests create tables with unique prefixes. They skip when `DATABASE_URL`
-is absent.
 
 ## HTTP API
 

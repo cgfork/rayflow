@@ -48,8 +48,15 @@ impl JobFs {
     }
 
     pub(crate) async fn restore(settings: Settings, job_id: Uuid) -> Result<Self, Error> {
-        let path = settings.workdir.join(job_id.to_string()).join("job.json");
-        let job: Job = read_json(&path).await?;
+        let job_fs = Self::restore_locked(settings, job_id).await?;
+        job_fs.unlock().await?;
+        Ok(job_fs)
+    }
+
+    pub(crate) async fn restore_locked(settings: Settings, job_id: Uuid) -> Result<Self, Error> {
+        let dir = settings.workdir.join(job_id.to_string());
+        let lock_file = lock_job_dir(&dir).await?;
+        let job: Job = read_json(&dir.join("job.json")).await?;
         if job.uuid != job_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -58,11 +65,12 @@ impl JobFs {
             .into());
         }
         let mut job_fs = Self::new(job, settings);
+        job_fs.lock_file = Mutex::new(Some(lock_file));
         job_fs.load_cached().await?;
         Ok(job_fs)
     }
 
-    /// Lists UUID-named job directories in a workdir without reading job files.
+    /// Lists persisted jobs in a workdir without reading their definitions.
     pub async fn job_ids(settings: &Settings) -> Result<Vec<Uuid>, Error> {
         let mut entries = fs::read_dir(&settings.workdir).await?;
         let mut jobs = Vec::new();
@@ -70,7 +78,9 @@ impl JobFs {
             if !entry.file_type().await?.is_dir() {
                 continue;
             }
-            if let Ok(job_id) = entry.file_name().to_string_lossy().parse() {
+            if let Ok(job_id) = entry.file_name().to_string_lossy().parse()
+                && fs::try_exists(entry.path().join("job.json")).await?
+            {
                 jobs.push(job_id);
             }
         }
@@ -82,7 +92,11 @@ impl JobFs {
     pub async fn discover(settings: Settings) -> Result<HashMap<String, Uuid>, Error> {
         let mut containers = HashMap::new();
         for job_id in Self::job_ids(&settings).await? {
-            let job_fs = Self::restore(settings.clone(), job_id).await?;
+            let job_fs = match Self::restore(settings.clone(), job_id).await {
+                Ok(job_fs) => job_fs,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             if let Some(container) = job_fs.container() {
                 containers.insert(container.id.clone(), job_id);
             }
@@ -130,23 +144,7 @@ impl JobFs {
         }
         let dir = self.dir_path();
         fs::create_dir_all(&dir).await?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("lock"))
-            .await?
-            .into_std()
-            .await;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(TryLockError::WouldBlock) => sleep(Duration::from_millis(10)).await,
-                Err(TryLockError::Error(error)) => return Err(error.into()),
-            }
-        }
-        *lock_file = Some(file);
+        *lock_file = Some(lock_job_dir(&dir).await?);
         Ok(())
     }
 
@@ -194,6 +192,7 @@ impl JobFs {
         let mut entries = fs::read_dir(dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_name() == "lock" {
+                // Existing waiters must continue to use the same lock inode.
                 continue;
             }
             if entry.file_type().await?.is_dir() {
@@ -229,6 +228,25 @@ impl JobFs {
             })
             .transpose()?;
         Ok(())
+    }
+}
+
+async fn lock_job_dir(dir: &Path) -> Result<StdFile, Error> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("lock"))
+        .await?
+        .into_std()
+        .await;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => sleep(Duration::from_millis(10)).await,
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
     }
 }
 
@@ -317,5 +335,72 @@ impl JobFsTrait for JobFs {
         transfer: &T,
     ) -> Result<(), Error> {
         transfer.complete_output(self, graph).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::JobFs as JobFsTrait;
+    use scheduler::ResourceCapacity;
+    use tempfile::tempdir;
+
+    fn settings(root: &Path) -> Settings {
+        Settings::new(
+            Uuid::new_v4(),
+            "http://127.0.0.1:8080",
+            root.join("jobs"),
+            ResourceCapacity {
+                cpu_cores: 1,
+                memory_bytes: 1,
+            },
+        )
+    }
+
+    fn job() -> Job {
+        let task = event::task::Task::new(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 1);
+        Job::new(&task, Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())
+    }
+
+    #[tokio::test]
+    async fn restores_cached_container_result_and_runtime() {
+        let root = tempdir().unwrap();
+        let settings = settings(root.path());
+        let job = job();
+        let mut job_fs = JobFs::new(job.clone(), settings.clone());
+
+        job_fs.lock().await.unwrap();
+        job_fs.persist_job().await.unwrap();
+        job_fs
+            .write_container(Container {
+                r#type: "test".into(),
+                id: "container-1".into(),
+            })
+            .await
+            .unwrap();
+        job_fs
+            .write_job_result(JobResult {
+                exit_code: 0,
+                outcome: Some("succeed".into()),
+                finished_at: None,
+                duration_ms: Some(10),
+            })
+            .await
+            .unwrap();
+        let started_at = Timestamp::now();
+        job_fs
+            .write_runtime(Some(42), Some(started_at))
+            .await
+            .unwrap();
+        job_fs.unlock().await.unwrap();
+
+        let restored = JobFs::restore(settings, job.uuid).await.unwrap();
+        assert_eq!(
+            restored.container().map(|value| value.id.as_str()),
+            Some("container-1")
+        );
+        assert_eq!(restored.job_result().map(|value| value.exit_code), Some(0));
+        assert_eq!(restored.pid(), Some(42));
+        assert_eq!(restored.started_at(), Some(&started_at));
     }
 }

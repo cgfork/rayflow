@@ -288,3 +288,29 @@ fn scheduler_error(error: &scheduler::Error) -> (StatusCode, &'static str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_job_claim_conflicts_to_http_conflict() {
+        let error = AppError::JobConflict(Uuid::new_v4());
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "RAYFLOW_JOB_CONFLICT");
+    }
+
+    #[test]
+    fn maps_invalid_requests_to_bad_request() {
+        let error = AppError::InvalidRequest("invalid node".into());
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), "RAYFLOW_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn maps_runtime_invalid_transitions_to_conflict() {
+        let error = AppError::Backend(runtime::Error::AlreadyStarted);
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "RAYFLOW_RUN_ALREADY_STARTED");
+    }
+}

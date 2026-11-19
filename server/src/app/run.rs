@@ -10,6 +10,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::api::run::{FileDirection, RunFileDownloadRequest, Transfer};
+use crate::app::job::{output_catalog_filename, resolve_input_source};
 use crate::app::{App, AppError, Page, PageQuery, RunApp};
 use catalog::{FileSystem, ObjectStorage, PresignOperation};
 use event::task::Task;
@@ -56,20 +57,18 @@ impl<S> App<S> {
         let node = graph
             .node(request.node_id)
             .ok_or(AppError::NodeNotFound(request.node_id))?;
-        let mut filename = request.file_name.as_str();
-        let producer = match request.direction {
+        let filename = request.file_name.as_str();
+        let (producer, output) = match request.direction {
             FileDirection::Output => {
-                if !node
+                let output = node
                     .data
                     .outputs
                     .iter()
-                    .any(|output| output.file_name == filename)
-                {
-                    return Err(AppError::InvalidRequest(
-                        "file is not a declared output".into(),
-                    ));
-                }
-                request.node_id
+                    .find(|output| output.file_name == filename)
+                    .ok_or_else(|| {
+                        AppError::InvalidRequest("file is not a declared output".into())
+                    })?;
+                (request.node_id, output)
             }
             FileDirection::Input => {
                 let input = node
@@ -80,30 +79,10 @@ impl<S> App<S> {
                     .ok_or_else(|| {
                         AppError::InvalidRequest("file is not a declared input".into())
                     })?;
-                let (producer_name, producer_file) = input
-                    .source
-                    .split_once('.')
-                    .ok_or_else(|| AppError::InvalidRequest("input source is invalid".into()))?;
-                let producer = graph
-                    .nodes()
-                    .find(|candidate| candidate.data.name == producer_name)
-                    .ok_or_else(|| {
-                        AppError::InvalidRequest("input producer is not in the graph".into())
-                    })?;
-                if !producer
-                    .data
-                    .outputs
-                    .iter()
-                    .any(|output| output.file_name == producer_file)
-                {
-                    return Err(AppError::InvalidRequest(
-                        "input producer output is not declared".into(),
-                    ));
-                }
-                filename = producer_file;
-                producer.id
+                resolve_input_source(&graph, &input.source)?
             }
         };
+        let filename = output_catalog_filename(output);
         let mut db = self.db.clone();
         let node_run = node_run_at(&mut db, run.uuid, producer, run.revision)
             .await?
@@ -114,12 +93,12 @@ impl<S> App<S> {
             ));
         }
         let file = db
-            .get_file_by_node_run_filename(node_run.uuid, filename)
+            .get_file_by_node_run_filename(node_run.uuid, &filename)
             .await?
-            .ok_or_else(|| AppError::ArtifactNotFound(filename.to_owned()))?;
+            .ok_or_else(|| AppError::ArtifactNotFound(filename.to_string()))?;
         let catalog = file
             .catalog
-            .ok_or_else(|| AppError::ArtifactNotFound(filename.to_owned()))?;
+            .ok_or_else(|| AppError::ArtifactNotFound(filename.into_owned()))?;
         if !catalog.uploaded {
             return Err(AppError::ArtifactNotFound(catalog.uuid.to_string()));
         }

@@ -59,6 +59,12 @@ pub fn models() -> toasty::ModelSet {
     toasty::models!(GraphRecord, GraphDraftRecord)
 }
 
+fn audit_timestamp() -> Timestamp {
+    // Match the DATETIME(6) columns so the audit timestamps also match in JSON.
+    Timestamp::from_microsecond(Timestamp::now().as_microsecond())
+        .expect("the current timestamp fits in microsecond precision")
+}
+
 /// Error returned by the persistent graph store.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -152,30 +158,35 @@ impl<B: Executor> DraftGraphStore<Uuid> for B {
     async fn write(&mut self, graph: &DAG, actor: &str) -> Result<(), Error> {
         let mut graph = graph.clone();
         graph.node_count = graph.nodes.len();
-        let now = Timestamp::now();
+        graph.updated_at = audit_timestamp();
+        graph.updated_by = actor.to_owned();
         let existing = GraphDraftRecord::filter_by_uuid(graph.id)
             .first()
             .exec(&mut *self)
             .await?;
 
         if let Some(record) = existing {
+            graph.created_at = record.created_at;
+            graph.created_by = record.created_by;
             GraphDraftRecord::filter_by_id(record.id)
                 .update()
                 .name(graph.name.clone())
-                .graph(Json(graph.clone()))
-                .updated_at(now)
-                .updated_by(actor.to_owned())
+                .updated_at(graph.updated_at)
+                .updated_by(graph.updated_by.clone())
+                .graph(Json(graph))
                 .exec(self)
                 .await?;
         } else {
+            graph.created_at = graph.updated_at;
+            graph.created_by = graph.updated_by.clone();
             GraphDraftRecord::create()
                 .uuid(graph.id)
                 .name(graph.name.clone())
-                .graph(Json(graph.clone()))
-                .updated_at(now)
-                .updated_by(actor.to_owned())
-                .created_at(now)
-                .created_by(actor.to_owned())
+                .updated_at(graph.updated_at)
+                .updated_by(graph.updated_by.clone())
+                .created_at(graph.created_at)
+                .created_by(graph.created_by.clone())
+                .graph(Json(graph))
                 .exec(self)
                 .await?;
         }
@@ -198,16 +209,19 @@ impl<B: Executor> DraftGraphStore<Uuid> for B {
             .checked_add(1)
             .ok_or(Error::VersionOverflow(graph_id))?;
 
-        let now = Timestamp::now();
+        graph.updated_at = audit_timestamp();
+        graph.updated_by = actor.to_owned();
+        graph.created_at = graph.updated_at;
+        graph.created_by = graph.updated_by.clone();
         GraphRecord::create()
             .uuid(graph.id)
             .name(graph.name.clone())
             .version(graph.version)
+            .updated_at(graph.updated_at)
+            .updated_by(graph.updated_by.clone())
+            .created_at(graph.created_at)
+            .created_by(graph.created_by.clone())
             .graph(Json(graph))
-            .updated_at(now)
-            .updated_by(actor.to_owned())
-            .created_at(now)
-            .created_by(actor.to_owned())
             .exec(&mut tx)
             .await?;
         tx.commit().await?;

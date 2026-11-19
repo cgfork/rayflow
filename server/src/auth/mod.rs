@@ -376,9 +376,12 @@ async fn providers(State(state): State<AuthState>) -> Result<Json<serde_json::Va
         providers
             .push(serde_json::json!({ "id": "oidc", "label": "Company SSO", "kind": "redirect" }));
     }
-    Ok(Json(
-        serde_json::json!({ "enabled": true, "company_name": auth.0.config.company_name, "providers": providers }),
-    ))
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "company_name": auth.0.config.company_name,
+        "public_url": auth.0.config.public_url,
+        "providers": providers,
+    })))
 }
 
 async fn me(State(state): State<AuthState>, headers: HeaderMap) -> Result<Json<User>, AuthError> {

@@ -268,3 +268,36 @@ impl StorageConfig {
         Ok(url.into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> Config {
+        Config {
+            database_url: "mysql://root:secret@127.0.0.1/rayflow".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn accepts_default_polling_limits() {
+        assert!(valid().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_poll_retry_interval() {
+        let mut config = valid();
+        config.poll_retry_interval = Duration::ZERO;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_sub_millisecond_poll_timeout() {
+        let mut config = valid();
+        config.poll_timeout = Duration::from_micros(1_999);
+
+        assert!(config.validate().is_err());
+    }
+}

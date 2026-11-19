@@ -156,3 +156,45 @@ impl Settings {
 fn default_data_dir() -> PathBuf {
     ".rayflow/data".into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_settings() -> Settings {
+        Settings::new(
+            Uuid::new_v4(),
+            "http://127.0.0.1:8080",
+            ".rayflow/test-jobs",
+            ResourceCapacity {
+                cpu_cores: 2,
+                memory_bytes: 1024,
+            },
+        )
+    }
+
+    #[test]
+    fn accepts_valid_settings() {
+        assert!(valid_settings().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_nil_agent_id() {
+        let mut settings = valid_settings();
+        settings.id = Uuid::nil();
+        assert!(matches!(
+            settings.validate(),
+            Err(Error::Settings("id must be a non-nil UUID"))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_capacity() {
+        let mut settings = valid_settings();
+        settings.resources.cpu_cores = 0;
+        assert!(matches!(
+            settings.validate(),
+            Err(Error::Settings("CPU and memory capacity must be positive"))
+        ));
+    }
+}

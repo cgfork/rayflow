@@ -1,10 +1,16 @@
 //! Job delivery and conversion of agent status reports into task events.
 
+use std::borrow::Cow;
+
+use catalog::directory::DIRECTORY_MANIFEST;
 use catalog::path::validate_relative_path;
 use catalog::{
     CatalogOptionalData, CatalogSystem, FileInput, FileSystem, ObjectStorage, PresignOperation,
 };
-use graph::{Graph, GraphStore, types::DAG};
+use graph::{
+    Graph, GraphStore,
+    types::{DAG, Kind, Output},
+};
 use runtime::command::{NodeRun, Run};
 use scheduler::{
     AgentRef, Job, JobPoll, actuator::NodeConfig, cancel_job, fail_job, succeed_job, terminate_job,
@@ -13,6 +19,38 @@ use scheduler::{
 use uuid::Uuid;
 
 use super::{App, AppError, Page, PageQuery};
+
+fn is_directory_output(output: &Output) -> bool {
+    output.kind == Kind::Directory || output.multiple
+}
+
+pub(super) fn output_catalog_filename(output: &Output) -> Cow<'_, str> {
+    if is_directory_output(output) {
+        format!("{}/{DIRECTORY_MANIFEST}", output.file_name).into()
+    } else {
+        output.file_name.as_str().into()
+    }
+}
+
+pub(super) fn resolve_input_source<'a>(
+    graph: &'a DAG,
+    source: &str,
+) -> Result<(Uuid, &'a Output), AppError> {
+    let mut outputs = graph.nodes.iter().filter_map(|node| {
+        let filename = source.strip_prefix(&node.name)?.strip_prefix('.')?;
+        node.outputs
+            .iter()
+            .find(|output| output.file_name == filename)
+            .map(|output| (node.id, output))
+    });
+    let output = outputs
+        .next()
+        .ok_or_else(|| AppError::InvalidRequest("input producer output is not declared".into()))?;
+    if outputs.next().is_some() {
+        return Err(AppError::InvalidRequest("input source is ambiguous".into()));
+    }
+    Ok(output)
+}
 
 impl<S> App<S> {
     async fn validate_output_filename(
@@ -31,12 +69,13 @@ impl<S> App<S> {
         let node = graph
             .node(node_run.node_id)
             .ok_or(AppError::NodeNotFound(node_run.node_id))?;
-        if !node
-            .data
-            .outputs
-            .iter()
-            .any(|output| output.file_name == filename)
-        {
+        if !node.data.outputs.iter().any(|output| {
+            output.file_name == filename
+                || (is_directory_output(output)
+                    && filename
+                        .strip_prefix(output.file_name.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+        }) {
             return Err(AppError::InvalidRequest(
                 "filename is not a declared output".into(),
             ));
@@ -207,6 +246,8 @@ impl<S> App<S> {
         S: GraphStore<Uuid, G = DAG> + Clone,
         S::Err: Send + Sync + 'static,
     {
+        validate_relative_path(&filename)
+            .map_err(|error| AppError::InvalidRequest(error.to_string()))?;
         let mut db = self.db.clone();
         let job = Job::filter_by_uuid(job_id)
             .include(Job::fields().node_run())
@@ -222,58 +263,47 @@ impl<S> App<S> {
         let consumer = graph
             .node(node_run.node_id)
             .ok_or(AppError::NodeNotFound(node_run.node_id))?;
-        let (input_name, member_suffix) = filename
-            .split_once('/')
-            .map_or((filename.as_str(), None), |(name, suffix)| {
-                (name, Some(suffix))
-            });
-        let input = consumer
+        let (input, member_suffix) = consumer
             .data
             .inputs
             .iter()
-            .find(|input| input.file_name == input_name)
+            .filter_map(|input| {
+                let suffix = filename.strip_prefix(input.file_name.as_str())?;
+                if suffix.is_empty() {
+                    Some((input, None))
+                } else {
+                    suffix.strip_prefix('/').map(|member| (input, Some(member)))
+                }
+            })
+            .max_by_key(|(input, _)| input.file_name.len())
             .ok_or_else(|| AppError::ArtifactNotFound(filename.clone()))?;
-        let (producer_name, producer_filename) = input
-            .source
-            .split_once('.')
-            .ok_or_else(|| AppError::InvalidRequest("input source is invalid".into()))?;
-        let producer = graph
-            .nodes()
-            .find(|node| node.data.name == producer_name)
-            .ok_or_else(|| AppError::NodeNotFound(node_run.node_id))?;
-        if !producer
-            .data
-            .outputs
-            .iter()
-            .any(|output| output.file_name == producer_filename)
-        {
-            return Err(AppError::InvalidRequest(
-                "input producer output is not declared".into(),
-            ));
-        }
+        let (producer, output) = resolve_input_source(&graph, &input.source)?;
         let producer_run = NodeRun::filter_by_run_id(job.run_id)
-            .filter(NodeRun::fields().node_id().eq(producer.id))
+            .filter(NodeRun::fields().node_id().eq(producer))
             .filter(NodeRun::fields().revision().le(node_run.revision))
             .filter(NodeRun::fields().ineffective().eq(0))
             .order_by(NodeRun::fields().revision().desc())
             .first()
             .exec(&mut db)
             .await?
-            .ok_or(AppError::NodeNotFound(producer.id))?;
+            .ok_or(AppError::NodeNotFound(producer))?;
         if producer_run.status != "Succeeded" {
             return Err(AppError::ArtifactNotFound(filename));
         }
-        let filename = member_suffix.map_or_else(
-            || producer_filename.to_owned(),
-            |suffix| format!("{producer_filename}/{suffix}"),
-        );
+        let filename = match member_suffix {
+            Some(suffix) if is_directory_output(output) => {
+                format!("{}/{suffix}", output.file_name).into()
+            }
+            Some(_) => return Err(AppError::ArtifactNotFound(filename)),
+            None => output_catalog_filename(output),
+        };
         let file = db
             .get_file_by_node_run_filename(producer_run.uuid, &filename)
             .await?
-            .ok_or_else(|| AppError::ArtifactNotFound(filename.clone()))?;
+            .ok_or_else(|| AppError::ArtifactNotFound(filename.to_string()))?;
         let catalog = file
             .catalog
-            .ok_or_else(|| AppError::ArtifactNotFound(filename))?;
+            .ok_or_else(|| AppError::ArtifactNotFound(filename.into_owned()))?;
         if !catalog.uploaded {
             return Err(AppError::ArtifactNotFound(catalog.uuid.to_string()));
         }

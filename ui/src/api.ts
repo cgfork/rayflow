@@ -56,24 +56,25 @@ export function useRemote<T>(path: string | null, interval = 0) {
       if (document.hidden) timer = setTimeout(tick, interval);
       else void load();
     }
-    void load();
+    // Let StrictMode clean up its first setup before sending a request.
+    timer = setTimeout(load, 0);
     return () => { controller.abort(); clearTimeout(timer); };
   }, [path, interval, revision]);
   return { data: result.path === path ? result.data : undefined, error: result.path === path ? result.error : undefined, loading, refresh };
 }
 
-export function usePaged<T>(path: string, interval = 0) {
-  const [navigation, setNavigation] = useState<{ path: string; cursors: (number | undefined)[] }>({ path, cursors: [undefined] });
+export function usePaged<T>(path: string | null, interval = 0) {
+  const [navigation, setNavigation] = useState<{ path: string | null; cursors: (number | undefined)[] }>({ path, cursors: [undefined] });
   const cursors = navigation.path === path ? navigation.cursors : [undefined];
   const before = cursors[cursors.length - 1];
-  const result = useRemote<Page<T>>(`${path}${path.includes('?') ? '&' : '?'}limit=50${before === undefined ? '' : `&before=${before}`}`, interval);
+  const result = useRemote<Page<T>>(path === null ? null : `${path}${path.includes('?') ? '&' : '?'}limit=50${before === undefined ? '' : `&before=${before}`}`, interval);
   return { ...result, page: cursors.length,
     next: () => { if (result.data?.next_cursor != null) setNavigation({ path, cursors: [...cursors, result.data.next_cursor] }); },
     previous: () => setNavigation({ path, cursors: cursors.slice(0, -1) }),
   };
 }
 
-export const shortId = (id: string) => id.slice(0, 8);
+export const shortId = (id: string) => id.slice(0, 6);
 export const dateTime = (value?: string | null) => value ? new Date(value).toLocaleString() : '—';
 export function relativeTime(value: string) {
   const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
