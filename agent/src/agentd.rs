@@ -253,7 +253,9 @@ where
                     Ok(_) => container,
                     Err(error) if is_not_found(&error) => {
                         self.inner.containers.lock().await.remove(&persisted_id);
-                        self.create_container(job_fs, &job).await?
+                        return Err(Error::Agentd(format!(
+                            "persisted container {persisted_id} is missing; refusing to create a replacement"
+                        )));
                     }
                     Err(error) => return Err(error),
                 }

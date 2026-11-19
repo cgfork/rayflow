@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashSet,
+    fs::{File as StdFile, OpenOptions as StdOpenOptions, TryLockError},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -13,6 +14,7 @@ use std::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use graph::{GraphStore, types::DAG};
 use scheduler::Job;
+use serde::Serialize;
 use tokio::{
     sync::{Mutex, Notify, watch},
     time::sleep,
@@ -41,6 +43,7 @@ pub struct Agentic<C = DockerContainerd, R = Client> {
     client: Client,
     transfer: JobTransfer,
     settings: Settings,
+    _owner_lock: StdFile,
     active: Mutex<HashSet<Uuid>>,
     reporting: Mutex<()>,
     stop: watch::Sender<bool>,
@@ -53,13 +56,14 @@ impl Agentic {
     pub async fn new(settings: Settings) -> Result<Self, Error> {
         settings.validate()?;
         let client = Client::new(settings.clone())?;
+        let owner_lock = acquire_owner_lock(&settings)?;
         let agentd = Agentd::open(
             DockerContainerd::connect_with_defaults()?,
             client.clone(),
             settings.clone(),
         )
         .await?;
-        Self::with_agent(agentd, client, settings)
+        Self::with_agent_owner(agentd, client, settings, owner_lock)
     }
 }
 
@@ -74,6 +78,16 @@ where
         client: Client,
         settings: Settings,
     ) -> Result<Self, Error> {
+        let owner_lock = acquire_owner_lock(&settings)?;
+        Self::with_agent_owner(agentd, client, settings, owner_lock)
+    }
+
+    fn with_agent_owner(
+        agentd: Agentd<C, R>,
+        client: Client,
+        settings: Settings,
+        owner_lock: StdFile,
+    ) -> Result<Self, Error> {
         settings.validate()?;
         if agentd.settings().workdir != settings.workdir
             || agentd.settings().data_dir != settings.data_dir
@@ -82,11 +96,13 @@ where
                 "agent daemon and transfer must use the same settings",
             ));
         }
+        write_owner_record(&settings, Uuid::new_v4())?;
         Ok(Self {
             transfer: JobTransfer::new(client.clone())?,
             agentd,
             client,
             settings,
+            _owner_lock: owner_lock,
             active: Mutex::new(HashSet::new()),
             reporting: Mutex::new(()),
             stop: watch::channel(false).0,
@@ -311,9 +327,89 @@ struct RunningGuard<'a> {
     stopped: &'a Notify,
 }
 
+const OWNER_FORMAT_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+struct OwnerRecord {
+    format_version: u32,
+    agent_id: Uuid,
+    generation: Uuid,
+    pid: u32,
+    binary_version: &'static str,
+    mode: &'static str,
+}
+
+fn acquire_owner_lock(settings: &Settings) -> Result<StdFile, Error> {
+    std::fs::create_dir_all(&settings.workdir)?;
+    let path = settings.workdir.join(".agent.lock");
+    let file = StdOpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(Error::Agentd(
+            "agent workdir is already owned by another process".into(),
+        )),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn write_owner_record(settings: &Settings, generation: Uuid) -> Result<(), Error> {
+    let record = OwnerRecord {
+        format_version: OWNER_FORMAT_VERSION,
+        agent_id: settings.id,
+        generation,
+        pid: std::process::id(),
+        binary_version: env!("CARGO_PKG_VERSION"),
+        mode: "running",
+    };
+    let path = settings.workdir.join(".agent-owner.json");
+    let contents = serde_json::to_vec(&record)?;
+    let temporary = settings
+        .workdir
+        .join(format!(".agent-owner.{}.tmp", Uuid::new_v4()));
+    std::fs::write(&temporary, contents)?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 impl Drop for RunningGuard<'_> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         self.stopped.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scheduler::ResourceCapacity;
+    use tempfile::tempdir;
+
+    #[test]
+    fn owner_lock_excludes_a_second_agent_and_releases_on_drop() {
+        let root = tempdir().unwrap();
+        let settings = Settings::new(
+            Uuid::new_v4(),
+            "http://127.0.0.1:8080",
+            root.path().join("jobs"),
+            ResourceCapacity {
+                cpu_cores: 1,
+                memory_bytes: 1,
+            },
+        );
+        let owner = acquire_owner_lock(&settings).unwrap();
+        assert!(matches!(
+            acquire_owner_lock(&settings),
+            Err(Error::Agentd(message)) if message.contains("already owned")
+        ));
+        drop(owner);
+        assert!(acquire_owner_lock(&settings).is_ok());
     }
 }

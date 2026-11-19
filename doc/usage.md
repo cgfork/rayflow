@@ -232,8 +232,11 @@ use compatible lease and poll settings.
 
 ### Agent
 
-The agent requires a stable, non-nil UUID. The other settings have defaults:
-`server_url` is the server base URL; the agent appends `/api/v1` automatically.
+The agent identity is stable across restarts. Set `id` explicitly when managing
+multiple agents, or omit it and let the first startup generate it in
+`<workdir>/.agent-owner.json`; later starts recover that UUID. The other
+settings have defaults. `server_url` is the server base URL; the agent appends
+`/api/v1` automatically.
 
 ```yaml
 id: 12345678-1234-4234-8234-123456789abc
@@ -622,6 +625,8 @@ directory; `job.json` is the source used to restore the job after a restart:
 {WORKDIR}/{job-uuid}/result.json
 {WORKDIR}/{job-uuid}/pid
 {WORKDIR}/{job-uuid}/runtime/started_at
+{WORKDIR}/.agent.lock
+{WORKDIR}/.agent-owner.json
 ```
 
 `container.json`, `result.json`, `pid`, and `runtime/started_at` are written only
@@ -632,6 +637,16 @@ The `lock` file is held with an exclusive OS lock while a job is being
 coordinated. On startup, `Agentic` discovers existing directories, reconnects
 to containers by their persisted IDs, and retries unreported results. Keep this
 directory across agent restarts.
+
+The agent also holds a process-wide lock for the entire `workdir`. Start an
+upgraded binary only after the previous process has exited, using the same
+agent UUID, `workdir`, and `data_dir`. The new process acquires the lock,
+reconnects to persisted containers, retries durable results, and resumes
+active jobs. The owner JSON is diagnostic metadata; the OS lock is the
+authority, so a stale owner file after a crash does not block recovery. Running
+containers and unacknowledged results remain available during this handoff.
+If a persisted container ID no longer exists, recovery fails closed instead of
+creating a second container for the same job.
 
 ## Agent inputs and outputs
 

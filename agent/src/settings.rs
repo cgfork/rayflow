@@ -1,6 +1,8 @@
 use std::{
     env,
-    path::PathBuf,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -14,9 +16,17 @@ use crate::errors::Error;
 
 /// Files larger than this size use multipart/ranged transfers by default.
 pub const DEFAULT_MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+const OWNER_FILE: &str = ".agent-owner.json";
+
+#[derive(Deserialize)]
+struct OwnerIdentity {
+    agent_id: Uuid,
+}
 
 #[derive(Clone, Deserialize)]
 pub struct Settings {
+    /// Stable agent identity. When omitted, it is generated once in `workdir`.
+    #[serde(default)]
     pub id: Uuid,
     /// Server base URL; the client appends `/api/v1` to API requests.
     pub server_url: String,
@@ -55,7 +65,10 @@ impl std::fmt::Debug for Settings {
 }
 
 impl Settings {
-    /// Loads rayflow configuration and RAYFLOW_AGENT_* overrides. The UUID is required.
+    /// Loads rayflow configuration and RAYFLOW_AGENT_* overrides.
+    ///
+    /// If no explicit UUID is configured, the first startup generates one in
+    /// `.agent-owner.json`; later starts recover the same identity from there.
     pub fn load() -> Result<Self, Error> {
         let path = env::var("RAYFLOW_AGENT_CONFIG")
             .ok()
@@ -72,7 +85,7 @@ impl Settings {
         let system = System::new_with_specifics(
             RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
         );
-        let settings: Self = Builder::builder()
+        let mut settings: Self = Builder::builder()
             .set_default("server_url", "http://127.0.0.1:8080")?
             .set_default("workdir", ".rayflow/jobs")?
             .set_default("data_dir", ".rayflow/data")?
@@ -90,6 +103,9 @@ impl Settings {
             .add_source(Self::environment())
             .build()?
             .try_deserialize()?;
+        if settings.id.is_nil() {
+            settings.id = load_or_create_agent_id(&settings.workdir)?;
+        }
         settings.validate()?;
         Ok(settings)
     }
@@ -172,6 +188,52 @@ fn default_multipart_threshold() -> u64 {
     DEFAULT_MULTIPART_THRESHOLD
 }
 
+fn load_or_create_agent_id(workdir: &Path) -> Result<Uuid, Error> {
+    fs::create_dir_all(workdir)?;
+    let path = workdir.join(OWNER_FILE);
+    loop {
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let identity: OwnerIdentity = serde_json::from_slice(&bytes).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid agent owner: {error}"),
+                    )
+                })?;
+                if identity.agent_id.is_nil() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "agent owner UUID must not be nil",
+                    )
+                    .into());
+                }
+                return Ok(identity.agent_id);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let agent_id = Uuid::new_v4();
+        let contents = serde_json::to_vec(&serde_json::json!({
+            "format_version": 1,
+            "agent_id": agent_id,
+            "generation": Uuid::new_v4(),
+            "pid": std::process::id(),
+            "binary_version": env!("CARGO_PKG_VERSION"),
+            "mode": "initializing",
+        }))?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(&contents)?;
+                file.sync_all()?;
+                return Ok(agent_id);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +283,14 @@ mod tests {
             settings.validate(),
             Err(Error::Settings("multipart threshold must be positive"))
         ));
+    }
+
+    #[test]
+    fn generates_and_recovers_agent_id_from_owner_file() {
+        let root = tempfile::tempdir().unwrap();
+        let first = load_or_create_agent_id(root.path()).unwrap();
+        let second = load_or_create_agent_id(root.path()).unwrap();
+        assert_eq!(first, second);
+        assert!(root.path().join(OWNER_FILE).is_file());
     }
 }
