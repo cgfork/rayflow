@@ -46,7 +46,7 @@ Use `./dev.sh --agent` to include a local Docker agent. Press Ctrl-C to stop.
 
 ## Release builds
 
-Build the UI and API server as separate artifacts:
+Build the UI and all runtime binaries as separate artifacts:
 
 ```sh
 ./release.sh
@@ -54,7 +54,9 @@ Build the UI and API server as separate artifacts:
 
 Serve `ui/dist/` with a web server and proxy `/api/v1/` to
 `target/release/server`. See [Production hosting](doc/usage.md#production-hosting).
-The script also builds `target/release/init-db` for database initialization.
+The script also builds `target/release/init-db` for database initialization,
+`target/release/pilot` for workflow scheduling, and `target/release/agent` for
+container execution.
 It can run from any working directory and reports the actual Cargo artifact
 paths, including custom target directories and build targets.
 
@@ -65,7 +67,8 @@ To embed the UI into the server executable instead:
 ```
 
 The resulting `target/release/server` contains the UI assets and serves the
-console at `/`, with both browser and agent API requests under `/api/v1`.
+console at `/`, with both browser and agent API requests under `/api/v1`. The
+same command also builds the release `pilot`, `agent`, and `init-db` binaries.
 Node.js and `ui/dist` are not needed on the deployment host. Set `auth.public_url` in `rayflow.yaml` to
 the externally reachable server URL for authentication callbacks.
 

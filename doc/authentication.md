@@ -45,6 +45,13 @@ When authentication is enabled, `./dev.sh` prints the configured browser origin
 as its UI address. If you change `RAYFLOW_DEV_UI_PORT`, update `auth.public_url`
 or `RAYFLOW_AUTH__PUBLIC_URL` to match the address you open in the browser.
 
+When the server is built with `./release.sh --embed-ui`, the console is served
+from the server itself. In that build, the server derives the browser origin
+from the request host, so opening `http://127.0.0.1:8080` keeps login on that
+origin even when the configuration file still contains a separate development
+UI address. Separate UI deployments continue to use the configured
+`auth.public_url`.
+
 Nested environment overrides use double underscores after `RAYFLOW_`:
 
 ```sh

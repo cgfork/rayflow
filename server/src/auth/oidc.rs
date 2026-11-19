@@ -24,6 +24,13 @@ pub(super) struct OidcProvider {
 
 impl OidcProvider {
     pub async fn new(config: &AuthConfig) -> Result<Self, AuthError> {
+        Self::new_with_redirect(config, &config.public_url).await
+    }
+
+    pub async fn new_with_redirect(
+        config: &AuthConfig,
+        public_url: &str,
+    ) -> Result<Self, AuthError> {
         let oidc = config.oidc.as_ref().ok_or(AuthError::Unavailable)?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -54,7 +61,7 @@ impl OidcProvider {
         .set_redirect_uri(
             RedirectUrl::new(format!(
                 "{}/api/v1/auth/oidc/callback",
-                config.public_url.trim_end_matches('/')
+                public_url.trim_end_matches('/')
             ))
             .map_err(|_| AuthError::Unavailable)?,
         );
@@ -65,10 +72,16 @@ impl OidcProvider {
         })
     }
 
-    pub fn start(&self) -> (String, String, String, String) {
+    pub fn start(&self, public_url: &str) -> Result<(String, String, String, String), AuthError> {
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-        let (url, state, nonce) = self
-            .client
+        let client = self.client.clone().set_redirect_uri(
+            RedirectUrl::new(format!(
+                "{}/api/v1/auth/oidc/callback",
+                public_url.trim_end_matches('/')
+            ))
+            .map_err(|_| AuthError::Unavailable)?,
+        );
+        let (url, state, nonce) = client
             .authorize_url(
                 AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
                 CsrfToken::new_random,
@@ -78,12 +91,12 @@ impl OidcProvider {
             .add_scope(Scope::new("email".into()))
             .set_pkce_challenge(challenge)
             .url();
-        (
+        Ok((
             url.to_string(),
             state.secret().clone(),
             nonce.secret().clone(),
             verifier.secret().clone(),
-        )
+        ))
     }
 
     pub async fn finish(&self, code: String, flow: LoginFlow) -> Result<User, AuthError> {

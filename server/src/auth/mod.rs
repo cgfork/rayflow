@@ -170,6 +170,19 @@ impl Auth {
     fn secure(&self) -> bool {
         self.0.config.public_url.starts_with("https://")
     }
+
+    /// Returns the browser origin used by the current authentication request.
+    ///
+    /// Embedded builds serve the UI from this server, so the request host is
+    /// authoritative for the browser origin. Separate UI builds keep using the
+    /// configured frontend origin.
+    fn browser_url(&self, headers: &HeaderMap) -> String {
+        browser_url_for(
+            &self.0.config.public_url,
+            headers,
+            cfg!(feature = "embed-ui"),
+        )
+    }
     fn session_cookie(&self) -> &'static str {
         if self.secure() {
             "__Host-rayflow_session"
@@ -201,9 +214,11 @@ impl Auth {
         {
             return Err(AuthError::Forbidden);
         }
-        if headers.get(header::ORIGIN).is_some_and(|origin| {
-            origin.to_str().ok() != Some(self.0.config.public_url.trim_end_matches('/'))
-        }) {
+        let expected = self.browser_url(headers);
+        if headers
+            .get(header::ORIGIN)
+            .is_some_and(|origin| origin.to_str().ok() != Some(expected.trim_end_matches('/')))
+        {
             return Err(AuthError::Forbidden);
         }
         Ok(())
@@ -319,6 +334,34 @@ impl Auth {
     }
 }
 
+fn browser_url_for(configured_url: &str, headers: &HeaderMap, embedded: bool) -> String {
+    if !embedded {
+        return configured_url.to_owned();
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return configured_url.to_owned();
+    };
+    let Some(config_url) = url::Url::parse(configured_url).ok() else {
+        return configured_url.to_owned();
+    };
+    let Ok(url) = url::Url::parse(&format!("{}://{host}", config_url.scheme())) else {
+        return configured_url.to_owned();
+    };
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return configured_url.to_owned();
+    }
+    url.origin().ascii_serialization()
+}
+
 pub(crate) fn routes(auth: Option<Auth>, enabled: bool) -> Router {
     Router::new()
         .route("/auth/providers", get(providers))
@@ -359,7 +402,10 @@ async fn no_cache(request: Request, next: Next) -> Response {
     response
 }
 
-async fn providers(State(state): State<AuthState>) -> Result<Json<serde_json::Value>, AuthError> {
+async fn providers(
+    State(state): State<AuthState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AuthError> {
     if !state.enabled {
         return Ok(Json(
             serde_json::json!({ "enabled": false, "company_name": "Rayflow", "providers": [] }),
@@ -379,7 +425,7 @@ async fn providers(State(state): State<AuthState>) -> Result<Json<serde_json::Va
     Ok(Json(serde_json::json!({
         "enabled": true,
         "company_name": auth.0.config.company_name,
-        "public_url": auth.0.config.public_url,
+        "public_url": auth.browser_url(&headers),
         "providers": providers,
     })))
 }
@@ -446,10 +492,19 @@ async fn logout(State(state): State<AuthState>, headers: HeaderMap) -> Result<Re
         .into_response())
 }
 
-async fn oidc_login(State(state): State<AuthState>) -> Result<Response, AuthError> {
+async fn oidc_login(
+    State(state): State<AuthState>,
+    headers: HeaderMap,
+) -> Result<Response, AuthError> {
     let auth = state.required()?;
     auth.limit("oidc-start")?;
-    let (url, state, nonce, verifier) = auth.0.oidc.as_ref().ok_or(AuthError::Unavailable)?.start();
+    let browser_url = auth.browser_url(&headers);
+    let (url, state, nonce, verifier) = auth
+        .0
+        .oidc
+        .as_ref()
+        .ok_or(AuthError::Unavailable)?
+        .start(&browser_url)?;
     let browser = random_token();
     let mut db = auth.0.db.clone();
     LoginFlow::filter(LoginFlow::fields().expires_at().le(Timestamp::now()))
@@ -487,6 +542,7 @@ async fn oidc_callback(
     Query(callback): Query<Callback>,
 ) -> Result<Response, AuthError> {
     let auth = state.required()?;
+    let browser_url = auth.browser_url(&headers);
     let result: Result<HeaderValue, AuthError> = async {
         let browser = cookie_value(&headers, auth.flow_cookie()).ok_or(AuthError::InvalidLogin)?;
         let flow = auth.consume_flow(&callback.state, browser).await?;
@@ -494,7 +550,7 @@ async fn oidc_callback(
             return Err(AuthError::InvalidLogin);
         }
         // Refresh discovery/JWKS for key rotation. The pinned issuer still verifies the token.
-        let oidc = oidc::OidcProvider::new(&auth.0.config).await?;
+        let oidc = oidc::OidcProvider::new_with_redirect(&auth.0.config, &browser_url).await?;
         let user = oidc
             .finish(callback.code.ok_or(AuthError::InvalidLogin)?, flow)
             .await?;
@@ -502,16 +558,8 @@ async fn oidc_callback(
     }
     .await;
     let mut response = match result {
-        Ok(cookie) => (
-            [(header::SET_COOKIE, cookie)],
-            Redirect::to(&auth.0.config.public_url),
-        )
-            .into_response(),
-        Err(_) => Redirect::to(&format!(
-            "{}/?login_error=1",
-            auth.0.config.public_url.trim_end_matches('/')
-        ))
-        .into_response(),
+        Ok(cookie) => ([(header::SET_COOKIE, cookie)], Redirect::to(&browser_url)).into_response(),
+        Err(_) => Redirect::to(&format!("{browser_url}/?login_error=1")).into_response(),
     };
     response
         .headers_mut()
@@ -618,4 +666,29 @@ fn digest(value: &str) -> String {
 }
 fn same_secret(left: &str, right: &str) -> bool {
     bool::from(Sha256::digest(left.as_bytes()).ct_eq(&Sha256::digest(right.as_bytes())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_browser_origin_uses_request_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8080"));
+        assert_eq!(
+            browser_url_for("http://10.10.2.199:5173", &headers, true),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn separate_browser_origin_keeps_configured_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8080"));
+        assert_eq!(
+            browser_url_for("http://10.10.2.199:5173", &headers, false),
+            "http://10.10.2.199:5173"
+        );
+    }
 }
