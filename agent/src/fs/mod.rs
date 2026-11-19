@@ -105,6 +105,9 @@ pub trait JobFs {
 
     async fn clear(&mut self) -> Result<(), crate::errors::Error>;
 
+    /// Removes the per-job artifact directory after remote acknowledgement.
+    async fn clear_data(&mut self) -> Result<(), crate::errors::Error>;
+
     async fn lock(&self) -> Result<(), crate::errors::Error>;
 
     async fn unlock(&self) -> Result<(), crate::errors::Error>;
@@ -126,22 +129,3 @@ pub trait JobFs {
 pub trait GraphFs: GraphStore<Uuid, G = DAG> {}
 
 impl<T> GraphFs for T where T: GraphStore<Uuid, G = DAG> {}
-
-/// Filesystem provider used by an agent.
-pub trait AgentFs {
-    /// The job filesystem returned for a borrowed agent filesystem.
-    type JobFs<'a>: JobFs
-    where
-        Self: 'a;
-
-    /// The graph filesystem returned for a borrowed agent filesystem.
-    type GraphFs<'a>: GraphFs
-    where
-        Self: 'a;
-
-    /// Opens the filesystem for one job.
-    fn job_fs(&self, job: &scheduler::Job) -> Self::JobFs<'_>;
-
-    /// Opens the graph cache filesystem.
-    fn graph_fs(&self) -> Self::GraphFs<'_>;
-}

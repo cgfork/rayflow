@@ -8,6 +8,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use catalog::PresignedUrl;
 use event::task_event::TaskEvent;
 use graph::{GraphStore, types::DAG};
 use scheduler::{AgentRef, ResourceCapacity};
@@ -79,6 +80,38 @@ pub struct PresignInputRequest {
     pub filename: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateMultipartOutputRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub filename: String,
+    pub size: Option<u64>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MultipartOutputContext {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub filename: String,
+    pub catalog_uuid: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UploadMultipartOutputRequest {
+    #[serde(flatten)]
+    pub context: MultipartOutputContext,
+    pub upload_id: String,
+    pub part_number: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionMultipartOutputRequest {
+    #[serde(flatten)]
+    pub context: MultipartOutputContext,
+    pub upload_id: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PollJobsResponse {
     pub jobs: Vec<scheduler::Job>,
@@ -101,6 +134,22 @@ where
         .route("/job/terminate", post(terminate_job::<S>))
         .route("/job/output/prepare", post(prepare_output::<S>))
         .route("/job/output/commit", post(commit_output::<S>))
+        .route(
+            "/job/output/multipart/create",
+            post(create_multipart_output::<S>),
+        )
+        .route(
+            "/job/output/multipart/upload",
+            post(upload_multipart_output::<S>),
+        )
+        .route(
+            "/job/output/multipart/complete",
+            post(complete_multipart_output::<S>),
+        )
+        .route(
+            "/job/output/multipart/abort",
+            post(abort_multipart_output::<S>),
+        )
         .route("/job/input/presign", post(presign_input::<S>))
 }
 
@@ -160,6 +209,98 @@ where
     app.presign_input(request.job_id, request.agent_id, request.filename)
         .await
         .map(Json)
+}
+
+async fn create_multipart_output<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<CreateMultipartOutputRequest>,
+) -> Result<Json<PrepareOutputResponse>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.create_multipart_output(
+        request.job_id,
+        request.agent_id,
+        request.filename,
+        request.size,
+        request.format,
+    )
+    .await
+    .map(|transfer| {
+        Json(PrepareOutputResponse {
+            catalog_uuid: transfer.catalog.uuid,
+            transfer,
+        })
+    })
+}
+
+async fn upload_multipart_output<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<UploadMultipartOutputRequest>,
+) -> Result<Json<PresignedUrl>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.presign_multipart_output(
+        request.context.job_id,
+        request.context.agent_id,
+        request.context.filename,
+        request.context.catalog_uuid,
+        catalog::PresignOperation::UploadPart {
+            upload_id: request.upload_id,
+            part_number: request.part_number,
+        },
+    )
+    .await
+    .map(Json)
+}
+
+async fn complete_multipart_output<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<SessionMultipartOutputRequest>,
+) -> Result<Json<PresignedUrl>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.presign_multipart_output(
+        request.context.job_id,
+        request.context.agent_id,
+        request.context.filename,
+        request.context.catalog_uuid,
+        catalog::PresignOperation::CompleteMultipart {
+            upload_id: request.upload_id,
+        },
+    )
+    .await
+    .map(Json)
+}
+
+async fn abort_multipart_output<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<SessionMultipartOutputRequest>,
+) -> Result<Json<PresignedUrl>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.presign_multipart_output(
+        request.context.job_id,
+        request.context.agent_id,
+        request.context.filename,
+        request.context.catalog_uuid,
+        catalog::PresignOperation::AbortMultipart {
+            upload_id: request.upload_id,
+        },
+    )
+    .await
+    .map(Json)
 }
 
 #[derive(Debug, Deserialize)]

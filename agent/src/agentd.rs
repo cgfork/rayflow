@@ -8,7 +8,6 @@
 use std::{
     collections::HashMap,
     io,
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -31,7 +30,7 @@ use crate::{
     containerd::{Container, ContainerState, Containerd, ExitStatus},
     errors::Error,
     fs::job::JobFs,
-    fs::{AgentFs, Container as JobContainer, JobFs as JobFsTrait, JobResult},
+    fs::{Container as JobContainer, JobFs as JobFsTrait, JobResult},
     settings::Settings,
 };
 
@@ -121,29 +120,6 @@ pub struct Agentd<C, R> {
     settings: Settings,
 }
 
-impl<C, R> AgentFs for Agentd<C, R>
-where
-    C: Containerd,
-    R: crate::fs::GraphFs + Clone,
-{
-    type JobFs<'a>
-        = JobFs
-    where
-        R: 'a;
-    type GraphFs<'a>
-        = R
-    where
-        R: 'a;
-
-    fn job_fs(&self, job: &Job) -> Self::JobFs<'_> {
-        self.job_fs(job)
-    }
-
-    fn graph_fs(&self) -> Self::GraphFs<'_> {
-        self.inner.graph_store.clone()
-    }
-}
-
 impl<C, R> Agentd<C, R>
 where
     C: Containerd,
@@ -171,10 +147,6 @@ where
         Ok(agentd)
     }
 
-    pub fn data_dir(&self) -> &Path {
-        &self.settings.data_dir
-    }
-
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
@@ -182,12 +154,9 @@ where
     /// Persists a claimed job, loads its pinned graph version, and prepares
     /// the provider resources needed by the job.
     pub async fn prepare(&self, job: Job) -> Result<(), Error> {
-        let mut job_fs = JobFs::new(job, self.settings.clone());
-        JobFsTrait::lock(&job_fs).await?;
+        let job_fs = JobFs::open_locked(job, self.settings.clone()).await?;
         let result = async {
-            job_fs.load_cached().await?;
             self.validate_preparation(&job_fs).await?;
-            job_fs.persist_job().await?;
             let spec = self
                 .execution_spec(JobFsTrait::job(&job_fs), &job_fs)
                 .await?;
@@ -304,7 +273,6 @@ where
                     container.kill().await?;
                     self.finish_locked(
                         job_fs,
-                        &job,
                         ExitStatus {
                             exit_code: 124,
                             finished_at: Some(Timestamp::now()),
@@ -322,7 +290,6 @@ where
             } => {
                 self.finish_locked(
                     job_fs,
-                    &job,
                     ExitStatus {
                         exit_code,
                         finished_at,
@@ -337,7 +304,6 @@ where
                     return self
                         .finish_locked(
                             job_fs,
-                            &job,
                             ExitStatus {
                                 exit_code: 124,
                                 finished_at: Some(Timestamp::now()),
@@ -357,7 +323,6 @@ where
                             container.kill().await?;
                             self.finish_locked(
                                 job_fs,
-                                &job,
                                 ExitStatus {
                                     exit_code: 124,
                                     finished_at: Some(Timestamp::now()),
@@ -375,7 +340,6 @@ where
                     } => {
                         self.finish_locked(
                             job_fs,
-                            &job,
                             ExitStatus {
                                 exit_code,
                                 finished_at,
@@ -545,13 +509,9 @@ where
         let job_fs = self.persisted_job_fs_locked(job_id).await?;
         let read = async {
             match JobFsTrait::job_result(&job_fs) {
-                Some(result) => {
-                    let job = JobFsTrait::job(&job_fs).clone();
-                    Ok(Some(
-                        self.agent_result(job_id, &job_fs, result.clone(), job)
-                            .await?,
-                    ))
-                }
+                Some(result) => Ok(Some(
+                    self.agent_result(job_id, &job_fs, result.clone()).await?,
+                )),
                 None => Ok(None),
             }
         }
@@ -562,10 +522,8 @@ where
 
     /// Persists a failed preparation or start so it can be reported after a restart.
     pub async fn fail(&self, job: Job) -> Result<(), Error> {
-        let mut job_fs = JobFs::new(job.clone(), self.settings.clone());
-        JobFsTrait::lock(&job_fs).await?;
+        let mut job_fs = JobFs::open_locked(job, self.settings.clone()).await?;
         let result = async {
-            job_fs.load_cached().await?;
             if JobFsTrait::job_result(&job_fs).is_some() {
                 return Ok(());
             }
@@ -575,7 +533,6 @@ where
             {
                 return Err(error);
             }
-            job_fs.persist_job().await?;
             JobFsTrait::write_job_result(
                 &mut job_fs,
                 JobResult {
@@ -605,13 +562,9 @@ where
             };
             let read_result = async {
                 match JobFsTrait::job_result(&job_fs) {
-                    Some(result) => {
-                        let job = JobFsTrait::job(&job_fs).clone();
-                        Ok(Some(
-                            self.agent_result(job_id, &job_fs, result.clone(), job)
-                                .await?,
-                        ))
-                    }
+                    Some(result) => Ok(Some(
+                        self.agent_result(job_id, &job_fs, result.clone()).await?,
+                    )),
                     None => Ok(None),
                 }
             }
@@ -649,7 +602,7 @@ where
     /// Removes a stopped container and its local execution metadata.
     pub async fn remove(&self, job_id: Uuid) -> Result<(), Error> {
         let mut job_fs = self.persisted_job_fs_locked(job_id).await?;
-        let result = self.remove_locked(&mut job_fs, job_id).await;
+        let result = self.remove_locked(&mut job_fs, job_id, false).await;
         let unlock = JobFsTrait::unlock(&job_fs).await;
         result.and(unlock)
     }
@@ -664,13 +617,14 @@ where
                 "cannot acknowledge a job without a result: {job_id}"
             )));
         }
-        self.remove_locked(job_fs, job_id).await
+        self.remove_locked(job_fs, job_id, true).await
     }
 
     async fn remove_locked<J: JobFsTrait>(
         &self,
         job_fs: &mut J,
         job_id: Uuid,
+        clear_data: bool,
     ) -> Result<(), Error> {
         if let Some(container) = JobFsTrait::container(job_fs) {
             let container_id = container.id.clone();
@@ -682,6 +636,9 @@ where
                 Err(error) => return Err(error),
             }
             self.inner.containers.lock().await.remove(&container_id);
+        }
+        if clear_data {
+            JobFsTrait::clear_data(job_fs).await?;
         }
         JobFsTrait::clear(job_fs).await?;
         Ok(())
@@ -700,7 +657,6 @@ where
         job_fs: &mut J,
         reason: StopReason,
     ) -> Result<(), Error> {
-        let job = JobFsTrait::job(job_fs).clone();
         let container_id = JobFsTrait::container(job_fs)
             .map(|container| container.id.clone())
             .ok_or_else(|| Error::Agentd("container metadata is missing".into()))?;
@@ -716,7 +672,6 @@ where
         };
         self.finish_locked(
             job_fs,
-            &job,
             ExitStatus {
                 exit_code,
                 finished_at: Some(Timestamp::now()),
@@ -772,7 +727,6 @@ where
             Err(error) if is_not_found(&error) => {
                 self.finish_locked(
                     job_fs,
-                    &job,
                     ExitStatus {
                         exit_code: 1,
                         finished_at: Some(Timestamp::now()),
@@ -794,7 +748,6 @@ where
                     handle.kill().await?;
                     self.finish_locked(
                         job_fs,
-                        &job,
                         ExitStatus {
                             exit_code: 124,
                             finished_at: Some(Timestamp::now()),
@@ -810,7 +763,6 @@ where
             } => {
                 self.finish_locked(
                     job_fs,
-                    &job,
                     ExitStatus {
                         exit_code,
                         finished_at,
@@ -827,7 +779,6 @@ where
                     handle.kill().await?;
                     self.finish_locked(
                         job_fs,
-                        &job,
                         ExitStatus {
                             exit_code: 124,
                             finished_at: Some(Timestamp::now()),
@@ -844,7 +795,6 @@ where
     async fn finish_locked<J: JobFsTrait>(
         &self,
         job_fs: &mut J,
-        _job: &Job,
         status: ExitStatus,
         forced_outcome: Option<JobOutcome>,
     ) -> Result<(), Error> {
@@ -883,7 +833,6 @@ where
         job_id: Uuid,
         job_fs: &J,
         result: JobResult,
-        _job: Job,
     ) -> Result<AgentResult, Error> {
         let outcome = match result.outcome.as_deref() {
             Some(outcome) => JobOutcome::parse(outcome)?,
@@ -901,17 +850,18 @@ where
         })
     }
 
-    /// Returns durable job metadata for orchestration.
+    /// Builds a non-persistent handle for inspecting a job's local paths.
+    /// Use [`JobFs::open`] or [`JobFs::reopen`] for lifecycle operations.
     pub fn job_fs(&self, job: &Job) -> JobFs {
         JobFs::new(job.clone(), self.settings.clone())
     }
 
     pub(crate) async fn persisted_job_fs(&self, job_id: Uuid) -> Result<JobFs, Error> {
-        JobFs::restore(self.settings.clone(), job_id).await
+        JobFs::reopen(self.settings.clone(), job_id).await
     }
 
     async fn persisted_job_fs_locked(&self, job_id: Uuid) -> Result<JobFs, Error> {
-        JobFs::restore_locked(self.settings.clone(), job_id).await
+        JobFs::reopen_locked(self.settings.clone(), job_id).await
     }
 
     async fn register_container(&self, container_id: String, job_id: Uuid) {

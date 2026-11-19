@@ -365,5 +365,3 @@ impl Containerd for DockerContainerd {
         Box::pin(stream)
     }
 }
-
-pub type DockerConnector = DockerContainerd;

@@ -20,7 +20,7 @@ pub mod errors;
 pub mod fs;
 pub mod settings;
 
-pub use fs::{AgentFs, GraphFs, JobFs as JobFsProvider};
+pub use fs::{GraphFs, JobFs as JobFsProvider};
 
 pub use agentd::{AgentResult, Agentd, JobOutcome, StopReason};
 pub use agentic::Agentic;

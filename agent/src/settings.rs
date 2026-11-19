@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 use crate::errors::Error;
 
+/// Files larger than this size use multipart/ranged transfers by default.
+pub const DEFAULT_MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Deserialize)]
 pub struct Settings {
     pub id: Uuid,
@@ -30,6 +33,9 @@ pub struct Settings {
     pub poll_interval: Duration,
     #[serde(with = "jiff::fmt::serde::unsigned_duration::required")]
     pub request_timeout: Duration,
+    /// Files larger than this size use multipart upload and ranged download.
+    #[serde(default = "default_multipart_threshold")]
+    pub multipart_threshold: u64,
 }
 
 impl std::fmt::Debug for Settings {
@@ -43,6 +49,7 @@ impl std::fmt::Debug for Settings {
             .field("batch", &self.batch)
             .field("poll_interval", &self.poll_interval)
             .field("request_timeout", &self.request_timeout)
+            .field("multipart_threshold", &self.multipart_threshold)
             .finish_non_exhaustive()
     }
 }
@@ -112,6 +119,7 @@ impl Settings {
             batch: 64,
             poll_interval: Duration::from_secs(1),
             request_timeout: Duration::from_secs(60),
+            multipart_threshold: DEFAULT_MULTIPART_THRESHOLD,
         }
     }
 
@@ -130,6 +138,9 @@ impl Settings {
         }
         if self.data_dir.as_os_str().is_empty() {
             return Err(Error::Settings("data_dir must not be empty"));
+        }
+        if self.multipart_threshold == 0 {
+            return Err(Error::Settings("multipart threshold must be positive"));
         }
         for duration in [self.poll_interval, self.request_timeout] {
             if duration.is_zero() || Instant::now().checked_add(duration).is_none() {
@@ -155,6 +166,10 @@ impl Settings {
 
 fn default_data_dir() -> PathBuf {
     ".rayflow/data".into()
+}
+
+fn default_multipart_threshold() -> u64 {
+    DEFAULT_MULTIPART_THRESHOLD
 }
 
 #[cfg(test)]
@@ -195,6 +210,16 @@ mod tests {
         assert!(matches!(
             settings.validate(),
             Err(Error::Settings("CPU and memory capacity must be positive"))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_multipart_threshold() {
+        let mut settings = valid_settings();
+        settings.multipart_threshold = 0;
+        assert!(matches!(
+            settings.validate(),
+            Err(Error::Settings("multipart threshold must be positive"))
         ));
     }
 }

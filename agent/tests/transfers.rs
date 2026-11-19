@@ -15,7 +15,7 @@ use agent::{
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post, put},
 };
@@ -44,8 +44,6 @@ const SIGNATURE: &str = "x-test-object-signature";
 
 struct Fixture {
     graph: DAG,
-    run: Run,
-    producer: NodeRun,
     job: Job,
     agent_id: Uuid,
     endpoint: String,
@@ -128,7 +126,6 @@ impl Fixture {
             updated_at: now,
             run: run.clone().into(),
         };
-        let producer = node_run(1, producer.id, "Succeeded");
         let consumer = node_run(2, consumer.id, "Running");
         let task = Task::new(run.data_id, graph.id, consumer.node_id, consumer.id);
         let mut job = Job::new(&task, run.uuid, Uuid::new_v4(), Uuid::new_v4());
@@ -139,8 +136,6 @@ impl Fixture {
         job.node_run = consumer.into();
         Self {
             graph,
-            run,
-            producer,
             job,
             agent_id,
             endpoint,
@@ -178,6 +173,7 @@ impl Fixture {
                     .checked_add(Duration::from_secs(30))
                     .unwrap(),
             },
+            multipart: false,
         }
     }
 }
@@ -202,31 +198,6 @@ struct Commit {
     #[serde(flatten)]
     claim: Claim,
     catalog_uuid: Uuid,
-}
-
-async fn graph(
-    State(fixture): State<Arc<Fixture>>,
-    Path(id): Path<Uuid>,
-    Query(query): Query<BTreeMap<String, u64>>,
-) -> Json<DAG> {
-    assert_eq!(id, fixture.graph.id);
-    assert_eq!(query.get("version"), Some(&fixture.graph.version));
-    fixture.record("graph");
-    Json(fixture.graph.clone())
-}
-
-async fn run(
-    State(fixture): State<Arc<Fixture>>,
-    Path(id): Path<Uuid>,
-    Query(query): Query<BTreeMap<String, u64>>,
-) -> Json<Value> {
-    assert_eq!(id, fixture.run.uuid);
-    assert_eq!(query.get("revision"), Some(&fixture.run.revision));
-    fixture.record("run");
-    Json(json!({
-        "run": fixture.run,
-        "node_runs": [[fixture.producer, fixture.graph.nodes[0]]],
-    }))
 }
 
 async fn presign_input(
@@ -334,8 +305,6 @@ async fn transfers_renamed_input_and_commits_file_and_directory_outputs_once() {
     settings.request_timeout = Duration::from_secs(5);
     let fixture = Arc::new(Fixture::new(settings.server_url.clone(), settings.id));
     let routes = Router::new()
-        .route("/api/v1/graphs/{id}", get(graph))
-        .route("/api/v1/runs/{id}", get(run))
         .route("/api/v1/job/input/presign", post(presign_input))
         .route("/api/v1/job/output/prepare", post(prepare_output))
         .route("/api/v1/job/output/commit", post(commit_output))
@@ -388,8 +357,6 @@ async fn transfers_renamed_input_and_commits_file_and_directory_outputs_once() {
     assert_eq!(
         traffic.calls,
         [
-            "graph",
-            "run",
             "presign staged/renamed.bin",
             "download original.bin",
             "prepare result.bin",

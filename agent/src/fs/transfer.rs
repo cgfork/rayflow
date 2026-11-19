@@ -3,6 +3,11 @@
 //! Metadata requests use the fleet client; object requests use a separate client
 //! without fleet credentials. Upload state survives restarts and success is
 //! reported only after every output and directory manifest has been published.
+//!
+//! Transfer operations do not acquire the job lifecycle lock. `Agentic` admits
+//! one executor per job, while the persisted markers make retries idempotent;
+//! the lock remains responsible for serializing job lifecycle changes such as
+//! start, stop, recovery, and cleanup.
 
 use crate::client::Transfer as CatalogTransfer;
 use catalog::directory::{
@@ -11,13 +16,18 @@ use catalog::directory::{
 };
 use catalog::path::validate_relative_path;
 use catalog::{PresignOperation, PresignedUrl};
-use graph::types::{DAG, Kind, Node};
+use graph::types::{Kind, Node};
 use scheduler::Job;
 use std::{
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -32,6 +42,26 @@ pub struct JobTransfer {
     client: Client,
     objects: reqwest::Client,
     agent_id: Uuid,
+}
+
+const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024;
+const MAX_MULTIPART_PARTS: u64 = 10_000;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct MultipartState {
+    catalog: catalog::model::Catalog,
+    upload_id: String,
+    size: u64,
+    modified: SystemTime,
+    parts: BTreeMap<u32, String>,
+}
+
+struct UploadSource<'a> {
+    filename: &'a str,
+    path: &'a Path,
+    format: &'a str,
+    size: u64,
+    modified: SystemTime,
 }
 
 impl JobTransfer {
@@ -54,8 +84,8 @@ impl JobTransfer {
         file_fs: &J,
         graph_store: &G,
     ) -> Result<(), Error> {
-        let job = file_fs.job().clone();
-        let node_run = job.node_run.get();
+        let job_id = file_fs.job().uuid;
+        let node_run = file_fs.job().node_run.get();
         let graph = graph_store
             .clone()
             .load(node_run.graph_id, Some(node_run.version))
@@ -70,20 +100,16 @@ impl JobTransfer {
         if node.inputs.is_empty() {
             return Ok(());
         }
-        file_fs.lock().await?;
-        let result = self.download_locked(file_fs, &job, &node).await;
-        let unlock = file_fs.unlock().await;
-        result.and(unlock)
+        self.download(file_fs, job_id, &node).await
     }
 
-    async fn download_locked<J: JobFsTrait>(
+    async fn download<J: JobFsTrait>(
         &self,
         file_fs: &J,
-        job: &Job,
+        job_id: Uuid,
         node: &Node,
     ) -> Result<(), Error> {
         validate_node_paths(node)?;
-        let job_id = job.uuid;
         if node.inputs.is_empty() || read_marker(file_fs, job_id, "inputs-ready").await? {
             return Ok(());
         }
@@ -97,24 +123,7 @@ impl JobTransfer {
             Err(e) => return Err(e.into()),
         }
         fs::create_dir_all(&root).await?;
-        let graph = self.job_graph(job).await?;
-        let state = self
-            .client
-            .run_state(job.run_id, job.node_run.get().revision)
-            .await?;
         for input in &node.inputs {
-            let Some(_filename) = self
-                .input_filename(job, &graph, &state, &input.source)
-                .await?
-            else {
-                if input.required {
-                    return Err(artifact(format!(
-                        "required input is unavailable: {}",
-                        input.file_name
-                    )));
-                }
-                continue;
-            };
             let Some(transfer) = self
                 .client
                 .download_input(job_id, self.agent_id, &input.file_name)
@@ -175,8 +184,8 @@ impl JobTransfer {
         file_fs: &J,
         graph_store: &G,
     ) -> Result<(), Error> {
-        let job = file_fs.job().clone();
-        let node_run = job.node_run.get();
+        let job_id = file_fs.job().uuid;
+        let node_run = file_fs.job().node_run.get();
         let graph = graph_store
             .clone()
             .load(node_run.graph_id, Some(node_run.version))
@@ -191,20 +200,16 @@ impl JobTransfer {
         if node.outputs.is_empty() {
             return Ok(());
         }
-        file_fs.lock().await?;
-        let result = self.upload_locked(file_fs, &job, &node).await;
-        let unlock = file_fs.unlock().await;
-        result.and(unlock)
+        self.upload(file_fs, job_id, &node).await
     }
 
-    async fn upload_locked<J: JobFsTrait>(
+    async fn upload<J: JobFsTrait>(
         &self,
         file_fs: &J,
-        job: &Job,
+        job_id: Uuid,
         node: &Node,
     ) -> Result<(), Error> {
         validate_node_paths(node)?;
-        let job_id = job.uuid;
         if node.outputs.is_empty() || read_marker(file_fs, job_id, "outputs-uploaded").await? {
             return Ok(());
         }
@@ -221,6 +226,7 @@ impl JobTransfer {
                     if entry.kind == EntryKind::File {
                         let file_path = safe_existing(&path, &entry.path).await?;
                         self.upload_one(
+                            &file_fs.state_dir(job_id),
                             job_id,
                             &format!("{}/{}", output.file_name, entry.path),
                             &file_path,
@@ -233,6 +239,7 @@ impl JobTransfer {
                 // Replace a previous internal manifest atomically, never follow it.
                 write_json(&manifest_path, &manifest).await?;
                 self.upload_one(
+                    &file_fs.state_dir(job_id),
                     job_id,
                     &format!("{}/{}", output.file_name, DIRECTORY_MANIFEST),
                     &manifest_path,
@@ -241,6 +248,7 @@ impl JobTransfer {
                 .await?;
             } else {
                 self.upload_one(
+                    &file_fs.state_dir(job_id),
                     job_id,
                     &output.file_name,
                     &path,
@@ -254,6 +262,7 @@ impl JobTransfer {
 
     async fn upload_one(
         &self,
+        state_dir: &Path,
         job_id: Uuid,
         filename: &str,
         path: &Path,
@@ -262,6 +271,21 @@ impl JobTransfer {
         let metadata = fs::symlink_metadata(path).await?;
         if !metadata.is_file() {
             return Err(artifact("output is not a regular file"));
+        }
+        if metadata.len() > self.client.settings().multipart_threshold {
+            return self
+                .upload_multipart(
+                    state_dir,
+                    job_id,
+                    UploadSource {
+                        filename,
+                        path,
+                        format,
+                        size: metadata.len(),
+                        modified: metadata.modified()?,
+                    },
+                )
+                .await;
         }
         let transfer = self
             .client
@@ -286,95 +310,258 @@ impl JobTransfer {
             .error_for_status()
             .map_err(reqwest::Error::without_url)?;
         self.client
-            .commit_upload(
-                job_id,
-                self.agent_id,
-                filename,
-                transfer.catalog.uuid,
-                metadata.len(),
-                format,
-            )
+            .commit_upload(job_id, self.agent_id, filename, transfer.catalog.uuid)
             .await
     }
 
-    async fn job_graph(&self, job: &Job) -> Result<DAG, Error> {
-        if job.run.is_unloaded() || job.node_run.is_unloaded() {
-            return Err(artifact("job execution relations are not loaded"));
+    async fn upload_multipart(
+        &self,
+        state_dir: &Path,
+        job_id: Uuid,
+        source: UploadSource<'_>,
+    ) -> Result<(), Error> {
+        let UploadSource {
+            filename,
+            path,
+            format,
+            size,
+            modified,
+        } = source;
+        if size.div_ceil(MULTIPART_PART_SIZE) > MAX_MULTIPART_PARTS {
+            return Err(artifact("output is too large for multipart upload"));
         }
-        let node_run = job.node_run.get();
-        let graph = self
-            .client
-            .graph(node_run.graph_id, Some(node_run.version))
-            .await?;
-        if graph.id != node_run.graph_id || graph.version != node_run.version {
-            return Err(artifact("graph does not match the job's run version"));
+        let checkpoint = state_dir.join("multipart").join(format!("{filename}.json"));
+        let mut state = match read_json::<MultipartState>(&checkpoint).await {
+            Ok(state) if state.size == size && state.modified == modified => state,
+            Ok(state) => {
+                self.abort_multipart(job_id, filename, state.catalog.uuid, &state.upload_id)
+                    .await;
+                let _ = fs::remove_file(&checkpoint).await;
+                self.create_multipart_state(job_id, filename, format, size, modified)
+                    .await?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.create_multipart_state(job_id, filename, format, size, modified)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = write_json(&checkpoint, &state).await {
+            self.abort_multipart(job_id, filename, state.catalog.uuid, &state.upload_id)
+                .await;
+            return Err(error);
         }
-        Ok(graph)
+        let result = self
+            .upload_multipart_parts(job_id, filename, path, size, &checkpoint, &mut state)
+            .await;
+        if let Err(error) = result {
+            self.abort_multipart(job_id, filename, state.catalog.uuid, &state.upload_id)
+                .await;
+            let _ = fs::remove_file(&checkpoint).await;
+            return Err(error);
+        }
+        let _ = fs::remove_file(&checkpoint).await;
+        self.client
+            .commit_upload(job_id, self.agent_id, filename, state.catalog.uuid)
+            .await
     }
 
-    async fn input_filename(
+    async fn create_multipart_state(
         &self,
-        job: &Job,
-        graph: &DAG,
-        state: &crate::client::RunState,
-        source: &str,
-    ) -> Result<Option<String>, Error> {
-        let mut sources = graph
-            .nodes
-            .iter()
-            .flat_map(|node| node.outputs.iter().map(move |output| (node, output)))
-            .filter(|(node, output)| source == format!("{}.{}", node.name, output.file_name));
-        let (producer, output) = sources
-            .next()
-            .ok_or_else(|| artifact("input source is not declared"))?;
-        if sources.next().is_some() {
-            return Err(artifact("ambiguous input source"));
-        }
-        let Some(producer_run) = state
-            .nodes
-            .iter()
-            .filter(|run| {
-                run.node_id == producer.id
-                    && run.revision <= job.node_run.get().revision
-                    && run.ineffective == 0
-            })
-            .max_by_key(|run| run.revision)
-            .filter(|run| run.status == "Succeeded")
-        else {
-            return Ok(None);
-        };
-        let producer_graph = if producer_run.version == graph.version {
-            graph.clone()
-        } else {
-            self.client
-                .graph(graph.id, Some(producer_run.version))
-                .await?
-        };
-        if producer_graph.id != graph.id || producer_graph.version != producer_run.version {
+        job_id: Uuid,
+        filename: &str,
+        format: &str,
+        size: u64,
+        modified: SystemTime,
+    ) -> Result<MultipartState, Error> {
+        let transfer = self
+            .client
+            .create_multipart_upload(job_id, self.agent_id, filename, size, format)
+            .await?;
+        if transfer.presigned.operation != PresignOperation::CreateMultipart {
             return Err(artifact(
-                "producer graph does not match its recorded version",
+                "server returned the wrong multipart create operation",
             ));
         }
-        let Some(producer_node) = producer_graph
-            .nodes
-            .iter()
-            .find(|node| node.id == producer.id)
+        let upload_id = self.start_multipart(&transfer).await?;
+        Ok(MultipartState {
+            catalog: transfer.catalog,
+            upload_id,
+            size,
+            modified,
+            parts: BTreeMap::new(),
+        })
+    }
+
+    async fn start_multipart(&self, transfer: &CatalogTransfer) -> Result<String, Error> {
+        let mut request = self.objects.post(&transfer.presigned.url);
+        for (name, value) in &transfer.presigned.headers {
+            request = request.header(name, value);
+        }
+        let body = request
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?
+            .bytes()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        xml_element(&body, "UploadId")
+            .filter(|upload_id| !upload_id.is_empty())
+            .ok_or_else(|| artifact("multipart create response has no upload ID"))
+    }
+
+    async fn upload_multipart_parts(
+        &self,
+        job_id: Uuid,
+        filename: &str,
+        path: &Path,
+        size: u64,
+        checkpoint: &Path,
+        state: &mut MultipartState,
+    ) -> Result<(), Error> {
+        let count = u32::try_from(size.div_ceil(MULTIPART_PART_SIZE))
+            .map_err(|_| artifact("too many multipart parts"))?;
+        if count == 0
+            || u64::from(count) > MAX_MULTIPART_PARTS
+            || state.upload_id.is_empty()
+            || state
+                .parts
+                .keys()
+                .any(|number| *number == 0 || *number > count)
+        {
+            return Err(artifact("invalid multipart checkpoint"));
+        }
+        let mut file = fs::File::open(path).await?;
+        let mut offset = 0;
+        let mut part_number = 1u32;
+        while offset < size {
+            let length = (size - offset).min(MULTIPART_PART_SIZE) as usize;
+            if state.parts.contains_key(&part_number) {
+                offset += length as u64;
+                part_number = part_number
+                    .checked_add(1)
+                    .ok_or_else(|| artifact("multipart part number overflow"))?;
+                continue;
+            }
+            let mut bytes = vec![0; length];
+            file.seek(SeekFrom::Start(offset)).await?;
+            file.read_exact(&mut bytes).await?;
+            let presigned = self
+                .client
+                .upload_multipart_part(
+                    job_id,
+                    self.agent_id,
+                    filename,
+                    state.catalog.uuid,
+                    &state.upload_id,
+                    part_number,
+                )
+                .await?;
+            if presigned.operation
+                != (PresignOperation::UploadPart {
+                    upload_id: state.upload_id.clone(),
+                    part_number,
+                })
+            {
+                return Err(artifact(
+                    "server returned the wrong multipart part operation",
+                ));
+            }
+            let mut request = self
+                .objects
+                .put(&presigned.url)
+                .header(reqwest::header::CONTENT_LENGTH, bytes.len());
+            for (name, value) in &presigned.headers {
+                request = request.header(name, value);
+            }
+            let response = request
+                .body(bytes)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?;
+            let etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+                .ok_or_else(|| artifact("multipart upload part has no ETag"))?;
+            response
+                .error_for_status()
+                .map_err(reqwest::Error::without_url)?;
+            state.parts.insert(part_number, etag);
+            write_json(checkpoint, state).await?;
+            offset += length as u64;
+            part_number = part_number
+                .checked_add(1)
+                .ok_or_else(|| artifact("multipart part number overflow"))?;
+        }
+        let metadata = fs::metadata(path).await?;
+        if metadata.len() != state.size || metadata.modified()? != state.modified {
+            return Err(artifact("output changed during multipart upload"));
+        }
+        let presigned = self
+            .client
+            .complete_multipart_upload(
+                job_id,
+                self.agent_id,
+                filename,
+                state.catalog.uuid,
+                &state.upload_id,
+            )
+            .await?;
+        if presigned.operation
+            != (PresignOperation::CompleteMultipart {
+                upload_id: state.upload_id.clone(),
+            })
+        {
+            return Err(artifact(
+                "server returned the wrong multipart complete operation",
+            ));
+        }
+        let body = complete_multipart_xml(&state.parts);
+        let mut request = self.objects.post(&presigned.url);
+        for (name, value) in &presigned.headers {
+            request = request.header(name, value);
+        }
+        request
+            .header(reqwest::header::CONTENT_TYPE, "application/xml")
+            .body(body)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
+        Ok(())
+    }
+
+    async fn abort_multipart(
+        &self,
+        job_id: Uuid,
+        filename: &str,
+        catalog_uuid: Uuid,
+        upload_id: &str,
+    ) {
+        let Ok(presigned) = self
+            .client
+            .abort_multipart_upload(job_id, self.agent_id, filename, catalog_uuid, upload_id)
+            .await
         else {
-            return Ok(None);
+            return;
         };
-        let Some(output) = producer_node
-            .outputs
-            .iter()
-            .find(|candidate| candidate.file_name == output.file_name)
-        else {
-            return Ok(None);
-        };
-        let key = if output.kind == Kind::Directory || output.multiple {
-            format!("{}/{}", output.file_name, DIRECTORY_MANIFEST)
-        } else {
-            output.file_name.clone()
-        };
-        Ok(Some(key))
+        if presigned.operation
+            != (PresignOperation::AbortMultipart {
+                upload_id: upload_id.to_owned(),
+            })
+        {
+            return;
+        }
+        let mut request = self.objects.delete(&presigned.url);
+        for (name, value) in &presigned.headers {
+            request = request.header(name, value);
+        }
+        let _ = request.send().await;
     }
 
     async fn response(&self, transfer: &CatalogTransfer) -> Result<reqwest::Response, Error> {
@@ -420,6 +607,10 @@ impl JobTransfer {
         transfer: &CatalogTransfer,
         destination: &Path,
     ) -> Result<(), Error> {
+        if transfer.multipart && transfer.catalog.size > self.client.settings().multipart_threshold
+        {
+            return self.download_file_ranges(transfer, destination).await;
+        }
         let parent = destination
             .parent()
             .ok_or_else(|| artifact("input has no parent"))?;
@@ -459,6 +650,99 @@ impl JobTransfer {
         }
         result
     }
+
+    async fn download_file_ranges(
+        &self,
+        transfer: &CatalogTransfer,
+        destination: &Path,
+    ) -> Result<(), Error> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| artifact("input has no parent"))?;
+        fs::create_dir_all(parent).await?;
+        let temporary = parent.join(format!(".{}.download", Uuid::new_v4()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        let result = async {
+            file.set_len(transfer.catalog.size).await?;
+            let mut offset = 0u64;
+            let mut etag = None::<String>;
+            while offset < transfer.catalog.size {
+                let end = (offset + MULTIPART_PART_SIZE)
+                    .min(transfer.catalog.size)
+                    .saturating_sub(1);
+                let mut request = self
+                    .objects
+                    .get(&transfer.presigned.url)
+                    .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
+                for (name, value) in &transfer.presigned.headers {
+                    request = request.header(name, value);
+                }
+                let response = request.send().await.map_err(reqwest::Error::without_url)?;
+                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    return Err(artifact(format!(
+                        "ranged input download returned {}",
+                        response.status()
+                    )));
+                }
+                let range = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_content_range)
+                    .ok_or_else(|| artifact("ranged input has invalid Content-Range"))?;
+                if range.0 != offset || range.1 != end || range.2 != transfer.catalog.size {
+                    return Err(artifact(
+                        "ranged input Content-Range does not match request",
+                    ));
+                }
+                let current_etag = response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                if let Some(expected) = &etag {
+                    if current_etag.as_deref() != Some(expected.as_str()) {
+                        return Err(artifact("ranged input ETag changed during download"));
+                    }
+                } else if current_etag.is_some() {
+                    etag = current_etag;
+                }
+                file.seek(SeekFrom::Start(offset)).await?;
+                let mut received = 0u64;
+                let expected = end - offset + 1;
+                let mut response = response;
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(reqwest::Error::without_url)?
+                {
+                    received = received
+                        .checked_add(chunk.len() as u64)
+                        .ok_or_else(|| artifact("input size overflow"))?;
+                    if received > expected {
+                        return Err(artifact("ranged input exceeds requested range"));
+                    }
+                    file.write_all(&chunk).await?;
+                }
+                if received != expected {
+                    return Err(artifact("incomplete ranged input download"));
+                }
+                offset = end + 1;
+            }
+            file.sync_all().await?;
+            fs::rename(&temporary, destination).await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary).await;
+        }
+        result
+    }
 }
 
 impl Transfer for JobTransfer {
@@ -480,7 +764,7 @@ impl Transfer for JobTransfer {
         catalog_id: Uuid,
     ) -> Result<(), Self::Err> {
         self.client
-            .commit_upload(job.uuid, self.agent_id, filename, catalog_id, 0, "")
+            .commit_upload(job.uuid, self.agent_id, filename, catalog_id)
             .await
     }
 
@@ -520,6 +804,48 @@ fn format_for(path: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("application/octet-stream")
         .to_owned()
+}
+
+fn xml_element(body: &[u8], name: &str) -> Option<String> {
+    let body = std::str::from_utf8(body).ok()?;
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].trim().to_owned())
+}
+
+fn complete_multipart_xml(parts: &BTreeMap<u32, String>) -> String {
+    let mut body = String::from("<CompleteMultipartUpload>");
+    for (number, etag) in parts {
+        body.push_str("<Part><PartNumber>");
+        body.push_str(&number.to_string());
+        body.push_str("</PartNumber><ETag>");
+        xml_escape_into(&mut body, etag);
+        body.push_str("</ETag></Part>");
+    }
+    body.push_str("</CompleteMultipartUpload>");
+    body
+}
+
+fn xml_escape_into(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            character => output.push(character),
+        }
+    }
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
 }
 
 fn validate_node_paths(node: &Node) -> Result<(), Error> {

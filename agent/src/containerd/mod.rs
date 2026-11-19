@@ -51,13 +51,6 @@ impl ContainerState {
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
     }
-
-    pub fn exit_code(&self) -> Option<i32> {
-        match self {
-            Self::Exited { exit_code, .. } => Some(*exit_code),
-            _ => None,
-        }
-    }
 }
 
 /// The terminal status returned after waiting for a container.

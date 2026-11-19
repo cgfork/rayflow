@@ -11,20 +11,21 @@ those pieces into processes.
 `catalog` defines `Catalog` and `File` metadata traits; `model::Catalog` and
 `model::File` are their owned Toasty records, linked by `catalog_uuid`.
 The traits expose core metadata; database IDs and all lifecycle timestamps live
-on the persistence models. Catalog URLs and file full names are unique;
-deletion removes metadata rows directly.
+on the persistence models. Catalog keys and URLs are unique; file rows are
+uniquely associated with a catalog UUID, while filenames are scoped to their
+node run. Deletion removes metadata rows directly.
 `CatalogSystem` owns `CatalogId<'a>`, `CatalogData<'a>`, and `CatalogOptionalData<'a>`.
 `FileSystem: CatalogSystem` adds `FileId<'a>`, `FileData<'a>`, and `FileOptionalData<'a>`,
 sharing the catalog system's error type. Stores can use their own identities and return
-owned records or borrowed views. Upserts accept data, resolve URL/full-name
-conflicts, and return IDs. Reads include loading a
-file with its catalog by ID or full name.
+owned records or borrowed views. Upserts accept data, resolve key conflicts,
+and return IDs. Reads include loading a file with its catalog by ID or by
+catalog key.
 The optional-data GATs let stores choose owned or borrowed write inputs. MySQL
 uses concrete `CatalogOptionalData` and `FileOptionalData<Uuid>` structs:
-omitted fields are preserved, URL/full name selects the row for upserts, and new
+omitted fields are preserved, key selects the row for upserts, and new
 rows require their other metadata. `update_catalog(id, data)` and
 `update_file(id, data)` apply partial data to existing identities without requiring
-URL/full name. Both stores use Toasty selects, updates, and inserts.
+key. Both stores use Toasty selects, updates, and inserts.
 The MySQL implementations use Toasty databases and transactions. `ObjectStorage`
 extends `FileSystem` with a provider signing contract for upload and download URLs.
 The optional `s3` feature provides `s3::S3<S>`, which delegates
@@ -51,7 +52,8 @@ The graph crate is the backend-independent graph model. It contains:
   graph, while writes and publishes return `()`.
 - `types::DAG`, `Node`, `Input`, `Output`, and `Kind` (`File` or `Directory`).
   `DAG` contains a node count and audit fields populated from database records;
-  its audit fields are excluded from JSON.
+  its audit fields are serialized with the graph. Missing audit fields in older
+  payloads default during deserialization.
 - `validator`, which checks cycles, edge endpoints, and the single-root rule;
   unused outputs are reported separately.
 - `diff`, which compares graph values and reports structural changes.
@@ -136,7 +138,8 @@ drafts come from the database. The server library remains graph-store agnostic,
 so another `GraphStore` can be injected by an application.
 
 HTTP handlers and application operations are grouped by resource: `graph`,
-`graph_draft`, `run`/`state`, `job`, `agent`, and `catalog`. Collection operations share
+`graph_draft`, `run`/`state`, `job`, and `agent`. Catalog metadata is used by
+job artifact operations but has no standalone catalog HTTP module. Collection operations share
 `app::pagination::{PageQuery, Page}`. Job modules also own task-event emission;
 graph modules own both published reads and draft editing/publication. Server
 and object-storage settings live together in `server::config`. Graph endpoints use `GraphStore` and
@@ -165,8 +168,9 @@ HTTP `Client`, and `Settings` to poll for jobs, run containers, persist job
 results, and report terminal task events. The current default execution
 provider is Docker through Bollard.
 
-`JobFs` gives each job a durable metadata directory and a run/node/revision data
-directory under the configured workdir. It owns input and output directories,
+`JobFs` gives each job a durable metadata directory under `workdir` and an
+isolated `<data_dir>/<job_uuid>` artifact directory under the separate
+configured `data_dir`. It owns input and output directories,
 transfer markers, and recovery state. `JobTransfer` implements the transfer
 backend used by `JobFs::prepare_input` and `JobFs::complete_output`. Docker mounts
 `inputs/` read-only and `outputs/` writable. Directory outputs use an internal

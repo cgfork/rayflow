@@ -202,7 +202,7 @@ async fn presign<'a>(
 `PresignOperation::Upload` authorizes HTTP PUT; `Download` authorizes HTTP GET.
 The result contains the URL, operation, required headers, and actual expiry.
 The same trait provides synchronous `presign_catalog` for already-loaded data
-and `supports_whole-object`. Loaded-record signing performs no persistence I/O, so
+and `supports_multipart`. Loaded-record signing performs no persistence I/O, so
 upload preparation can sign uncommitted catalog data without moving lookups
 outside its transaction. Server handlers use only this contract; provider
 construction is confined to storage configuration.
@@ -327,26 +327,42 @@ Agents do not submit storage keys.
 | --- | --- | --- |
 | `POST /api/v1/job/output/prepare` | `job_id`, `agent_id`, `filename`, `size`, `format` | Catalog UUID and ordinary upload signature |
 | `POST /api/v1/job/output/commit` | `job_id`, `agent_id`, `filename`, `catalog_uuid` | Marks the catalog uploaded and publishes the file |
+| `POST /api/v1/job/output/multipart/create` | `job_id`, `agent_id`, `filename`, `size`, `format` | Creates the catalog and returns a multipart-create signature |
+| `POST /api/v1/job/output/multipart/upload` | `job_id`, `agent_id`, `filename`, `catalog_uuid`, `upload_id`, `part_number` | Returns an upload-part signature |
+| `POST /api/v1/job/output/multipart/complete` | `job_id`, `agent_id`, `filename`, `catalog_uuid`, `upload_id` | Returns a multipart-complete signature |
+| `POST /api/v1/job/output/multipart/abort` | `job_id`, `agent_id`, `filename`, `catalog_uuid`, `upload_id` | Returns a multipart-abort signature |
 | `POST /api/v1/job/input/presign` | `job_id`, `agent_id`, `filename` | Download signature and catalog metadata |
 
 The server validates the active job claim, checks the declared input or output,
 and derives the producer node run for input downloads. Upload state and transfer
-markers are persisted in the job filesystem. The agent uses ordinary presigned
-HTTP PUT and GET requests.
+markers are persisted in the job filesystem. Files larger than the agent's
+`multipart_threshold` setting use multipart upload and ranged GET requests;
+smaller files use ordinary presigned HTTP PUT and GET requests. The default
+threshold is 64 MiB. Multipart
+completion must succeed before `/job/output/commit` marks the catalog uploaded.
 
 ### Local data layout
 
-`JobFs` stores metadata under the job UUID and artifact data under the pinned
-run/node/revision directory:
+`JobFs` stores metadata and artifact data under separate configured roots. Both
+roots are scoped by the job UUID; artifact data is isolated per job:
 
 ```text
 <metadata_dir>/<job_uuid>/job.json
+<metadata_dir>/<job_uuid>/lock
 <metadata_dir>/<job_uuid>/container.json
-<data_dir>/<run_uuid>/<node_id>/<revision>/inputs/<filename>
-<data_dir>/<run_uuid>/<node_id>/<revision>/outputs/<filename>
-<data_dir>/<run_uuid>/<node_id>/<revision>/.rayflow/<job_uuid>/...
+<metadata_dir>/<job_uuid>/result.json
+<metadata_dir>/<job_uuid>/pid
+<metadata_dir>/<job_uuid>/runtime/started_at
+<data_dir>/<job_uuid>/inputs/<filename>
+<data_dir>/<job_uuid>/outputs/<filename>
+<data_dir>/<job_uuid>/.rayflow/<job_uuid>/inputs-ready.json
+<data_dir>/<job_uuid>/.rayflow/<job_uuid>/outputs-uploaded.json
 ```
 
-The agent keeps input readiness, output completion, and transfer state in jobfs.
-Outputs remain available after acknowledgement for downstream jobs. Docker mounts
-inputs read-only at `/data/inputs` and outputs writable at `/data/outputs`.
+`metadata_dir` is the configured agent `workdir`; `data_dir` is configured
+separately (the defaults are `.rayflow/jobs` and `.rayflow/data`). The agent
+keeps input readiness, output completion, and transfer state in the per-job
+marker directory. Outputs remain available until acknowledgement, after which
+the agent removes the local artifact directory.
+Docker mounts inputs read-only at `/data/inputs` and outputs writable at
+`/data/outputs`.

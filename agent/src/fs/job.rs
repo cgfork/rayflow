@@ -47,13 +47,49 @@ impl JobFs {
         }
     }
 
-    pub(crate) async fn restore(settings: Settings, job_id: Uuid) -> Result<Self, Error> {
-        let job_fs = Self::restore_locked(settings, job_id).await?;
-        job_fs.unlock().await?;
+    /// Opens a job filesystem from a claimed job and persists its definition.
+    ///
+    /// Existing metadata and cached runtime state are checked and loaded. A new
+    /// job definition is persisted only when its job directory does not already
+    /// contain one; existing metadata is retained across redelivery. The returned
+    /// filesystem is unlocked;
+    /// callers that need to coordinate further lifecycle work should use
+    /// [`Self::open_locked`].
+    pub async fn open(job: Job, settings: Settings) -> Result<Self, Error> {
+        let job_fs = Self::open_locked(job, settings).await?;
+        JobFsTrait::unlock(&job_fs).await?;
         Ok(job_fs)
     }
 
-    pub(crate) async fn restore_locked(settings: Settings, job_id: Uuid) -> Result<Self, Error> {
+    /// Opens a job filesystem while holding its exclusive lock.
+    pub(crate) async fn open_locked(job: Job, settings: Settings) -> Result<Self, Error> {
+        let mut job_fs = Self::new(job, settings);
+        JobFsTrait::lock(&job_fs).await?;
+        let result = async {
+            let has_existing_job = job_fs.check_existing().await?;
+            job_fs.load_cached().await?;
+            if !has_existing_job {
+                job_fs.persist_job().await?;
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = JobFsTrait::unlock(&job_fs).await;
+            return Err(error);
+        }
+        Ok(job_fs)
+    }
+
+    /// Reopens a persisted job filesystem by job UUID and loads all cached state.
+    pub async fn reopen(settings: Settings, job_id: Uuid) -> Result<Self, Error> {
+        let job_fs = Self::reopen_locked(settings, job_id).await?;
+        JobFsTrait::unlock(&job_fs).await?;
+        Ok(job_fs)
+    }
+
+    /// Reopens a persisted job filesystem while holding its exclusive lock.
+    pub(crate) async fn reopen_locked(settings: Settings, job_id: Uuid) -> Result<Self, Error> {
         let dir = settings.workdir.join(job_id.to_string());
         let lock_file = lock_job_dir(&dir).await?;
         let job: Job = read_json(&dir.join("job.json")).await?;
@@ -66,8 +102,50 @@ impl JobFs {
         }
         let mut job_fs = Self::new(job, settings);
         job_fs.lock_file = Mutex::new(Some(lock_file));
+        job_fs.check_existing().await?;
         job_fs.load_cached().await?;
         Ok(job_fs)
+    }
+
+    async fn check_existing(&self) -> Result<bool, Error> {
+        let job_path = self.job_dir().join("job.json");
+        let has_existing_job = match read_json::<Job>(&job_path).await {
+            Ok(existing) if existing.uuid == self.job.uuid => true,
+            Ok(existing) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "job metadata UUID {} does not match directory/job UUID {}",
+                        existing.uuid, self.job.uuid
+                    ),
+                )
+                .into());
+            }
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+
+        for path in [
+            self.file_dir().join("inputs"),
+            self.file_dir().join("outputs"),
+            self.file_dir()
+                .join(".rayflow")
+                .join(self.job.uuid.to_string()),
+        ] {
+            match fs::symlink_metadata(&path).await {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("cached job path is not a directory: {}", path.display()),
+                    )
+                    .into());
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(has_existing_job)
     }
 
     /// Lists persisted jobs in a workdir without reading their definitions.
@@ -92,7 +170,7 @@ impl JobFs {
     pub async fn discover(settings: Settings) -> Result<HashMap<String, Uuid>, Error> {
         let mut containers = HashMap::new();
         for job_id in Self::job_ids(&settings).await? {
-            let job_fs = match Self::restore(settings.clone(), job_id).await {
+            let job_fs = match Self::reopen(settings.clone(), job_id).await {
                 Ok(job_fs) => job_fs,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
@@ -104,114 +182,23 @@ impl JobFs {
         Ok(containers)
     }
 
-    fn dir_path(&self) -> PathBuf {
+    fn job_dir(&self) -> PathBuf {
         self.settings.workdir.join(self.job.uuid.to_string())
     }
 
     fn file_dir(&self) -> PathBuf {
-        if self.job.node_run.is_unloaded() {
-            return self.settings.data_dir.join(self.job.uuid.to_string());
-        }
-        let node_run = self.job.node_run.get();
-        self.settings
-            .data_dir
-            .join(self.job.run_id.to_string())
-            .join(node_run.node_id.to_string())
-            .join(node_run.revision.to_string())
-    }
-
-    fn input_path(&self) -> PathBuf {
-        self.file_dir().join("inputs")
-    }
-    fn output_path(&self) -> PathBuf {
-        self.file_dir().join("outputs")
-    }
-    fn state_path(&self, job_id: Uuid) -> PathBuf {
-        self.file_dir().join(".rayflow").join(job_id.to_string())
+        self.settings.data_dir.join(self.job.uuid.to_string())
     }
 
     /// Persists the job definition held by this filesystem.
     pub(crate) async fn persist_job(&self) -> Result<(), Error> {
-        write_json(&self.dir_path().join("job.json"), &self.job).await
-    }
-
-    /// Acquire the exclusive job lock, waiting until it is available.
-    /// The lock is held until `unlock` is called or this `JobFs` is dropped.
-    pub(crate) async fn lock(&self) -> Result<(), Error> {
-        let mut lock_file = self.lock_file.lock().await;
-        if lock_file.is_some() {
-            return Ok(());
-        }
-        let dir = self.dir_path();
-        fs::create_dir_all(&dir).await?;
-        *lock_file = Some(lock_job_dir(&dir).await?);
-        Ok(())
-    }
-
-    pub(crate) async fn unlock(&self) -> Result<(), Error> {
-        let mut lock_file = self.lock_file.lock().await;
-        if let Some(file) = lock_file.as_ref() {
-            file.unlock()?;
-            *lock_file = None;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn write_job_result(&mut self, result: JobResult) -> Result<(), Error> {
-        write_json(&self.dir_path().join("result.json"), &result).await?;
-        self.result = Some(result);
-        Ok(())
-    }
-
-    pub(crate) async fn write_container(&mut self, container: Container) -> Result<(), Error> {
-        write_json(&self.dir_path().join("container.json"), &container).await?;
-        self.container = Some(container);
-        Ok(())
-    }
-
-    pub(crate) async fn write_runtime(
-        &mut self,
-        pid: Option<i64>,
-        started_at: Option<Timestamp>,
-    ) -> Result<(), Error> {
-        let runtime = self.dir_path().join("runtime");
-        fs::create_dir_all(&runtime).await?;
-        if let Some(pid) = pid.filter(|pid| *pid > 0) {
-            fs::write(self.dir_path().join("pid"), pid.to_string()).await?;
-            self.pid = Some(pid);
-        }
-        if let Some(started_at) = started_at {
-            fs::write(runtime.join("started_at"), started_at.to_string()).await?;
-            self.started_at = Some(started_at);
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn clear(&mut self) -> Result<(), Error> {
-        let dir = self.dir_path();
-        let mut entries = fs::read_dir(dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_name() == "lock" {
-                // Existing waiters must continue to use the same lock inode.
-                continue;
-            }
-            if entry.file_type().await?.is_dir() {
-                fs::remove_dir_all(entry.path()).await?;
-            } else {
-                fs::remove_file(entry.path()).await?;
-            }
-        }
-        self.container = None;
-        self.result = None;
-        self.started_at = None;
-        self.pid = None;
-        Ok(())
+        write_json(&self.job_dir().join("job.json"), &self.job).await
     }
 
     pub(crate) async fn load_cached(&mut self) -> Result<(), Error> {
-        self.container = read_optional_json(&self.dir_path().join("container.json")).await?;
-        self.result = read_optional_json(&self.dir_path().join("result.json")).await?;
-        self.started_at = read_optional_string(&self.dir_path().join("runtime/started_at"))
+        self.container = read_optional_json(&self.job_dir().join("container.json")).await?;
+        self.result = read_optional_json(&self.job_dir().join("result.json")).await?;
+        self.started_at = read_optional_string(&self.job_dir().join("runtime/started_at"))
             .await?
             .map(|value| {
                 value
@@ -219,7 +206,7 @@ impl JobFs {
                     .map_err(|error| Error::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
             })
             .transpose()?;
-        self.pid = read_optional_string(&self.dir_path().join("pid"))
+        self.pid = read_optional_string(&self.job_dir().join("pid"))
             .await?
             .map(|value| {
                 value
@@ -277,35 +264,49 @@ impl JobFsTrait for JobFs {
         &self.settings.data_dir
     }
     fn dir(&self) -> PathBuf {
-        self.dir_path()
+        self.job_dir()
     }
     fn input_dir(&self) -> PathBuf {
-        self.input_path()
+        self.file_dir().join("inputs")
     }
     fn output_dir(&self) -> PathBuf {
-        self.output_path()
+        self.file_dir().join("outputs")
     }
     fn state_dir(&self, job_id: Uuid) -> PathBuf {
-        self.state_path(job_id)
+        self.file_dir().join(".rayflow").join(job_id.to_string())
     }
     fn container(&self) -> Option<&Container> {
         self.container.as_ref()
     }
     async fn write_container(&mut self, container: Container) -> Result<(), Error> {
-        self.write_container(container).await
+        write_json(&self.job_dir().join("container.json"), &container).await?;
+        self.container = Some(container);
+        Ok(())
     }
     fn job_result(&self) -> Option<&JobResult> {
         self.result.as_ref()
     }
     async fn write_job_result(&mut self, result: JobResult) -> Result<(), Error> {
-        self.write_job_result(result).await
+        write_json(&self.job_dir().join("result.json"), &result).await?;
+        self.result = Some(result);
+        Ok(())
     }
     async fn write_runtime(
         &mut self,
         pid: Option<i64>,
         started_at: Option<Timestamp>,
     ) -> Result<(), Error> {
-        self.write_runtime(pid, started_at).await
+        let runtime = self.job_dir().join("runtime");
+        fs::create_dir_all(&runtime).await?;
+        if let Some(pid) = pid.filter(|pid| *pid > 0) {
+            fs::write(self.job_dir().join("pid"), pid.to_string()).await?;
+            self.pid = Some(pid);
+        }
+        if let Some(started_at) = started_at {
+            fs::write(runtime.join("started_at"), started_at.to_string()).await?;
+            self.started_at = Some(started_at);
+        }
+        Ok(())
     }
     fn started_at(&self) -> Option<&Timestamp> {
         self.started_at.as_ref()
@@ -314,13 +315,76 @@ impl JobFsTrait for JobFs {
         self.pid
     }
     async fn clear(&mut self) -> Result<(), Error> {
-        self.clear().await
+        let dir = self.job_dir();
+        let mut entries = fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_name() == "lock" {
+                // Existing waiters must continue to use the same lock inode.
+                continue;
+            }
+            if entry.file_type().await?.is_dir() {
+                fs::remove_dir_all(entry.path()).await?;
+            } else {
+                fs::remove_file(entry.path()).await?;
+            }
+        }
+        self.container = None;
+        self.result = None;
+        self.started_at = None;
+        self.pid = None;
+        Ok(())
+    }
+    async fn clear_data(&mut self) -> Result<(), Error> {
+        let root = &self.settings.data_dir;
+        let root_metadata = match fs::symlink_metadata(root).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("artifact root is not a directory: {}", root.display()),
+            )
+            .into());
+        }
+
+        let dir = self.file_dir();
+        let metadata = match fs::symlink_metadata(&dir).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("artifact directory is not a directory: {}", dir.display()),
+            )
+            .into());
+        }
+        match fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
     async fn lock(&self) -> Result<(), Error> {
-        self.lock().await
+        let mut lock_file = self.lock_file.lock().await;
+        if lock_file.is_some() {
+            return Ok(());
+        }
+        let dir = self.job_dir();
+        fs::create_dir_all(&dir).await?;
+        *lock_file = Some(lock_job_dir(&dir).await?);
+        Ok(())
     }
     async fn unlock(&self) -> Result<(), Error> {
-        self.unlock().await
+        let mut lock_file = self.lock_file.lock().await;
+        if let Some(file) = lock_file.as_ref() {
+            file.unlock()?;
+            *lock_file = None;
+        }
+        Ok(())
     }
     async fn prepare_input<G: crate::fs::GraphFs + Clone, T: crate::fs::Transfer<Err = Error>>(
         &self,
@@ -367,10 +431,9 @@ mod tests {
         let root = tempdir().unwrap();
         let settings = settings(root.path());
         let job = job();
-        let mut job_fs = JobFs::new(job.clone(), settings.clone());
+        let mut job_fs = JobFs::open(job.clone(), settings.clone()).await.unwrap();
 
         job_fs.lock().await.unwrap();
-        job_fs.persist_job().await.unwrap();
         job_fs
             .write_container(Container {
                 r#type: "test".into(),
@@ -394,7 +457,7 @@ mod tests {
             .unwrap();
         job_fs.unlock().await.unwrap();
 
-        let restored = JobFs::restore(settings, job.uuid).await.unwrap();
+        let restored = JobFs::reopen(settings, job.uuid).await.unwrap();
         assert_eq!(
             restored.container().map(|value| value.id.as_str()),
             Some("container-1")

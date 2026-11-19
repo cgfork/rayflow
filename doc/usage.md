@@ -243,6 +243,7 @@ data_dir: .rayflow/data
 batch: 64
 poll_interval: 1s
 request_timeout: 60s
+multipart_threshold: 67108864
 resources:
   cpu_cores: 4
   memory_bytes: 4294967296
@@ -252,6 +253,8 @@ resources:
 otherwise `RAYFLOW_CONFIG` is used. Environment variables use the
 `RAYFLOW_AGENT_` prefix. Nested resource fields use double underscores, for
 example `RAYFLOW_AGENT_RESOURCES__CPU_CORES=2`.
+Files larger than `multipart_threshold` bytes use multipart upload and ranged
+download; the default is 64 MiB.
 
 Run the default Docker-backed agent with Docker available:
 
@@ -443,6 +446,18 @@ The service endpoints are:
 | `POST` | `/api/v1/job/succeed` | Complete a claimed job successfully. |
 | `POST` | `/api/v1/job/fail` | Report a claimed job failure. |
 | `POST` | `/api/v1/job/terminate` | Terminate a claimed job. |
+| `POST` | `/api/v1/job/output/prepare` | Create or reset an output catalog and return its upload signature. |
+| `POST` | `/api/v1/job/output/commit` | Mark an uploaded output catalog as uploaded and publish its file. |
+| `POST` | `/api/v1/job/input/presign` | Return a signed download URL for a declared input. |
+| `POST` | `/api/v1/runs/{run_id}/files/download` | Return a signed download URL for a succeeded declared input or output. |
+| `POST` | `/api/v1/users/resolve` | Resolve valid audit user IDs to display names for the console. |
+
+The file-download response contains `catalog`, `presigned.url`,
+`presigned.operation`, `presigned.headers`, and `presigned.expires_at`. The
+browser or client must request the returned absolute URL exactly as provided,
+including its query string, and include any returned headers. There is no
+Rayflow `/files/content` proxy route; the server does not stream the object
+itself.
 
 Run commands and task events return `202 Accepted` with the appended entry ID.
 In Runtime, click **Upgrade** on a run or its detail page. Select a newer
@@ -490,11 +505,12 @@ the next page with the same filters. Job status values are `Scheduled`, `Polled`
 
 Graph and draft lists contain complete DAGs, including `id` (the graph UUID),
 `name`, `version`, `node_count`, `nodes`, and `edges`. Numeric database row IDs
-are used only for pagination cursors. Audit fields are stored in database
-columns and available on loaded Rust DAGs, but excluded from JSON responses.
-Run detail returns
-`{ "state": ..., "graph": ..., "current": true }`, where `current` indicates
-whether the selected run is the latest version for its data/graph pair.
+are used only for pagination cursors. Graph audit fields (`created_by`,
+`created_at`, `updated_by`, and `updated_at`) are included in the serialized DAG;
+older payloads that omit them are read with default values.
+Run detail returns `{ "run": ..., "graph": ..., "node_runs": [...] }`.
+The `run` record contains the run UUID, data ID, graph/version, and revision;
+`node_runs` contains effective node-run records joined with their graph nodes.
 
 Example start request:
 
@@ -596,30 +612,37 @@ there is no separate heartbeat or notification service.
 
 ## Agent workdir
 
-Each job has an isolated directory under `workdir`:
+The agent keeps durable job metadata below `workdir`. Each job has an isolated
+directory; `job.json` is the source used to restore the job after a restart:
 
 ```text
 {WORKDIR}/{job-uuid}/job.json
-{WORKDIR}/{job-uuid}/node.json
-{WORKDIR}/{job-uuid}/result.json
-{WORKDIR}/{job-uuid}/pid
 {WORKDIR}/{job-uuid}/lock
 {WORKDIR}/{job-uuid}/container.json
+{WORKDIR}/{job-uuid}/result.json
+{WORKDIR}/{job-uuid}/pid
 {WORKDIR}/{job-uuid}/runtime/started_at
-{WORKDIR}/{job-uuid}/runtime/stdout
 ```
 
-The agent writes job and result JSON atomically, persists results before
-reporting them, and retains job files for recovery. The lock file is held with
-an exclusive OS lock while a job is being coordinated. On startup, `Agentic`
-discovers existing directories, reconnects to containers by UUID, and retries
-unreported results. Keep this directory across agent restarts.
+`container.json`, `result.json`, `pid`, and `runtime/started_at` are written only
+when the corresponding state is available. There is no persisted `node.json` or
+container stdout file in this directory. The agent writes JSON atomically,
+persists results before reporting them, and retains job metadata for recovery.
+The `lock` file is held with an exclusive OS lock while a job is being
+coordinated. On startup, `Agentic` discovers existing directories, reconnects
+to containers by their persisted IDs, and retries unreported results. Keep this
+directory across agent restarts.
 
 ## Agent inputs and outputs
 
-`JobFs` stores metadata and artifact bytes together. Its data directory is scoped by
-`<run_uuid>/<node_id>/<revision>`, with `inputs/`, `outputs/`, and transfer
-markers. Job completion retains this data for downstream work.
+`JobFs` keeps metadata and artifact bytes in separate roots. Metadata is under
+`<workdir>/<job_uuid>`. Artifact data is under
+`<data_dir>/<job_uuid>`, with `inputs/`, `outputs/`, and per-job transfer
+markers under `.rayflow/<job_uuid>/`. Each job therefore has an isolated local
+artifact directory, including resumed jobs that share a run or node-run. Job
+completion retains that job's artifact data for recovery until acknowledgement,
+then acknowledgement removes the local artifact directory after the container
+is removed.
 
 Declare outputs on the producer node and bind downstream inputs with
 `source: "producer.output_name"`. In containers, read from
@@ -659,15 +682,18 @@ require it. See [upload acknowledgement](catalog.md#metadata-operations) for
 handling previously stored objects.
 
 Migration 11 changes catalog URLs to `VARCHAR(750)` and adds the unique
-`(url, deleted_at)` key. Before upgrading, resolve any URLs longer than 750
-characters or duplicate URL/deletion pairs while preserving catalog UUIDs and
-file references. The migration does not merge or delete records. Upload prepare
-now creates or reuses the catalog by URL; only commit requires the returned
+`(url, deleted_at)` key for the schema that existed at that migration step.
+Before upgrading, resolve any URLs longer than 750 characters or duplicate
+URL/deletion pairs while preserving catalog UUIDs and file references. The
+migration does not merge or delete records. Upload preparation now creates or
+reuses the catalog by its generated key; only commit requires the returned
 catalog UUID. Deploy matching server and agent binaries.
 
-Migrations 12 and 13 remove `deleted_at` from catalog and file metadata. URLs and
-full names become unique across all rows. Resolve historical duplicates before
-upgrading. Rows are preserved, and retained historical rows become readable.
+Migrations 12 and 13 remove `deleted_at` from catalog and file metadata. Catalog
+URLs become unique across all rows, and file catalog references remain unique;
+filenames are scoped to their node-run ownership. Resolve historical duplicates
+before upgrading. Rows are preserved, and retained historical rows become
+readable.
 
 Migrations 14–16 align the authentication tables with the SQL conventions and
 add auto-incrementing numeric primary IDs. The former `auth_user.id` becomes

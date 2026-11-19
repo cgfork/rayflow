@@ -309,13 +309,21 @@ impl Containerd for FakeProvider {
 }
 
 #[tokio::test]
-async fn yield_and_resume_preserve_node_data_and_only_acknowledge_finished_jobs() {
+async fn yield_and_resume_isolate_job_data_and_only_acknowledge_finished_jobs() {
     let workflow = Workflow::new(true).await;
     let provider = FakeProvider::default();
     let daemon = workflow.open(provider.clone()).await;
     let job = workflow.claim("fixture-image", "true");
-    let files = daemon.job_fs(&job);
+    let mut files = daemon.job_fs(&job);
 
+    assert_eq!(
+        files.input_dir(),
+        files.data_dir().join(job.uuid.to_string()).join("inputs")
+    );
+    assert_eq!(
+        files.output_dir(),
+        files.data_dir().join(job.uuid.to_string()).join("outputs")
+    );
     daemon.prepare(job.clone()).await.unwrap();
     let spec = provider.0.lock().unwrap().prepared[0].clone();
     assert_eq!(spec.image, "fixture-image");
@@ -346,11 +354,15 @@ async fn yield_and_resume_preserve_node_data_and_only_acknowledge_finished_jobs(
 
     let daemon = workflow.open(provider.clone()).await;
     assert_eq!(daemon.poll_results().await.unwrap(), vec![result]);
+    assert!(files.data_dir().join(job.uuid.to_string()).exists());
     daemon.acknowledge_result(job.uuid).await.unwrap();
     assert!(daemon.poll_results().await.unwrap().is_empty());
     assert!(daemon.jobs().await.unwrap().is_empty());
     assert!(!files.dir().join("job.json").exists());
     assert!(!files.dir().join("result.json").exists());
+    assert!(!files.data_dir().join(job.uuid.to_string()).exists());
+    files.clear_data().await.unwrap();
+    files.clear_data().await.unwrap();
     assert!(provider.container(&spec.name).inspect().await.is_err());
     assert_eq!(provider.0.lock().unwrap().stops, 1);
 
@@ -358,17 +370,12 @@ async fn yield_and_resume_preserve_node_data_and_only_acknowledge_finished_jobs(
     let resumed_files = daemon.job_fs(&resumed);
     assert_ne!(resumed.uuid, job.uuid);
     assert_eq!(resumed.node_run_id, job.node_run_id);
-    assert_eq!(resumed_files.output_dir(), files.output_dir());
+    assert_ne!(resumed_files.output_dir(), files.output_dir());
     assert_ne!(
         resumed_files.state_dir(resumed.uuid),
         files.state_dir(job.uuid)
     );
-    assert_eq!(
-        fs::read(resumed_files.output_dir().join("result.txt"))
-            .await
-            .unwrap(),
-        b"checkpoint"
-    );
+    assert!(!resumed_files.output_dir().join("result.txt").exists());
     daemon.prepare(resumed.clone()).await.unwrap();
     daemon.start(resumed.uuid).await.unwrap();
     let finished_at = provider.exit(&format!("rayflow-{}", resumed.uuid), 0);
@@ -389,6 +396,11 @@ async fn restarting_during_execution_preserves_container_and_recovers_failure() 
     let daemon = workflow.open(provider.clone()).await;
     let job = workflow.claim("fixture-image", "exit 7");
     daemon.prepare(job.clone()).await.unwrap();
+    let files = daemon.job_fs(&job);
+    fs::create_dir_all(files.output_dir()).await.unwrap();
+    fs::write(files.output_dir().join("checkpoint.txt"), b"pending report")
+        .await
+        .unwrap();
     daemon.start(job.uuid).await.unwrap();
     drop(daemon);
 
@@ -415,6 +427,13 @@ async fn restarting_during_execution_preserves_container_and_recovers_failure() 
     assert_eq!(result.finished_at, Some(finished_at));
     assert!(result.started_at.is_some());
     assert!(result.duration.is_some());
+    assert!(
+        daemon
+            .job_fs(&job)
+            .data_dir()
+            .join(job.uuid.to_string())
+            .exists()
+    );
 }
 
 #[tokio::test]
