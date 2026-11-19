@@ -1,10 +1,11 @@
+import { randomUUID } from './uuid';
 import type { Graph, GraphNode } from './types';
 
 export function createGraph(name: string): Graph {
-  return { id: crypto.randomUUID(), name, version: 0, node_count: 1, nodes: [createNode('start')], edges: [] };
+  return { id: randomUUID(), name, version: 0, node_count: 1, nodes: [createNode('start')], edges: [] };
 }
 export function createNode(name: string): GraphNode {
-  return { id: crypto.randomUUID(), name, node_type: 'docker', settings: { config: { image: '' }, resource: { cpu_cores: 1, memory_bytes: 268435456 }, timeout: '30s' }, inputs: [], outputs: [] };
+  return { id: randomUUID(), name, node_type: 'docker', settings: { config: { image: '' }, resource: { cpu_cores: 1, memory_bytes: 268435456 }, timeout: '30s' }, inputs: [], outputs: [] };
 }
 
 export function normalizeGraph(graph: Graph): Graph {

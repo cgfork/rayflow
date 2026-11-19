@@ -24,7 +24,7 @@ use crate::{
     client::{Client, PollRequest, PollResponse},
     containerd::{Containerd, docker::DockerContainerd},
     errors::Error,
-    filed::Filed,
+    fs::{JobFs as JobFsTrait, JobTransfer},
     settings::Settings,
 };
 
@@ -37,7 +37,7 @@ use crate::{
 pub struct Agentic<C = DockerContainerd, R = Client> {
     agentd: Agentd<C, R>,
     client: Client,
-    filed: Filed,
+    transfer: JobTransfer,
     settings: Settings,
     active: Mutex<HashSet<Uuid>>,
     reporting: Mutex<()>,
@@ -50,12 +50,11 @@ impl Agentic {
     /// Opens the configured workdir with Docker and HTTP connections.
     pub async fn new(settings: Settings) -> Result<Self, Error> {
         settings.validate()?;
-        let client = Client::new(&settings)?;
-        let agentd = Agentd::open_with_data_dir(
+        let client = Client::new(settings.clone())?;
+        let agentd = Agentd::open(
             DockerContainerd::connect_with_defaults()?,
             client.clone(),
-            &settings.workdir,
-            &settings.data_dir,
+            settings.clone(),
         )
         .await?;
         Self::with_agent(agentd, client, settings)
@@ -74,13 +73,15 @@ where
         settings: Settings,
     ) -> Result<Self, Error> {
         settings.validate()?;
-        if agentd.data_dir() != settings.data_dir {
+        if agentd.settings().workdir != settings.workdir
+            || agentd.settings().data_dir != settings.data_dir
+        {
             return Err(Error::Settings(
-                "agent daemon and filed must use the same data_dir",
+                "agent daemon and transfer must use the same settings",
             ));
         }
         Ok(Self {
-            filed: Filed::new(client.clone(), &settings)?,
+            transfer: JobTransfer::new(client.clone())?,
             agentd,
             client,
             settings,
@@ -214,11 +215,10 @@ where
     }
 
     async fn download_inputs(&self, job_id: Uuid) -> Result<(), Error> {
-        let job_fs = self.agentd.job_fs(job_id);
-        let node = job_fs.node().await?;
-        let job = job_fs.job().await?;
+        let job_fs = self.agentd.persisted_job_fs(job_id).await?;
+        let job = job_fs.job().clone();
         loop {
-            match self.filed.download_inputs(&job, &node).await {
+            match JobFsTrait::prepare_input(&job_fs, &self.client, &self.transfer).await {
                 Err(Error::Http(error))
                     if job.expired_at.is_some_and(|at| at > jiff::Timestamp::now())
                         && (error.is_timeout()
@@ -259,14 +259,8 @@ where
         let mut outcome = result.outcome;
         let mut lost = false;
         if outcome == JobOutcome::Succeeded {
-            match self
-                .filed
-                .upload_outputs(
-                    &self.agentd.job_fs(result.job_id).job().await?,
-                    &self.agentd.job_fs(result.job_id).node().await?,
-                )
-                .await
-            {
+            let job_fs = self.agentd.persisted_job_fs(result.job_id).await?;
+            match JobFsTrait::complete_output(&job_fs, &self.client, &self.transfer).await {
                 Ok(()) => {}
                 Err(Error::ClaimLost(_)) => lost = true,
                 Err(Error::Artifact(message)) => {

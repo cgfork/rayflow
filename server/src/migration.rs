@@ -88,6 +88,26 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "file_fullpath",
         include_str!("../migrations/0018_file_fullpath.sql"),
     ),
+    MigrationFile::new(
+        19,
+        "node_run_uuid",
+        include_str!("../migrations/0019_node_run_uuid.sql"),
+    ),
+    MigrationFile::new(
+        20,
+        "file_node_run",
+        include_str!("../migrations/0020_file_node_run.sql"),
+    ),
+    MigrationFile::new(
+        21,
+        "file_catalog_key",
+        include_str!("../migrations/0021_file_catalog_key.sql"),
+    ),
+    MigrationFile::new(
+        22,
+        "uuid_references",
+        include_str!("../migrations/0022_uuid_references.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

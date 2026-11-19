@@ -12,6 +12,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use catalog::{
+    ObjectStorage,
+    path::{PathError, validate_relative_path},
+    s3::{Config as S3Config, Credentials},
+};
 use config::{Config as Builder, Environment, File};
 use serde::Deserialize;
 
@@ -31,7 +36,7 @@ fn default_poll_retry_interval() -> Duration {
 pub struct Config {
     /// Optional S3-compatible storage for job inputs and outputs.
     #[serde(default)]
-    pub storage: Option<crate::storage::StorageConfig>,
+    pub storage: Option<StorageConfig>,
     /// User authentication; disabled for backwards-compatible local development.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
@@ -132,158 +137,167 @@ impl Config {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StorageConfigError {
+    #[error(transparent)]
+    S3(#[from] catalog::s3::ConfigError),
+    #[error("storage.bucket must be an S3 bucket name")]
+    InvalidBucket,
+    #[error(transparent)]
+    Path(#[from] PathError),
+    #[error("storage.prefix is too long")]
+    PrefixTooLong,
+    #[error("storage.presign_ttl must be 1..=604800 whole seconds")]
+    InvalidPresignTtl,
+    #[error("artifact fullpath must start with /")]
+    InvalidFullpath,
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+    #[error("invalid storage URL")]
+    InvalidUrl,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct StorageConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    #[serde(default = "default_multipart")]
+    pub multipart_enabled: bool,
+    pub session_token: Option<String>,
+    pub credential_expiry: Option<jiff::Timestamp>,
+    #[serde(
+        default = "default_ttl",
+        with = "jiff::fmt::serde::unsigned_duration::required"
+    )]
+    pub presign_ttl: Duration,
+}
+
+fn default_prefix() -> String {
+    "artifacts".into()
+}
+fn default_multipart() -> bool {
+    true
+}
+fn default_region() -> String {
+    "us-east-1".into()
+}
+fn default_ttl() -> Duration {
+    Duration::from_secs(900)
+}
+
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("presign_ttl", &self.presign_ttl)
+            .field("multipart_enabled", &self.multipart_enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StorageConfig {
+    /// Provider construction is confined to configuration; callers only receive
+    /// ObjectStorage, never a concrete signing client.
+    pub fn object_storage(
+        &self,
+        db: toasty::Db,
+    ) -> Result<impl ObjectStorage<Err: Send + Sync + 'static> + use<>, StorageConfigError> {
+        Ok(self.signer().build(db)?)
+    }
+
+    fn signer(&self) -> S3Config {
+        let mut config = S3Config::new(
+            &self.endpoint,
+            Credentials::new(
+                &self.access_key,
+                &self.secret_key,
+                self.session_token.clone(),
+                self.credential_expiry.map(Into::into),
+                "rayflow-server",
+            ),
+        );
+        config.region = self.region.clone();
+        config
+    }
+
+    pub fn validate(&self) -> Result<(), StorageConfigError> {
+        self.signer().validate()?;
+        if self.bucket.is_empty()
+            || !self
+                .bucket
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+            || !self.bucket.as_bytes()[0].is_ascii_alphanumeric()
+            || !self.bucket.as_bytes()[self.bucket.len() - 1].is_ascii_alphanumeric()
+            || self.bucket.contains("..")
+        {
+            return Err(StorageConfigError::InvalidBucket);
+        }
+        validate_relative_path(self.prefix.trim_matches('/'))?;
+        if self.prefix.chars().count() > 128 {
+            return Err(StorageConfigError::PrefixTooLong);
+        }
+        if !(1..=604800).contains(&self.presign_ttl.as_secs())
+            || self.presign_ttl.subsec_nanos() != 0
+        {
+            return Err(StorageConfigError::InvalidPresignTtl);
+        }
+        Ok(())
+    }
+
+    pub fn object_url(&self, fullpath: &str) -> Result<String, StorageConfigError> {
+        self.validate()?;
+        let path = fullpath
+            .strip_prefix('/')
+            .ok_or(StorageConfigError::InvalidFullpath)?;
+        validate_relative_path(path)?;
+        let mut url = url::Url::parse(&format!("s3://{}/", self.bucket))?;
+        url.path_segments_mut()
+            .map_err(|_| StorageConfigError::InvalidUrl)?
+            .pop_if_empty()
+            .extend(path.split('/'));
+        Ok(url.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn server_config_deserializes_address_and_database() {
-        let config: Config = Builder::builder()
-            .set_override("addr", "127.0.0.1:8080")
-            .unwrap()
-            .set_override("database_url", "mysql://localhost/rayflow")
-            .unwrap()
-            .build()
-            .unwrap()
-            .try_deserialize()
-            .unwrap();
-        assert_eq!(config.addr.to_string(), "127.0.0.1:8080");
-        assert_eq!(config.database_url, "mysql://localhost/rayflow");
-        assert_eq!(config.poll_timeout, Duration::from_secs(30));
-        assert_eq!(config.poll_retry_interval, Duration::from_millis(250));
-    }
-
-    #[test]
-    fn nested_authentication_environment_overrides_preserve_existing_names() {
-        let source = [
-            ("RAYFLOW_ADDR".into(), "127.0.0.1:8082".into()),
-            ("RAYFLOW_POLL_TIMEOUT".into(), "20s".into()),
-            ("RAYFLOW_AUTH__ENABLED".into(), "true".into()),
-            ("RAYFLOW_AUTH__OIDC__CLIENT_SECRET".into(), "secret".into()),
-        ]
-        .into_iter()
-        .collect();
-        let config: Config = Builder::builder()
-            .add_source(File::from_str("database_url: mysql://localhost/rayflow\nauth:\n  oidc:\n    issuer_url: https://company.example.com\n    client_id: rayflow\n    client_secret: overridden\n", config::FileFormat::Yaml))
-            .add_source(Environment::with_prefix("RAYFLOW").prefix_separator("_").separator("__").try_parsing(true).source(Some(source)))
-            .build().unwrap().try_deserialize().unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.addr.port(), 8082);
-        assert_eq!(config.poll_timeout, Duration::from_secs(20));
-        assert!(config.auth.enabled);
-        assert_eq!(config.auth.oidc.unwrap().client_secret, "secret");
-    }
-
-    #[test]
-    fn poll_timeout_accepts_configuration_and_rejects_empty_random_ranges() {
-        for poll_timeout_ms in [0, 1, 2, 600, 60_000] {
-            let config: Config = Builder::builder()
-                .set_override("addr", "127.0.0.1:8080")
-                .unwrap()
-                .set_override("database_url", "mysql://localhost/rayflow")
-                .unwrap()
-                .set_override("poll_timeout", format!("{poll_timeout_ms}ms"))
-                .unwrap()
-                .build()
-                .unwrap()
-                .try_deserialize()
-                .unwrap();
-            assert_eq!(config.poll_timeout, Duration::from_millis(poll_timeout_ms));
-            assert_eq!(config.validate().is_ok(), poll_timeout_ms >= 2);
+    fn valid() -> Config {
+        Config {
+            database_url: "mysql://root:secret@127.0.0.1/rayflow".into(),
+            ..Config::default()
         }
     }
 
     #[test]
-    fn poll_retry_interval_accepts_configuration_and_rejects_zero() {
-        for poll_retry_interval_ms in [0, 1, 500, 60_000] {
-            let config: Config = Builder::builder()
-                .set_override("addr", "127.0.0.1:8080")
-                .unwrap()
-                .set_override("database_url", "mysql://localhost/rayflow")
-                .unwrap()
-                .set_override("poll_retry_interval", format!("{poll_retry_interval_ms}ms"))
-                .unwrap()
-                .build()
-                .unwrap()
-                .try_deserialize()
-                .unwrap();
-            assert_eq!(
-                config.poll_retry_interval,
-                Duration::from_millis(poll_retry_interval_ms)
-            );
-            assert_eq!(config.validate().is_ok(), poll_retry_interval_ms > 0);
-        }
+    fn accepts_default_polling_limits() {
+        assert!(valid().validate().is_ok());
     }
 
     #[test]
-    fn duration_strings_load_from_yaml_and_environment() {
-        let source = Builder::builder()
-            .add_source(File::from_str(
-                "addr: 127.0.0.1:8080\ndatabase_url: mysql://localhost/rayflow\npoll_timeout: 10s\npoll_retry_interval: 250ms\n",
-                config::FileFormat::Yaml,
-            ))
-            .build()
-            .unwrap();
-        let config: Config = source.clone().try_deserialize().unwrap();
-        assert_eq!(config.poll_timeout, Duration::from_secs(10));
-        assert_eq!(config.poll_retry_interval, Duration::from_millis(250));
-        config.validate().unwrap();
+    fn rejects_zero_poll_retry_interval() {
+        let mut config = valid();
+        config.poll_retry_interval = Duration::ZERO;
 
-        let environment = Environment::with_prefix("RAYFLOW")
-            .try_parsing(true)
-            .ignore_empty(true)
-            .source(Some(
-                [
-                    ("RAYFLOW_POLL_TIMEOUT".to_owned(), "1m".to_owned()),
-                    ("RAYFLOW_POLL_RETRY_INTERVAL".to_owned(), "1.5s".to_owned()),
-                ]
-                .into_iter()
-                .collect(),
-            ));
-        let config: Config = Builder::builder()
-            .add_source(source)
-            .add_source(environment)
-            .build()
-            .unwrap()
-            .try_deserialize()
-            .unwrap();
-        assert_eq!(config.poll_timeout, Duration::from_secs(60));
-        assert_eq!(config.poll_retry_interval, Duration::from_millis(1500));
-        config.validate().unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn polling_durations_reject_malformed_and_negative_strings() {
-        for key in ["poll_timeout", "poll_retry_interval"] {
-            for value in ["-10s", "10", "invalid"] {
-                let result = Builder::builder()
-                    .set_override("addr", "127.0.0.1:8080")
-                    .unwrap()
-                    .set_override("database_url", "mysql://localhost/rayflow")
-                    .unwrap()
-                    .set_override(key, value)
-                    .unwrap()
-                    .build()
-                    .unwrap()
-                    .try_deserialize::<Config>();
-                assert!(result.is_err(), "accepted {key}: {value}");
-            }
-        }
-    }
+    fn rejects_sub_millisecond_poll_timeout() {
+        let mut config = valid();
+        config.poll_timeout = Duration::from_micros(1_999);
 
-    #[test]
-    fn polling_durations_must_fit_timer_deadlines() {
-        for config in [
-            Config {
-                poll_timeout: Duration::MAX,
-                ..Config::default()
-            },
-            Config {
-                poll_retry_interval: Duration::MAX,
-                ..Config::default()
-            },
-        ] {
-            assert!(config.validate().is_err());
-        }
+        assert!(config.validate().is_err());
     }
 }

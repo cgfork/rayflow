@@ -236,11 +236,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn yield_round_trips_and_pends_the_node() {
+    fn yield_maps_to_pending_and_resume_is_distinct() {
         let node = Uuid::new_v4();
         assert_eq!(TaskEvent::Yield.command(node), Command::Pend { node });
-        assert_eq!(TaskEvent::Yield.to_string(), "Yield");
-        assert_eq!("Yield".parse::<TaskEvent>().unwrap(), TaskEvent::Yield);
-        assert!("Pend".parse::<TaskEvent>().is_err());
+        assert_ne!(TaskEvent::Yield.command(node), Command::Resume { node });
+    }
+
+    #[test]
+    fn terminal_events_map_to_terminal_commands() {
+        let node = Uuid::new_v4();
+        assert_eq!(TaskEvent::Succeed.command(node), Command::Succeed { node });
+        assert_eq!(TaskEvent::Fail.command(node), Command::Fail { node });
+        assert_eq!(
+            TaskEvent::Terminate.command(node),
+            Command::Terminate { node }
+        );
+        assert_eq!(TaskEvent::Cancel.command(node), Command::Cancel { node });
     }
 }

@@ -43,6 +43,8 @@ pub struct NodeRun {
     #[key]
     #[auto]
     pub id: u64,
+    #[unique]
+    pub uuid: Uuid,
     pub run_id: Uuid,
     pub data_id: Uuid,
     pub graph_id: Uuid,
@@ -314,6 +316,7 @@ impl<S> Backend<S> {
 
         for node_id in &targets {
             let node_run = NodeRun::create()
+                .uuid(Uuid::new_v4())
                 .run_id(run_id)
                 .data_id(data_id)
                 .graph_id(graph_id)
@@ -449,6 +452,7 @@ impl<S> Backend<S> {
     async fn ready_node<E: Executor>(tx: &mut E, run: &Run, node: Uuid) -> Result<(), Error> {
         let now = Timestamp::now();
         let node_run = NodeRun::create()
+            .uuid(Uuid::new_v4())
             .run_id(run.uuid)
             .data_id(run.data_id)
             .graph_id(run.graph_id)
@@ -585,6 +589,7 @@ impl<S> Backend<S> {
                     continue;
                 }
                 NodeRun::create()
+                    .uuid(Uuid::new_v4())
                     .run_id(run.uuid)
                     .data_id(data_id)
                     .graph_id(graph_id)
@@ -601,6 +606,7 @@ impl<S> Backend<S> {
 
         for node in &targets {
             let node_run = NodeRun::create()
+                .uuid(Uuid::new_v4())
                 .run_id(run.uuid)
                 .data_id(data_id)
                 .graph_id(graph_id)
@@ -861,6 +867,7 @@ impl<S> Backend<S> {
                 }
                 None => {
                     NodeRun::create()
+                        .uuid(Uuid::new_v4())
                         .run_id(run.uuid)
                         .data_id(data_id)
                         .graph_id(graph_id)

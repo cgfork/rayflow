@@ -151,47 +151,4 @@ fn list_graphs(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
 
-    use super::*;
-
-    #[test]
-    fn embedded_graphs_parse() {
-        let store = StaticGraphStore::new();
-        assert_eq!(store.graphs.len(), 10);
-
-        for graph in store.graphs.values() {
-            let nodes = graph.nodes.len();
-            assert!(
-                (10..=20).contains(&nodes),
-                "graph {} has {nodes} nodes",
-                graph.name
-            );
-
-            let ids: HashSet<Uuid> = graph.nodes.iter().map(|node| node.id).collect();
-            assert_eq!(
-                ids.len(),
-                nodes,
-                "graph {} has duplicate node ids",
-                graph.name
-            );
-
-            for &(from, to) in &graph.edges {
-                assert!(ids.contains(&from) && ids.contains(&to));
-            }
-        }
-    }
-
-    #[test]
-    fn loads_embedded_graphs() {
-        let store = StaticGraphStore::new();
-        let graph_0 = Uuid::parse_str("00000001-0000-0000-0000-000000000000").unwrap();
-        let graph = store.graph(graph_0).expect("alpha is embedded");
-        assert_eq!(graph.name, "alpha");
-
-        let missing = Uuid::parse_str("000000ff-0000-0000-0000-000000000000").unwrap();
-        assert!(store.graph(missing).is_none());
-    }
-}

@@ -16,12 +16,16 @@ Options:
 Environment:
   DATABASE_URL           Override the MySQL URL for server and pilot.
   RAYFLOW_CONFIG         Use a different configuration file.
+  RAYFLOW_DEV_HOST       API and UI bind address (default: 0.0.0.0).
   RAYFLOW_DEV_API_PORT   Local API port (default: 5172).
   RAYFLOW_DEV_UI_PORT    Local UI port (default: 5173).
   RAYFLOW_AGENT_ID       Override the local agent UUID when using --agent.
+  RAYFLOW_DEV_AGENT_TOKEN Override the shared local fleet token when using --agent.
 
 Logs: .rayflow/dev/{server,pilot,ui,agent}.log
-With --agent, the agent's server URL is set to the local API URL automatically.
+With authentication enabled, open the UI address configured in auth.public_url.
+With --agent, the local API URL and matching fleet credentials are set automatically.
+The generated fleet token is persisted in .rayflow/dev/agent-token.
 Press Ctrl-C to stop all processes started by this script.
 EOF
 }
@@ -43,23 +47,49 @@ done
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$root_dir"
 log_dir="$root_dir/.rayflow/dev"
+bind_host="${RAYFLOW_DEV_HOST:-0.0.0.0}"
 api_port="${RAYFLOW_DEV_API_PORT:-5172}"
 ui_port="${RAYFLOW_DEV_UI_PORT:-5173}"
-api_url="http://127.0.0.1:$api_port"
-ui_url="http://127.0.0.1:$ui_port"
+connect_host="$bind_host"
+case "$connect_host" in
+    0.0.0.0) connect_host=127.0.0.1 ;;
+    ::) connect_host=::1 ;;
+esac
+
+# HTTP clients differ in which case they prefer. Preserve each existing list.
+local_no_proxy=127.0.0.1,localhost,::1
+case "$connect_host" in
+    127.0.0.1|localhost|::1) ;;
+    *) local_no_proxy+=",$connect_host" ;;
+esac
+upper_no_proxy="${NO_PROXY-${no_proxy:-}}"
+lower_no_proxy="${no_proxy:-${NO_PROXY:-}}"
+export NO_PROXY="${upper_no_proxy:+$upper_no_proxy,}$local_no_proxy"
+# curl treats a wildcard as a bypass for every host only when it stands alone.
+if [[ "$lower_no_proxy" != '*' ]]; then
+    lower_no_proxy="${lower_no_proxy:+$lower_no_proxy,}$local_no_proxy"
+fi
+export no_proxy="$lower_no_proxy"
+
+if [[ "$connect_host" == *:* ]]; then connect_host="[$connect_host]"; fi
+api_url="http://$connect_host:$api_port"
+ui_url="http://$connect_host:$ui_port"
+api_bind="$bind_host:$api_port"
+if [[ "$bind_host" == *:* ]]; then api_bind="[$bind_host]:$api_port"; fi
 
 for dependency in cargo node npm curl; do
     command -v "$dependency" >/dev/null 2>&1 || fail "Install $dependency first."
 done
 
-node - "$api_port" "$ui_port" <<'JS'
+node - "$bind_host" "$api_port" "$ui_port" <<'JS'
 const net = require('node:net');
 const [major, minor] = process.versions.node.split('.').map(Number);
 if (!(major === 20 && minor >= 19 || major === 22 && minor >= 12 || major > 22)) {
     console.error('Node.js 20.19+ (20.x) or 22.12+ is required.');
     process.exit(1);
 }
-const ports = process.argv.slice(2).map(Number);
+const host = process.argv[2];
+const ports = process.argv.slice(3).map(Number);
 if (ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535) || ports[0] === ports[1]) {
     console.error('API and UI ports must be different integers between 1 and 65535.');
     process.exit(1);
@@ -67,10 +97,10 @@ if (ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535) ||
 for (const port of ports) {
     const server = net.createServer();
     server.once('error', (error) => {
-        console.error(`Cannot listen on 127.0.0.1:${port}: ${error.message}`);
+        console.error(`Cannot listen on ${host}:${port}: ${error.message}`);
         process.exitCode = 1;
     });
-    server.listen(port, '127.0.0.1', () => server.close());
+    server.listen(port, host, () => server.close());
 }
 JS
 
@@ -88,6 +118,18 @@ fi
 packages=(-p server -p pilot)
 if "$with_agent"; then
     packages+=(-p agent)
+    if [[ -n "${RAYFLOW_AUTH__AGENT_TOKEN:-}" && -n "${RAYFLOW_AGENT_AUTH_TOKEN:-}" && "$RAYFLOW_AUTH__AGENT_TOKEN" != "$RAYFLOW_AGENT_AUTH_TOKEN" ]]; then
+        fail 'RAYFLOW_AUTH__AGENT_TOKEN and RAYFLOW_AGENT_AUTH_TOKEN must match.'
+    fi
+    fleet_token="${RAYFLOW_DEV_AGENT_TOKEN:-${RAYFLOW_AUTH__AGENT_TOKEN:-${RAYFLOW_AGENT_AUTH_TOKEN:-}}}"
+    if [[ -z "$fleet_token" ]]; then
+        if [[ ! -s "$log_dir/agent-token" ]]; then
+            (umask 077; node -e 'console.log(require("node:crypto").randomBytes(32).toString("hex"))' > "$log_dir/agent-token")
+        fi
+        fleet_token="$(cat "$log_dir/agent-token")"
+    fi
+    export RAYFLOW_AUTH__AGENT_TOKEN="$fleet_token"
+    export RAYFLOW_AGENT_AUTH_TOKEN="$fleet_token"
     agent_id="${RAYFLOW_AGENT_ID:-}"
     if [[ -z "$agent_id" ]]; then
         if [[ ! -s "$log_dir/agent-id" ]]; then
@@ -169,17 +211,22 @@ wait_for_health() {
     fail "Timed out waiting for $url. Check the logs in $log_dir."
 }
 
-start server env RAYFLOW_ADDR="127.0.0.1:$api_port" "$target_dir/debug/server"
+start server env RAYFLOW_ADDR="$api_bind" "$target_dir/debug/server"
 wait_for_health "$api_url/health"
 start pilot "$target_dir/debug/pilot"
-start ui env RAYFLOW_API_URL="$api_url" npm run dev --prefix ui -- --port "$ui_port" --strictPort
+start ui env RAYFLOW_API_URL="$api_url" npm run dev --prefix ui -- --host "$bind_host" --port "$ui_port" --strictPort
 wait_for_health "$ui_url/api/v1/health"
+browser_url="$(curl --noproxy '*' --fail --silent --show-error --max-time 5 "$ui_url/api/v1/auth/providers" | node -e '
+const { enabled, public_url } = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+process.stdout.write(enabled ? public_url : process.argv[1]);
+' "$ui_url")" || fail 'Unable to read the sign-in settings from the local UI.'
 if "$with_agent"; then
     start agent env RAYFLOW_AGENT_ID="$agent_id" RAYFLOW_AGENT_SERVER_URL="$api_url" "$target_dir/debug/agent"
 fi
 check_processes
 
-printf '\nRayflow is running.\n  UI:  %s\n  API: %s\n  Logs: %s\nPress Ctrl-C to stop.\n\n' "$ui_url" "$api_url" "$log_dir"
+printf 'API and UI bind address: %s\n' "$bind_host"
+printf '\nRayflow is running.\n  UI:  %s\n  API: %s\n  Logs: %s\nPress Ctrl-C to stop.\n\n' "$browser_url" "$api_url" "$log_dir"
 while true; do
     check_processes
     sleep 1

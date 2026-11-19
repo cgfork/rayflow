@@ -60,8 +60,8 @@ dependencies = [
  "graph",
  "jiff",
  "percent-encoding",
- "quick-xml",
  "reqwest",
+ "runtime",
  "scheduler",
  "serde",
  "serde_json",
@@ -2967,23 +2967,28 @@ dependencies = [
 name = "pilot"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "axum",
+ "bollard",
  "config",
  "coordinator",
  "event",
  "graph",
  "jiff",
+ "reqwest",
  "runtime",
  "scheduler",
  "serde",
  "serde_json",
  "server",
+ "tempfile",
  "thiserror 2.0.21",
  "toasty",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -3225,16 +3230,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
-dependencies = [
- "memchr",
- "serde",
 ]
 
 [[package]]
@@ -4112,6 +4107,7 @@ dependencies = [
  "ldap3",
  "mime_guess",
  "openidconnect",
+ "percent-encoding",
  "reqwest",
  "runtime",
  "rust-embed",

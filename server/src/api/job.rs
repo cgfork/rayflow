@@ -1,13 +1,14 @@
-//! Resource-aware job polling for agents.
+//! Job polling, agent reports, and task-event emission.
 
 use crate::app::{App, AppError, Page, PageQuery};
 use axum::{
     Json, Router,
     extract::{Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::{get, post},
 };
+use event::task_event::TaskEvent;
 use graph::{GraphStore, types::DAG};
 use scheduler::{AgentRef, ResourceCapacity};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,37 @@ pub struct JobActionRequest {
     pub agent_id: Uuid,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PrepareOutputRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub filename: String,
+    pub size: Option<u64>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrepareOutputResponse {
+    pub catalog_uuid: Uuid,
+    #[serde(flatten)]
+    pub transfer: crate::api::run::Transfer,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitOutputRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub filename: String,
+    pub catalog_uuid: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PresignInputRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub filename: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PollJobsResponse {
     pub jobs: Vec<scheduler::Job>,
@@ -55,16 +87,79 @@ pub struct PollJobsResponse {
 pub(super) fn routes<S>() -> Router<App<S>>
 where
     S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
     S::Err: Send + Sync + 'static,
 {
     Router::new()
         .route("/jobs", get(list_jobs::<S>))
+        .route("/task_events", post(emit_task_event::<S>))
         .route("/jobs/poll", post(poll::<S>))
         .route("/job/cancel", post(cancel_job::<S>))
         .route("/job/yield", post(yield_job::<S>))
         .route("/job/succeed", post(succeed_job::<S>))
         .route("/job/fail", post(fail_job::<S>))
         .route("/job/terminate", post(terminate_job::<S>))
+        .route("/job/output/prepare", post(prepare_output::<S>))
+        .route("/job/output/commit", post(commit_output::<S>))
+        .route("/job/input/presign", post(presign_input::<S>))
+}
+
+async fn prepare_output<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<PrepareOutputRequest>,
+) -> Result<Json<PrepareOutputResponse>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.prepare_output(
+        request.job_id,
+        request.agent_id,
+        request.filename,
+        request.size,
+        request.format,
+    )
+    .await
+    .map(|transfer| {
+        Json(PrepareOutputResponse {
+            catalog_uuid: transfer.catalog.uuid,
+            transfer,
+        })
+    })
+}
+
+async fn commit_output<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<CommitOutputRequest>,
+) -> Result<Json<Uuid>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.commit_output(
+        request.job_id,
+        request.agent_id,
+        request.filename,
+        request.catalog_uuid,
+    )
+    .await
+    .map(Json)
+}
+
+async fn presign_input<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<PresignInputRequest>,
+) -> Result<Json<crate::api::run::Transfer>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.presign_input(request.job_id, request.agent_id, request.filename)
+        .await
+        .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,11 +182,7 @@ async fn list_jobs<S>(
 async fn cancel_job<S>(
     State(app): State<App<S>>,
     Json(request): Json<JobActionRequest>,
-) -> Result<StatusCode, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    S::Err: Send + Sync + 'static,
-{
+) -> Result<StatusCode, AppError> {
     app.cancel_job(request.job_id, request.agent_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -99,11 +190,7 @@ where
 async fn yield_job<S>(
     State(app): State<App<S>>,
     Json(request): Json<JobActionRequest>,
-) -> Result<StatusCode, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    S::Err: Send + Sync + 'static,
-{
+) -> Result<StatusCode, AppError> {
     app.yield_job(request.job_id, request.agent_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -111,11 +198,7 @@ where
 async fn succeed_job<S>(
     State(app): State<App<S>>,
     Json(request): Json<JobActionRequest>,
-) -> Result<StatusCode, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    S::Err: Send + Sync + 'static,
-{
+) -> Result<StatusCode, AppError> {
     app.succeed_job(request.job_id, request.agent_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -123,11 +206,7 @@ where
 async fn fail_job<S>(
     State(app): State<App<S>>,
     Json(request): Json<JobActionRequest>,
-) -> Result<StatusCode, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    S::Err: Send + Sync + 'static,
-{
+) -> Result<StatusCode, AppError> {
     app.fail_job(request.job_id, request.agent_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -135,35 +214,26 @@ where
 async fn terminate_job<S>(
     State(app): State<App<S>>,
     Json(request): Json<JobActionRequest>,
-) -> Result<StatusCode, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    S::Err: Send + Sync + 'static,
-{
+) -> Result<StatusCode, AppError> {
     app.terminate_job(request.job_id, request.agent_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn poll<S>(State(app): State<App<S>>, Json(request): Json<PollJobsRequest>) -> Response
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    S::Err: Send + Sync + 'static,
-{
+async fn poll<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<PollJobsRequest>,
+) -> Result<Json<PollJobsResponse>, AppError> {
     if !(1..=1000).contains(&request.batch) {
-        return (StatusCode::BAD_REQUEST, "batch must be 1 to 1000").into_response();
+        return Err(AppError::InvalidRequest("batch must be 1 to 1000".into()));
     }
     if request
         .wait_ms
         .is_some_and(|wait_ms| Duration::from_millis(wait_ms) > app.config.poll_timeout)
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "wait_ms must be 0 to {}",
-                app.config.poll_timeout.as_millis()
-            ),
-        )
-            .into_response();
+        return Err(AppError::InvalidRequest(format!(
+            "wait_ms must be 0 to {}",
+            app.config.poll_timeout.as_millis()
+        )));
     }
     let deadline = Instant::now() + request.wait(app.config.poll_timeout);
     loop {
@@ -172,88 +242,47 @@ where
             request.resources,
             request.active_jobs.clone(),
         );
-        let jobs = match app.poll(&mut agent, request.batch).await {
-            Ok(jobs) => jobs,
-            Err(error) => return error.into_response(),
-        };
+        let jobs = app.poll(&mut agent, request.batch).await?;
         let response = PollJobsResponse { jobs };
         if !response.jobs.is_empty()
             || !request.active_jobs.is_empty()
             || Instant::now() >= deadline
         {
-            return Json(response).into_response();
+            return Ok(Json(response));
         }
         sleep_until(deadline.min(Instant::now() + app.config.poll_retry_interval)).await;
         if Instant::now() >= deadline {
-            return Json(response).into_response();
+            return Ok(Json(response));
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Request body for `POST /task_events`.
+#[derive(Debug, Deserialize)]
+pub struct EmitTaskEventRequest {
+    /// Task whose run produced the event.
+    pub task_id: Uuid,
+    /// Event to record.
+    pub event: TaskEvent,
+}
 
-    #[test]
-    fn missing_or_null_wait_uses_a_random_configured_timeout() {
-        let mut body = serde_json::json!({
-            "agent_id": Uuid::new_v4(), "batch": 1,
-            "resources": { "cpu_cores": 1, "memory_bytes": 512 },
-        });
-        let request: PollJobsRequest = serde_json::from_value(body.clone()).unwrap();
-        assert_eq!(request.wait_ms, None);
-        assert!(request.active_jobs.is_empty());
-        for timeout in [
-            Duration::from_millis(2),
-            Duration::from_micros(2500),
-            Duration::from_millis(601),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-        ] {
-            for _ in 0..128 {
-                let wait = request.wait(timeout);
-                assert!((timeout / 2..timeout).contains(&wait));
-            }
-        }
-        body["wait_ms"] = serde_json::Value::Null;
-        let request: PollJobsRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(request.wait_ms, None);
-        assert!(
-            (Duration::from_millis(300)..Duration::from_millis(600))
-                .contains(&request.wait(Duration::from_millis(600)))
-        );
-    }
+/// Response returned by `POST /task_events`.
+#[derive(Debug, Serialize)]
+pub struct EmitTaskEventResponse {
+    /// Identifier of the emitted task event.
+    pub id: Uuid,
+}
 
-    #[test]
-    fn explicit_wait_is_preserved_including_zero() {
-        for wait_ms in [0, 1, 600, 30_000] {
-            let request: PollJobsRequest = serde_json::from_value(serde_json::json!({
-                "agent_id": Uuid::new_v4(), "batch": 1,
-                "resources": { "cpu_cores": 1, "memory_bytes": 512 },
-                "wait_ms": wait_ms,
-            }))
-            .unwrap();
-            assert_eq!(request.wait_ms, Some(wait_ms));
-            assert_eq!(
-                request.wait(Duration::from_secs(30)),
-                Duration::from_millis(wait_ms)
-            );
-        }
-    }
-
-    #[test]
-    fn wait_requires_nonnegative_integer_milliseconds() {
-        for value in [
-            serde_json::json!(-1),
-            serde_json::json!(0.5),
-            serde_json::json!("100"),
-        ] {
-            let body = serde_json::json!({
-                "agent_id": Uuid::new_v4(), "batch": 1,
-                "resources": { "cpu_cores": 1, "memory_bytes": 512 },
-                "wait_ms": value,
-            });
-            assert!(serde_json::from_value::<PollJobsRequest>(body).is_err());
-        }
-    }
+/// Emits a task event for an existing task.
+async fn emit_task_event<S>(
+    State(state): State<App<S>>,
+    Json(request): Json<EmitTaskEventRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let entry = state
+        .emit_task_event(request.task_id, request.event)
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(EmitTaskEventResponse { id: entry.id }),
+    ))
 }

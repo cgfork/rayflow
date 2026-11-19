@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS run (
 
 CREATE TABLE IF NOT EXISTS run_config (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    uuid       CHAR(36)        NOT NULL COMMENT 'stable run config identity',
     run_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
     annotation JSON            NOT NULL COMMENT 'run annotation key/value map',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
@@ -64,11 +65,13 @@ CREATE TABLE IF NOT EXISTS run_config (
     created_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'creator of the record',
     updated_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'last updater of the record',
     PRIMARY KEY (id),
+    UNIQUE KEY uk_run_config_uuid (uuid),
     KEY idx_run_config_run_id (run_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'run annotation snapshots referenced by jobs';
 
 CREATE TABLE IF NOT EXISTS node_config (
     id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    uuid             CHAR(36)        NOT NULL COMMENT 'stable node config identity',
     node_id          CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning node identifier',
     version          BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'config version',
     annotation_match VARCHAR(255)    NOT NULL DEFAULT '' COMMENT 'run annotation match expression',
@@ -81,12 +84,14 @@ CREATE TABLE IF NOT EXISTS node_config (
     created_by       VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'creator of the record',
     updated_by       VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'last updater of the record',
     PRIMARY KEY (id),
+    UNIQUE KEY uk_node_config_uuid (uuid),
     UNIQUE KEY uk_node_config_node_version (node_id, version),
     KEY idx_node_config_node_id (node_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node configuration, one row per node version';
 
 CREATE TABLE IF NOT EXISTS node_run (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
+    uuid CHAR(36) NOT NULL COMMENT 'stable node-run identity',
     run_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
     data_id    CHAR(36)        NOT NULL DEFAULT '' COMMENT 'data unique identifier',
     graph_id   CHAR(36)        NOT NULL DEFAULT '' COMMENT 'graph unique identifier',
@@ -98,6 +103,7 @@ CREATE TABLE IF NOT EXISTS node_run (
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
     PRIMARY KEY (id),
+    UNIQUE KEY uk_node_run_uuid (uuid),
     UNIQUE KEY uk_node_run_run_node_revision (run_id, node_id, revision),
     KEY idx_node_run_data_graph (data_id, graph_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node status within a dag execution run, one row per revision';
@@ -121,9 +127,9 @@ CREATE TABLE IF NOT EXISTS job (
     uuid           CHAR(36)        NOT NULL DEFAULT '' COMMENT 'job unique identifier',
     task_id        CHAR(36)        NOT NULL DEFAULT '' COMMENT 'task unique identifier',
     run_id         CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
-    node_run_id    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'owning node run id',
-    node_config_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'referenced node config id',
-    run_config_id  BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'referenced run config id',
+    node_run_id    CHAR(36) NOT NULL COMMENT 'UUID of the owning node run',
+    node_config_id CHAR(36) NOT NULL COMMENT 'referenced node config uuid',
+    run_config_id  CHAR(36) NOT NULL COMMENT 'referenced run config uuid',
     status         VARCHAR(16)     NOT NULL DEFAULT 'Scheduled' COMMENT 'Scheduled, Polled, Yielded, Succeeded, Failed, or Terminated',
     required_cpu_cores INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'CPU requirement in cores',
     required_memory_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'memory requirement in bytes',
@@ -251,13 +257,13 @@ CREATE TABLE IF NOT EXISTS catalog (
 CREATE TABLE IF NOT EXISTS file (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     uuid CHAR(36) NOT NULL,
-    fullpath VARCHAR(512) NOT NULL,
+    node_run_id CHAR(36) NOT NULL COMMENT 'UUID of the producing node run',
     filename VARCHAR(255) NOT NULL,
     catalog_uuid CHAR(36) NOT NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
     UNIQUE KEY uk_file_uuid (uuid),
-    UNIQUE KEY uk_file_fullpath (fullpath),
-    KEY idx_file_catalog_uuid (catalog_uuid)
+    UNIQUE KEY uk_file_catalog_uuid (catalog_uuid),
+    KEY idx_file_node_run_id (node_run_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT = 'logical file names referencing catalog UUIDs';

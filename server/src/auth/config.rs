@@ -10,7 +10,7 @@ pub enum AuthConfigError {
     #[error("invalid authentication URL")]
     InvalidUrl(#[source] url::ParseError),
     #[error(
-        "authentication URLs require HTTPS (HTTP is allowed only on loopback) and no credentials, query, or fragment"
+        "authentication URLs require HTTPS (HTTP requires loopback or auth.allow_insecure_http) and no credentials, query, or fragment"
     )]
     UnsafeUrl,
     #[error("auth.public_url must be an origin without a path")]
@@ -47,6 +47,8 @@ pub struct AuthConfig {
     pub company_name: String,
     /// Browser-facing origin, including the UI and the /api reverse proxy.
     pub public_url: String,
+    /// Allow an HTTP browser origin on a trusted development network.
+    pub allow_insecure_http: bool,
     #[serde(with = "jiff::fmt::serde::unsigned_duration::required")]
     pub session_ttl: Duration,
     pub local_users: Vec<LocalUser>,
@@ -71,6 +73,7 @@ impl Default for AuthConfig {
             enabled: false,
             company_name: "Rayflow".into(),
             public_url: "http://127.0.0.1:5173".into(),
+            allow_insecure_http: false,
             session_ttl: Duration::from_secs(8 * 3600),
             local_users: Vec::new(),
             oidc: None,
@@ -121,9 +124,13 @@ fn default_email_attribute() -> String {
 
 /// HTTPS is required except for loopback development; never infer it from request headers.
 pub(super) fn web_url(value: &str) -> Result<Url, AuthConfigError> {
+    web_url_with_http(value, false)
+}
+
+fn web_url_with_http(value: &str, allow_http: bool) -> Result<Url, AuthConfigError> {
     let url = Url::parse(value).map_err(AuthConfigError::InvalidUrl)?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if (url.scheme() != "https" && !(url.scheme() == "http" && local))
+    if (url.scheme() != "https" && !(url.scheme() == "http" && (local || allow_http)))
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -136,6 +143,10 @@ pub(super) fn web_url(value: &str) -> Result<Url, AuthConfigError> {
 }
 
 impl AuthConfig {
+    pub(super) fn public_origin(&self) -> Result<Url, AuthConfigError> {
+        web_url_with_http(&self.public_url, self.allow_insecure_http)
+    }
+
     pub fn validate(&self) -> Result<(), AuthConfigError> {
         self.validate_with_providers(false)
     }
@@ -147,7 +158,7 @@ impl AuthConfig {
         if !self.enabled {
             return Ok(());
         }
-        if web_url(&self.public_url)?.path() != "/" {
+        if self.public_origin()?.path() != "/" {
             return Err(AuthConfigError::PublicUrlPath);
         }
         if !(Duration::from_secs(60)..=Duration::from_secs(7 * 86400)).contains(&self.session_ttl) {

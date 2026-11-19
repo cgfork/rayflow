@@ -20,7 +20,7 @@ pub enum AppError {
     #[error(transparent)]
     Storage(Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
-    StorageConfiguration(#[from] crate::storage::Error),
+    StorageConfiguration(#[from] crate::config::StorageConfigError),
     #[error(transparent)]
     ArtifactPath(#[from] ::catalog::path::PathError),
     #[error("{0}")]
@@ -70,7 +70,10 @@ pub enum AppError {
 
 impl From<event::Error> for AppError {
     fn from(error: event::Error) -> Self {
-        Self::Backend(error.into())
+        match error {
+            event::Error::TaskNotFound(id) => Self::TaskNotFound(id),
+            error => Self::Backend(error.into()),
+        }
     }
 }
 
@@ -208,9 +211,6 @@ fn graph_error(error: &(dyn std::error::Error + 'static)) -> (StatusCode, &'stat
     use StatusCode as Status;
     use graph::store::Error;
 
-    if error.is::<crate::graph::GraphNotFound>() {
-        return (Status::NOT_FOUND, "RAYFLOW_GRAPH_NOT_FOUND");
-    }
     match error.downcast_ref::<Error>() {
         Some(Error::GraphNotFound { .. }) => (Status::NOT_FOUND, "RAYFLOW_GRAPH_NOT_FOUND"),
         Some(Error::DraftNotFound(_)) => (Status::NOT_FOUND, "RAYFLOW_GRAPH_DRAFT_NOT_FOUND"),
@@ -286,5 +286,31 @@ fn scheduler_error(error: &scheduler::Error) -> (StatusCode, &'static str) {
         Error::JobLeaseNotFound(_) => {
             (Status::INTERNAL_SERVER_ERROR, "RAYFLOW_JOB_LEASE_NOT_FOUND")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_job_claim_conflicts_to_http_conflict() {
+        let error = AppError::JobConflict(Uuid::new_v4());
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "RAYFLOW_JOB_CONFLICT");
+    }
+
+    #[test]
+    fn maps_invalid_requests_to_bad_request() {
+        let error = AppError::InvalidRequest("invalid node".into());
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), "RAYFLOW_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn maps_runtime_invalid_transitions_to_conflict() {
+        let error = AppError::Backend(runtime::Error::AlreadyStarted);
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "RAYFLOW_RUN_ALREADY_STARTED");
     }
 }

@@ -35,8 +35,15 @@ https://rayflow.example.com/api/v1/auth/oidc/callback
 ```
 
 For local development use `http://127.0.0.1:5173` (or your UI port). HTTP is
-permitted only on loopback. HTTPS uses `__Host-` cookies with `Secure`, `HttpOnly`,
+permitted on loopback by default. For a trusted development network, explicitly
+set `auth.allow_insecure_http: true` and set `auth.public_url` to the exact browser
+origin (for example, `http://10.10.2.199:5173`). This option applies only to the
+browser origin; OIDC issuer URLs still require HTTPS outside loopback. HTTPS uses `__Host-` cookies with `Secure`, `HttpOnly`,
 `SameSite=Lax`, and `Path=/`; do not rewrite their path in the reverse proxy.
+
+When authentication is enabled, `./dev.sh` prints the configured browser origin
+as its UI address. If you change `RAYFLOW_DEV_UI_PORT`, update `auth.public_url`
+or `RAYFLOW_AUTH__PUBLIC_URL` to match the address you open in the browser.
 
 Nested environment overrides use double underscores after `RAYFLOW_`:
 
@@ -152,7 +159,7 @@ Sign-out ends the Rayflow session, not the company identity provider's session.
 
 | Server endpoint | Behavior |
 | --- | --- |
-| `GET /api/v1/auth/providers` | Public company name and login choices, without secrets |
+| `GET /api/v1/auth/providers` | Public company name and login choices, plus `public_url` when authentication is enabled |
 | `POST /api/v1/auth/login` | JSON `provider` (`local`/`ldap`), `username`, `password` |
 | `GET /api/v1/auth/oidc/login` | Redirect to company SSO |
 | `GET /api/v1/auth/oidc/callback` | Consume state and complete SSO |

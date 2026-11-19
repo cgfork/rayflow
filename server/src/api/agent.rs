@@ -3,9 +3,7 @@ use axum::{
     extract::{Query, State},
     routing::get,
 };
-use graph::{GraphStore, types::DAG};
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::app::{AgentView, App, AppError, Page, PageQuery};
 
@@ -16,8 +14,7 @@ pub struct ListAgentsQuery {
 
 pub(super) fn routes<S>() -> Router<App<S>>
 where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    S::Err: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     Router::new().route("/agents", get(list_agents::<S>))
 }

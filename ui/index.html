@@ -3,7 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#151d32" />
+    <meta name="theme-color" content="#f8fafc" data-light="#f8fafc" data-dark="#0b1220" />
+    <script>
+      (() => {
+        let preference;
+        try {
+          preference = window.localStorage.getItem('rayflow.theme');
+        } catch {
+          // Use the system theme when storage is unavailable.
+        }
+        const systemTheme = window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        const theme = preference === 'light' || preference === 'dark' ? preference : systemTheme;
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        const themeColor = document.querySelector('meta[name="theme-color"]');
+        themeColor.content = themeColor.dataset[theme];
+      })();
+    </script>
     <meta name="description" content="Build workflows, inspect runs, and manage Rayflow execution." />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Rayflow · Workflow console</title>

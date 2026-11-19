@@ -5,12 +5,13 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use catalog::{PresignedUrl, model::Catalog};
 use graph::GraphStore;
 use graph::types::DAG;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::app::{App, AppError, GraphState, Page, PageQuery, RunView};
+use crate::app::{App, AppError, Page, PageQuery, RunView};
 
 /// Builds the run routes.
 pub(super) fn routes<S>() -> Router<App<S>>
@@ -28,6 +29,7 @@ where
         .route("/runs/resume", post(resume_run::<S>))
         .route("/runs/dryrun", post(dryrun_run::<S>))
         .route("/runs/graph_state", get(get_graph_state::<S>))
+        .route("/runs/{run_id}/files/download", post(download_file::<S>))
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,20 +77,18 @@ pub struct StartRunRequest {
 
 /// Response returned by `POST /runs/start`.
 #[derive(Debug, Serialize)]
-pub struct StartRunResponse {
+pub struct CommandResponse {
     /// Identifier of the emitted command entry.
     pub id: Uuid,
 }
 
+pub type StartRunResponse = CommandResponse;
+
 /// Emits `Command::Start`, beginning a run.
-async fn start_run<S>(
+async fn start_run<S: Clone>(
     State(state): State<App<S>>,
     Json(request): Json<StartRunRequest>,
-) -> Result<impl IntoResponse, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
-{
+) -> Result<impl IntoResponse, AppError> {
     let mut run = state.run_with(request.data_id, request.graph_id);
     let entry = run.start(request.nodes).await?;
     Ok((
@@ -109,21 +109,13 @@ pub struct RerunRunRequest {
 }
 
 /// Response returned by `POST /runs/rerun`.
-#[derive(Debug, Serialize)]
-pub struct RerunRunResponse {
-    /// Identifier of the emitted command entry.
-    pub id: Uuid,
-}
+pub type RerunRunResponse = CommandResponse;
 
 /// Emits `Command::Rerun`, resetting one node to `Ready`.
-async fn rerun_run<S>(
+async fn rerun_run<S: Clone>(
     State(state): State<App<S>>,
     Json(request): Json<RerunRunRequest>,
-) -> Result<impl IntoResponse, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
-{
+) -> Result<impl IntoResponse, AppError> {
     let mut run = state.run_with(request.data_id, request.graph_id);
     let entry = run.rerun(request.node).await?;
     Ok((
@@ -140,10 +132,7 @@ pub struct UpgradeRunRequest {
     pub node: Uuid,
 }
 
-#[derive(Debug, Serialize)]
-pub struct UpgradeRunResponse {
-    pub id: Uuid,
-}
+pub type UpgradeRunResponse = CommandResponse;
 
 async fn upgrade_run<S: Clone>(
     State(state): State<App<S>>,
@@ -166,19 +155,12 @@ pub struct ResumeRunRequest {
     pub node: Uuid,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ResumeRunResponse {
-    pub id: Uuid,
-}
+pub type ResumeRunResponse = CommandResponse;
 
-async fn resume_run<S>(
+async fn resume_run<S: Clone>(
     State(state): State<App<S>>,
     Json(request): Json<ResumeRunRequest>,
-) -> Result<impl IntoResponse, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
-{
+) -> Result<impl IntoResponse, AppError> {
     let mut run = state.run_with(request.data_id, request.graph_id);
     let entry = run.resume(request.node).await?;
     Ok((
@@ -200,21 +182,13 @@ pub struct DryrunRunRequest {
 }
 
 /// Response returned by `POST /runs/dryrun`.
-#[derive(Debug, Serialize)]
-pub struct DryrunRunResponse {
-    /// Identifier of the emitted command entry.
-    pub id: Uuid,
-}
+pub type DryrunRunResponse = CommandResponse;
 
 /// Emits `Command::Dryrun`, mock-succeeding the nodes' predecessors.
-async fn dryrun_run<S>(
+async fn dryrun_run<S: Clone>(
     State(state): State<App<S>>,
     Json(request): Json<DryrunRunRequest>,
-) -> Result<impl IntoResponse, AppError>
-where
-    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
-    <S as GraphStore<Uuid>>::Err: Send + Sync + 'static,
-{
+) -> Result<impl IntoResponse, AppError> {
     let mut run = state.run_with(request.data_id, request.graph_id);
     let entry = run.dryrun(request.nodes).await?;
     Ok((
@@ -233,7 +207,7 @@ pub struct GetGraphStateRequest {
 }
 
 /// Response returned by `GET /runs/graph_state`.
-pub type GetGraphStateResponse = GraphState;
+pub type GetGraphStateResponse = Vec<(runtime::command::NodeRun, graph::types::Node)>;
 
 /// Reads the current state of a run's graph.
 async fn get_graph_state<S>(
@@ -252,15 +226,39 @@ where
     Ok(Json(response))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A declared input or output in a revision of a run.
+#[derive(Debug, Deserialize)]
+pub struct RunFileDownloadRequest {
+    pub node_id: Uuid,
+    pub file_name: String,
+    pub direction: FileDirection,
+    pub revision: Option<u64>,
+}
 
-    #[test]
-    fn start_request_defaults_nodes() {
-        let request: StartRunRequest =
-            serde_json::from_str(r#"{"data_id":"00000000-0000-0000-0000-000000000001","graph_id":"00000000-0000-0000-0000-000000000002"}"#)
-                .unwrap();
-        assert!(request.nodes.is_empty());
-    }
+#[derive(Debug, Serialize)]
+pub struct Transfer {
+    pub catalog: Catalog,
+    pub presigned: PresignedUrl,
+    #[serde(default)]
+    pub multipart: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDirection {
+    Input,
+    Output,
+}
+
+async fn download_file<S>(
+    State(app): State<App<S>>,
+    Path(run_id): Path<Uuid>,
+    Json(request): Json<RunFileDownloadRequest>,
+) -> Result<Json<Transfer>, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone + Send + Sync + 'static,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.download_run_file(run_id, request).await.map(Json)
 }

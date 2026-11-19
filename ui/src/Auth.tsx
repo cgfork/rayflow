@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { ArrowRight, GitBranch, LogIn } from 'lucide-react';
 import App from './App';
+import { ThemePicker } from './Theme';
 import { api, ApiError, send } from './api';
+import { Loading } from './components';
 
 export type User = { id: string; provider: string; subject: string; name: string; email?: string };
 type Provider = { id: string; label: string; kind: 'password' | 'redirect' };
-type Configuration = { enabled: boolean; company_name: string; providers: Provider[] };
+type Configuration = { enabled: boolean; company_name: string; public_url?: string; providers: Provider[] };
 
 export default function Auth() {
   const [config, setConfig] = useState<Configuration>();
@@ -64,14 +66,19 @@ export default function Auth() {
     finally { setBusy(false); setPassword(''); }
   }
 
-  if (!loading && config && (!config.enabled || user)) return <App user={user} logout={logout} />;
+  const publicUrl = config?.public_url;
+  const originMismatch = publicUrl && publicUrl !== window.location.origin;
+  if (!loading && config && !originMismatch && (!config.enabled || user)) return <App user={user} logout={logout} />;
   const passwords = config?.providers.filter((item) => item.kind === 'password') || [];
-  return <div className="login-page"><section className="login-card" aria-label="Sign in">
+  return <div className="login-page"><div className="login-theme"><ThemePicker /></div><section className="login-card" aria-label="Sign in">
     <a className="brand" href="/"><span className="brand-mark"><GitBranch size={25} /></span><span>rayflow<span className="brand-period">.</span></span></a>
     <div className="login-heading"><span className="login-symbol"><LogIn size={24} /></span><h1>Welcome to {config?.company_name || 'Rayflow'}</h1><p>Sign in to your workflow workspace.</p></div>
-    {loading ? <p role="status">Loading sign-in…</p> : <>
+    {loading ? <Loading label="Loading sign-in…" /> : <>
       {error && <p className="login-error" role="alert">{error}</p>}
-      {!config ? <button className="button primary" onClick={() => { setError(''); setRetry((value) => value + 1); }}>Retry connection</button> : <>
+      {!config ? <button className="button primary" onClick={() => { setError(''); setRetry((value) => value + 1); }}>Retry connection</button> : originMismatch ? <>
+        <p>Use the configured Rayflow address to sign in.</p>
+        <a className="button primary" href={publicUrl}>{publicUrl}<ArrowRight size={16} /></a>
+      </> : <>
         {config.providers.some((item) => item.kind === 'redirect') && <a className="button primary sso-button" href="/api/v1/auth/oidc/login">Continue with company SSO<ArrowRight size={16} /></a>}
         {passwords.length > 0 && <form onSubmit={login}>
           {config.providers.some((item) => item.kind === 'redirect') && <div className="login-divider">or use your account</div>}

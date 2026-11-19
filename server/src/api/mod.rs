@@ -15,27 +15,25 @@
 //! * `POST /graphs/{graph_id}/publish` — validate and publish the draft.
 //! * `POST /task_events` — emit a `TaskEvent` for a task.
 //! * `POST /jobs/poll` — claim jobs matching the agent's capacity, optionally long-polling.
-//! * `POST /catalog/prepare` — prepare metadata and a signed upload URL.
-//! * `POST /catalog/commit` — acknowledge an upload and publish its file.
-//! * `POST /catalog/download` — sign the download URL for an agent-supplied key.
 //! * `POST /job/cancel` — cancel a job and emit `TaskEvent::Cancel`.
 //! * `POST /job/yield` — yield a job and emit `TaskEvent::Yield`.
 //! * `POST /job/succeed` — complete a job and emit `TaskEvent::Succeed`.
 //! * `POST /job/fail` — fail a job and emit `TaskEvent::Fail`.
 //! * `POST /job/terminate` — terminate a job and emit `TaskEvent::Terminate`.
 //! * `GET  /runs/graph_state` — read the current state of a run.
+//! * `POST /runs/{run_id}/files/download` — presign a declared run input/output for browsers.
+//! * `GET  /runs/{run_id}/files/content` — stream a declared file as an attachment.
+//! * `POST /users/resolve` — look up display names for user IDs.
 //!
 //! Application failures use the mapped HTTP status with a JSON
 //! [`crate::app::ErrorBody`] containing `error_code` (a stable business code)
 //! and `error` (the human-readable message).
 
 pub mod agent;
-pub mod catalog;
 pub mod graph;
-pub mod graph_draft;
 pub mod job;
 pub mod run;
-pub mod task_event;
+mod user;
 
 use ::graph::GraphStore;
 use ::graph::types::DAG;
@@ -44,14 +42,16 @@ use uuid::Uuid;
 
 use crate::app::App;
 
-pub use graph_draft::{PublishGraphDraftRequest, WriteGraphDraftRequest};
-pub use job::{JobActionRequest, PollJobsRequest, PollJobsResponse};
+pub use graph::{PublishGraphDraftRequest, WriteGraphDraftRequest};
+pub use job::{
+    EmitTaskEventRequest, EmitTaskEventResponse, JobActionRequest, PollJobsRequest,
+    PollJobsResponse,
+};
 pub use run::{
     DryrunRunRequest, DryrunRunResponse, GetGraphStateRequest, GetGraphStateResponse,
     RerunRunRequest, RerunRunResponse, ResumeRunRequest, ResumeRunResponse, StartRunRequest,
     StartRunResponse, UpgradeRunRequest, UpgradeRunResponse,
 };
-pub use task_event::{EmitTaskEventRequest, EmitTaskEventResponse};
 
 /// Builds the API router, backed by `App`.
 pub fn router<S>(state: App<S>) -> Router
@@ -66,12 +66,10 @@ where
         enabled: state.config.auth.enabled,
     };
     graph::routes::<S>()
-        .merge(catalog::routes::<S>())
         .merge(agent::routes::<S>())
-        .merge(graph_draft::routes::<S>())
         .merge(run::routes::<S>())
-        .merge(task_event::routes::<S>())
         .merge(job::routes::<S>())
+        .merge(user::routes::<S>())
         .route_layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             crate::auth::require_auth,

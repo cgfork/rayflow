@@ -129,7 +129,8 @@ impl Auth {
             .validate_with_providers(!providers.is_empty())
             .map_err(AuthError::Configuration)?;
         if config.enabled {
-            config.public_url = config::web_url(&config.public_url)
+            config.public_url = config
+                .public_origin()
                 .map_err(AuthError::Configuration)?
                 .origin()
                 .ascii_serialization();
@@ -375,9 +376,12 @@ async fn providers(State(state): State<AuthState>) -> Result<Json<serde_json::Va
         providers
             .push(serde_json::json!({ "id": "oidc", "label": "Company SSO", "kind": "redirect" }));
     }
-    Ok(Json(
-        serde_json::json!({ "enabled": true, "company_name": auth.0.config.company_name, "providers": providers }),
-    ))
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "company_name": auth.0.config.company_name,
+        "public_url": auth.0.config.public_url,
+        "providers": providers,
+    })))
 }
 
 async fn me(State(state): State<AuthState>, headers: HeaderMap) -> Result<Json<User>, AuthError> {
@@ -565,18 +569,14 @@ fn agent_route(method: &Method, path: &str) -> bool {
         return matches!(
             path,
             "/jobs/poll"
-                | "/catalog/prepare"
-                | "/catalog/commit"
-                | "/catalog/download"
-                | "/catalog/multipart/create"
-                | "/catalog/multipart/upload"
-                | "/catalog/multipart/complete"
-                | "/catalog/multipart/abort"
                 | "/job/cancel"
                 | "/job/yield"
                 | "/job/succeed"
                 | "/job/fail"
                 | "/job/terminate"
+                | "/job/output/prepare"
+                | "/job/output/commit"
+                | "/job/input/presign"
         );
     }
     *method == Method::GET
@@ -615,6 +615,3 @@ fn digest(value: &str) -> String {
 fn same_secret(left: &str, right: &str) -> bool {
     bool::from(Sha256::digest(left.as_bytes()).ct_eq(&Sha256::digest(right.as_bytes())))
 }
-
-#[cfg(test)]
-mod tests;

@@ -76,43 +76,45 @@ impl crate::Catalog for Catalog {
     }
 }
 
-/// A logical name pointing to a catalog object. Multiple files may refer to the
-/// same catalog. Full paths are unique and typically equal the catalog key.
+/// A node-run-owned file pointing to a catalog object. Its path lives in the catalog.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, toasty::Model)]
 #[table = "file"]
 #[unique(uuid)]
-#[unique(fullpath)]
+#[unique(node_run_id, filename)]
 pub struct File {
     #[key]
     #[auto]
     pub id: u64,
     pub uuid: Uuid,
-    #[column(type = varchar(512))]
-    pub fullpath: String,
+    #[index]
+    pub node_run_id: Uuid,
     #[column(type = varchar(255))]
     pub filename: String,
-    #[index]
     pub catalog_uuid: Uuid,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    #[belongs_to(key = catalog_uuid, references = uuid)]
+    #[serde(default, skip_serializing_if = "toasty::Deferred::is_unloaded")]
+    pub catalog: toasty::Deferred<Catalog>,
 }
 
 impl File {
     /// Constructs a logical file. Names are preserved as supplied.
     pub fn new(
         uuid: Uuid,
-        fullpath: impl Into<String>,
+        node_run_id: Uuid,
         filename: impl Into<String>,
         catalog_uuid: Uuid,
     ) -> Self {
         Self {
             id: 0,
             uuid,
-            fullpath: fullpath.into(),
+            node_run_id,
             filename: filename.into(),
             catalog_uuid,
             created_at: Timestamp::UNIX_EPOCH,
             updated_at: Timestamp::UNIX_EPOCH,
+            catalog: toasty::Deferred::default(),
         }
     }
 }
@@ -120,8 +122,8 @@ impl File {
 impl crate::File for File {
     type CatalogId = Uuid;
 
-    fn fullpath(&self) -> &str {
-        &self.fullpath
+    fn node_run_id(&self) -> Uuid {
+        self.node_run_id
     }
 
     fn filename(&self) -> &str {

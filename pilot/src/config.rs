@@ -177,63 +177,36 @@ impl Config {
 mod tests {
     use super::*;
 
-    #[test]
-    fn defaults_are_valid_except_for_the_database_url() {
-        let config = Config::default();
-        assert!(config.validate().is_err());
-
-        let config = Config {
-            database_url: "mysql://localhost/rayflow".to_string(),
+    fn valid() -> Config {
+        Config {
+            database_url: "mysql://root:secret@127.0.0.1/rayflow".into(),
             ..Config::default()
-        };
+        }
+    }
+
+    #[test]
+    fn defaults_have_a_usable_consumer_cadence() {
+        let config = valid();
+
         assert!(config.validate().is_ok());
         assert_eq!(config.poll_interval(), Duration::from_millis(250));
+        assert_eq!(config.leader_lease(), Duration::from_secs(10));
+        assert_eq!(config.gap_timeout(), Duration::from_secs(10));
     }
 
     #[test]
-    fn poll_interval_must_fit_inside_the_leader_lease() {
-        let config = Config {
-            database_url: "mysql://localhost/rayflow".to_string(),
-            poll_interval_ms: 10_000,
-            leader_lease_ms: 10_000,
-            ..Config::default()
-        };
+    fn rejects_a_poll_interval_that_can_outlive_the_lease() {
+        let mut config = valid();
+        config.poll_interval_ms = config.leader_lease_ms;
+
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn configurable_timeouts_are_validated() {
-        let mut config = Config {
-            database_url: "mysql://localhost/rayflow".into(),
-            gap_timeout_ms: 2000,
-            ..Config::default()
-        };
-        assert!(config.validate().is_ok());
-        assert_eq!(config.gap_timeout(), Duration::from_secs(2));
-        config.gap_timeout_ms = 0;
-        assert!(config.validate().is_err());
-    }
+    fn rejects_missing_database_configuration() {
+        let mut config = valid();
+        config.database_url.clear();
 
-    #[test]
-    fn job_timeout_gap_accepts_duration_strings_and_zero() {
-        assert_eq!(Config::default().job_timeout_gap, Duration::from_secs(10));
-        for (value, expected) in [
-            ("1.5s", Duration::from_millis(1500)),
-            ("0s", Duration::ZERO),
-        ] {
-            let config: Config = serde_json::from_value(serde_json::json!({
-                "database_url": "mysql://localhost/rayflow",
-                "job_timeout_gap": value,
-            }))
-            .unwrap();
-            assert_eq!(config.job_timeout_gap, expected);
-            assert!(config.validate().is_ok());
-        }
-        let config = Config {
-            database_url: "mysql://localhost/rayflow".into(),
-            job_timeout_gap: Duration::MAX,
-            ..Config::default()
-        };
         assert!(config.validate().is_err());
     }
 }

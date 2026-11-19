@@ -137,7 +137,9 @@ so another `GraphStore` can be injected by an application.
 
 HTTP handlers and application operations are grouped by resource: `graph`,
 `graph_draft`, `run`/`state`, `job`, `agent`, and `catalog`. Collection operations share
-`app::pagination::{PageQuery, Page}`. Graph endpoints use `GraphStore` and
+`app::pagination::{PageQuery, Page}`. Job modules also own task-event emission;
+graph modules own both published reads and draft editing/publication. Server
+and object-storage settings live together in `server::config`. Graph endpoints use `GraphStore` and
 `DraftGraphStore` and return complete DAGs without exposing persistence records.
 Draft writes/publishing, run commands, and job actions reuse their existing
 application methods. `app::AgentInstance` records poll observations in
@@ -163,17 +165,12 @@ HTTP `Client`, and `Settings` to poll for jobs, run containers, persist job
 results, and report terminal task events. The current default execution
 provider is Docker through Bollard.
 
-`JobFs` gives each job a durable directory under the configured workdir. The
-filesystem and UUID-based container names allow an agent to recover jobs after
-restart. `Filed` resolves artifact keys and producer versions, downloads declared
-inputs, and publishes outputs using `/catalog/prepare`, `/catalog/commit`, and
-`/catalog/download`. Each request supplies job/agent IDs, the key, and metadata
-in JSON. The server stores metadata and signs URLs within the claimed run.
-Transfers finish before execution and success reporting respectively. Its separate
-`FileFs` stores bytes under `data_dir/<run_uuid>/<node_id>/<revision>/`, retaining
-producer outputs after job acknowledgement. Docker mounts `inputs/` read-only
-and `outputs/` writable. Directory outputs use an internal JSON manifest. See
-[Catalog](catalog.md#http-api-and-agent-transfers) for configuration and protocol.
+`JobFs` gives each job a durable metadata directory and a run/node/revision data
+directory under the configured workdir. It owns input and output directories,
+transfer markers, and recovery state. `JobTransfer` implements the transfer
+backend used by `JobFs::prepare_input` and `JobFs::complete_output`. Docker mounts
+`inputs/` read-only and `outputs/` writable. Directory outputs use an internal
+JSON manifest. See [Catalog](catalog.md#job-artifact-api) for the protocol.
 
 ## Web UI
 
@@ -200,7 +197,6 @@ server/        Axum API binary and reusable application state
 pilot/         leader-elected consumer binary
 agent/         container execution and HTTP polling binary
 ui/            React workflow editor and runtime, job, and agent management
-graphs/        sample graphs available to tests and library consumers
 doc/           architecture, design, module, and usage documentation
 rayflow.sql    MySQL schema for all persistent models
 ```

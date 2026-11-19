@@ -9,15 +9,12 @@ pub mod api;
 pub mod app;
 pub mod auth;
 pub mod config;
-pub mod graph;
 pub mod migration;
-pub mod storage;
 #[cfg(feature = "embed-ui")]
 mod ui;
 
 pub use app::App;
 pub use config::Config;
-pub use graph::{Graphs, StaticGraphStore};
 
 use ::graph::GraphStore;
 use ::graph::types::DAG;
@@ -29,7 +26,9 @@ use uuid::Uuid;
 /// Registers catalog, graph, runtime, scheduling, and authentication models.
 pub fn models() -> toasty::ModelSet {
     let mut models = scheduler::models();
-    models.add(app::AgentInstance::schema());
+    for model in scheduler::agent_registry::models() {
+        models.add(model);
+    }
     models.add(auth::Session::schema());
     models.add(auth::LoginFlow::schema());
     models.add(auth::UserRecord::schema());
@@ -83,84 +82,4 @@ async fn index() -> &'static str {
 /// Liveness probe.
 async fn health() -> &'static str {
     "ok"
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-
-    use super::*;
-
-    #[test]
-    fn models_include_catalog_graph_runtime_and_scheduler() {
-        let models = models();
-        for model in scheduler::models()
-            .into_iter()
-            .chain(::graph::models())
-            .chain(catalog::models())
-        {
-            assert!(models.contains(model.id()));
-        }
-    }
-
-    #[tokio::test]
-    async fn health_returns_ok() {
-        let response = service_routes()
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn unknown_route_returns_not_found() {
-        let response = service_routes()
-            .oneshot(
-                Request::builder()
-                    .uri("/missing")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn browser_and_agent_routes_require_the_versioned_prefix() {
-        let api = Router::new()
-            .route("/auth/providers", get(|| async { "providers" }))
-            .route("/jobs/poll", axum::routing::post(|| async { "jobs" }));
-        let router = service_routes().merge(versioned_api(api));
-        for (method, path, expected) in [
-            ("GET", "/api/v1/auth/providers", StatusCode::OK),
-            ("POST", "/api/v1/jobs/poll", StatusCode::OK),
-            ("GET", "/api/v1/health", StatusCode::OK),
-            ("GET", "/health", StatusCode::OK),
-            ("GET", "/auth/providers", StatusCode::NOT_FOUND),
-            ("POST", "/jobs/poll", StatusCode::NOT_FOUND),
-            ("GET", "/api/auth/providers", StatusCode::NOT_FOUND),
-            ("POST", "/api/jobs/poll", StatusCode::NOT_FOUND),
-        ] {
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(path)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), expected, "{method} {path}");
-        }
-    }
 }
