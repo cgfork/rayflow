@@ -20,9 +20,12 @@
 //! * `POST /job/succeed` — complete a job and emit `TaskEvent::Succeed`.
 //! * `POST /job/fail` — fail a job and emit `TaskEvent::Fail`.
 //! * `POST /job/terminate` — terminate a job and emit `TaskEvent::Terminate`.
+//! * `POST /job/output/multipart/{create,upload,complete,abort}` — sign one
+//!   claim-scoped multipart output operation; the agent transfers bytes directly
+//!   to object storage and acknowledges the catalog through `/job/output/commit`.
 //! * `GET  /runs/graph_state` — read the current state of a run.
-//! * `POST /runs/{run_id}/files/download` — presign a declared run input/output for browsers.
-//! * `GET  /runs/{run_id}/files/content` — stream a declared file as an attachment.
+//! * `POST /runs/{run_id}/files/download` — return the provider's signed download URL
+//!   for a declared file; clients fetch the returned URL directly.
 //! * `POST /users/resolve` — look up display names for user IDs.
 //!
 //! Application failures use the mapped HTTP status with a JSON
@@ -44,8 +47,9 @@ use crate::app::App;
 
 pub use graph::{PublishGraphDraftRequest, WriteGraphDraftRequest};
 pub use job::{
-    EmitTaskEventRequest, EmitTaskEventResponse, JobActionRequest, PollJobsRequest,
-    PollJobsResponse,
+    CreateMultipartOutputRequest, EmitTaskEventRequest, EmitTaskEventResponse, JobActionRequest,
+    MultipartOutputContext, PollJobsRequest, PollJobsResponse, SessionMultipartOutputRequest,
+    UploadMultipartOutputRequest,
 };
 pub use run::{
     DryrunRunRequest, DryrunRunResponse, GetGraphStateRequest, GetGraphStateResponse,

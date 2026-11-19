@@ -576,6 +576,10 @@ fn agent_route(method: &Method, path: &str) -> bool {
                 | "/job/terminate"
                 | "/job/output/prepare"
                 | "/job/output/commit"
+                | "/job/output/multipart/create"
+                | "/job/output/multipart/upload"
+                | "/job/output/multipart/complete"
+                | "/job/output/multipart/abort"
                 | "/job/input/presign"
         );
     }

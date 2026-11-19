@@ -1,6 +1,5 @@
 use graph::GraphStore;
 use graph::types::DAG;
-use runtime::command::{NodeRun, Run};
 use scheduler::{Job, ResourceCapacity};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -18,6 +17,19 @@ pub struct Client {
 pub struct Transfer {
     pub catalog: catalog::model::Catalog,
     pub presigned: catalog::PresignedUrl,
+    #[serde(default)]
+    pub multipart: bool,
+}
+
+#[derive(Serialize)]
+struct MultipartPresignRequest<'a> {
+    job_id: Uuid,
+    agent_id: Uuid,
+    filename: &'a str,
+    catalog_uuid: Uuid,
+    upload_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    part_number: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -33,54 +45,7 @@ pub struct PollResponse {
     pub jobs: Vec<Job>,
 }
 
-#[derive(Deserialize)]
-pub(crate) struct RunView {
-    pub run: Run,
-    pub node_runs: Vec<(NodeRun, graph::types::Node)>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct RunState {
-    pub nodes: Vec<NodeState>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct NodeState {
-    pub node_id: Uuid,
-    pub version: u64,
-    pub revision: u64,
-    pub status: String,
-    pub ineffective: u32,
-}
-
 impl Client {
-    pub(crate) async fn run_state(&self, run_id: Uuid, revision: u64) -> Result<RunState, Error> {
-        let view: RunView = self
-            .http
-            .get(format!("{}/runs/{run_id}", self.base_url()))
-            .query(&[("revision", revision)])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        if view.run.uuid != run_id {
-            return Err(Error::Artifact("server returned a different run".into()));
-        }
-        Ok(RunState {
-            nodes: view
-                .node_runs
-                .into_iter()
-                .map(|(node_run, _)| NodeState {
-                    node_id: node_run.node_id,
-                    version: node_run.version,
-                    revision: node_run.revision,
-                    status: node_run.status,
-                    ineffective: node_run.ineffective,
-                })
-                .collect(),
-        })
-    }
     /// Prepares an output catalog and returns its ordinary upload signature.
     pub async fn prepare_upload(
         &self,
@@ -108,8 +73,6 @@ impl Client {
         agent_id: Uuid,
         filename: &str,
         catalog_uuid: Uuid,
-        _size: u64,
-        _format: &str,
     ) -> Result<(), Error> {
         let body = serde_json::json!({"job_id": job_id, "agent_id": agent_id, "filename": filename, "catalog_uuid": catalog_uuid});
         self.http
@@ -119,6 +82,115 @@ impl Client {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    pub async fn create_multipart_upload(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: &str,
+        size: u64,
+        format: &str,
+    ) -> Result<Transfer, Error> {
+        let body = serde_json::json!({
+            "job_id": job_id,
+            "agent_id": agent_id,
+            "filename": filename,
+            "size": size,
+            "format": format,
+        });
+        let response = self
+            .http
+            .post(format!("{}/job/output/multipart/create", self.base_url()))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        let value: serde_json::Value = response.json().await?;
+        serde_json::from_value(value.get("transfer").cloned().unwrap_or(value)).map_err(Into::into)
+    }
+
+    async fn presign_multipart(
+        &self,
+        path: &str,
+        request: MultipartPresignRequest<'_>,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        Ok(self
+            .http
+            .post(format!("{}{path}", self.base_url()))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    pub async fn upload_multipart_part(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: &str,
+        catalog_uuid: Uuid,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        self.presign_multipart(
+            "/job/output/multipart/upload",
+            MultipartPresignRequest {
+                job_id,
+                agent_id,
+                filename,
+                catalog_uuid,
+                upload_id,
+                part_number: Some(part_number),
+            },
+        )
+        .await
+    }
+
+    pub async fn complete_multipart_upload(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: &str,
+        catalog_uuid: Uuid,
+        upload_id: &str,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        self.presign_multipart(
+            "/job/output/multipart/complete",
+            MultipartPresignRequest {
+                job_id,
+                agent_id,
+                filename,
+                catalog_uuid,
+                upload_id,
+                part_number: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: &str,
+        catalog_uuid: Uuid,
+        upload_id: &str,
+    ) -> Result<catalog::PresignedUrl, Error> {
+        self.presign_multipart(
+            "/job/output/multipart/abort",
+            MultipartPresignRequest {
+                job_id,
+                agent_id,
+                filename,
+                catalog_uuid,
+                upload_id,
+                part_number: None,
+            },
+        )
+        .await
     }
 
     pub async fn download_input(
@@ -194,10 +266,6 @@ impl Client {
             request = request.query(&[("version", version)]);
         }
         Ok(request.send().await?.error_for_status()?.json().await?)
-    }
-
-    pub async fn cancel(&self, agent_id: Uuid, job_id: Uuid) -> Result<(), Error> {
-        self.job_action("cancel", agent_id, job_id).await
     }
 
     pub async fn fail(&self, agent_id: Uuid, job_id: Uuid) -> Result<(), Error> {

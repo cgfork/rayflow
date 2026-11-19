@@ -140,10 +140,65 @@ impl<S> App<S> {
         S::load(..): Send,
         S::Err: Send + Sync + 'static,
     {
+        self.prepare_output_with_operation(
+            job_id,
+            agent_id,
+            filename,
+            size,
+            format,
+            PresignOperation::Upload,
+        )
+        .await
+    }
+
+    pub async fn create_multipart_output(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: String,
+        size: Option<u64>,
+        format: Option<String>,
+    ) -> Result<crate::api::run::Transfer, AppError>
+    where
+        S: GraphStore<Uuid, G = DAG> + Clone,
+        S::load(..): Send,
+        S::Err: Send + Sync + 'static,
+    {
+        self.prepare_output_with_operation(
+            job_id,
+            agent_id,
+            filename,
+            size,
+            format,
+            PresignOperation::CreateMultipart,
+        )
+        .await
+    }
+
+    async fn prepare_output_with_operation(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: String,
+        size: Option<u64>,
+        format: Option<String>,
+        operation: PresignOperation,
+    ) -> Result<crate::api::run::Transfer, AppError>
+    where
+        S: GraphStore<Uuid, G = DAG> + Clone,
+        S::load(..): Send,
+        S::Err: Send + Sync + 'static,
+    {
         let size =
             size.ok_or_else(|| AppError::InvalidRequest("output size is required".into()))?;
         let format =
             format.ok_or_else(|| AppError::InvalidRequest("output format is required".into()))?;
+        let multipart = operation.is_multipart();
+        if multipart && !self.multipart_enabled() {
+            return Err(AppError::InvalidRequest(
+                "multipart storage is not enabled".into(),
+            ));
+        }
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let job = Job::filter_by_uuid(job_id)
@@ -177,15 +232,86 @@ impl<S> App<S> {
             .as_ref()
             .ok_or(AppError::StorageUnavailable)?;
         let storage = config.object_storage(self.db.clone())?;
+        if multipart && !storage.supports_multipart() {
+            return Err(AppError::InvalidRequest(
+                "storage provider does not support multipart uploads".into(),
+            ));
+        }
         let presigned = storage
-            .presign_catalog(&catalog, PresignOperation::Upload, config.presign_ttl)
+            .presign_catalog(&catalog, operation, config.presign_ttl)
             .map_err(|error| AppError::Storage(Box::new(error)))?;
         tx.commit().await?;
         Ok(crate::api::run::Transfer {
             catalog,
             presigned,
-            multipart: false,
+            multipart,
         })
+    }
+
+    pub async fn presign_multipart_output(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: String,
+        catalog_uuid: Uuid,
+        operation: PresignOperation,
+    ) -> Result<catalog::PresignedUrl, AppError>
+    where
+        S: GraphStore<Uuid, G = DAG> + Clone,
+        S::load(..): Send,
+        S::Err: Send + Sync + 'static,
+    {
+        if !operation.is_multipart() || matches!(operation, PresignOperation::CreateMultipart) {
+            return Err(AppError::InvalidRequest(
+                "invalid multipart output operation".into(),
+            ));
+        }
+        if !self.multipart_enabled() {
+            return Err(AppError::InvalidRequest(
+                "multipart storage is not enabled".into(),
+            ));
+        }
+        let mut db = self.db.clone();
+        let job = Job::filter_by_uuid(job_id)
+            .include(Job::fields().node_run())
+            .first()
+            .exec(&mut db)
+            .await?
+            .ok_or(AppError::JobNotFound(job_id))?;
+        Self::validate_output_job(&job, agent_id)?;
+        let node_run = job.node_run.get();
+        self.validate_output_filename(node_run, &filename).await?;
+        let (key, _) = self.output_location(node_run, &filename)?;
+        let catalog = db
+            .get_catalog(catalog_uuid)
+            .await?
+            .ok_or_else(|| AppError::ArtifactNotFound(catalog_uuid.to_string()))?;
+        if catalog.key != key || catalog.uploaded {
+            return Err(AppError::InvalidRequest(
+                "output catalog does not match the active multipart upload".into(),
+            ));
+        }
+        let config = self
+            .config
+            .storage
+            .as_ref()
+            .ok_or(AppError::StorageUnavailable)?;
+        let storage = config.object_storage(self.db.clone())?;
+        if !storage.supports_multipart() {
+            return Err(AppError::InvalidRequest(
+                "storage provider does not support multipart uploads".into(),
+            ));
+        }
+        storage
+            .presign_catalog(&catalog, operation, config.presign_ttl)
+            .map_err(|error| AppError::Storage(Box::new(error)))
+    }
+
+    fn multipart_enabled(&self) -> bool {
+        self.config
+            .storage
+            .as_ref()
+            .is_some_and(|config| config.multipart_enabled)
     }
 
     pub async fn commit_output(
@@ -319,7 +445,11 @@ impl<S> App<S> {
         Ok(crate::api::run::Transfer {
             catalog,
             presigned,
-            multipart: false,
+            multipart: self
+                .config
+                .storage
+                .as_ref()
+                .is_some_and(|config| config.multipart_enabled && storage.supports_multipart()),
         })
     }
 

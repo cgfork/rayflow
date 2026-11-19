@@ -31,9 +31,11 @@ use crate::{
 /// Connects the remote scheduling service to a local [`Agentd`].
 ///
 /// One loop polls jobs sequentially while preparing and starting them
-/// concurrently. A second loop delivers durable results, including results
-/// recovered after a crash. Pending preparations and unacknowledged results
-/// remain active so the server does not redeliver their jobs.
+/// concurrently. The active-job set admits each job to execution once per
+/// agent process; lifecycle locks also guard direct start/recovery calls. A
+/// second loop delivers durable results, including results recovered after a
+/// crash. Pending preparations and unacknowledged results remain active so the
+/// server does not redeliver their jobs.
 pub struct Agentic<C = DockerContainerd, R = Client> {
     agentd: Agentd<C, R>,
     client: Client,
