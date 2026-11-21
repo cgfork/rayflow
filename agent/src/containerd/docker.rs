@@ -48,6 +48,8 @@ pub struct DockerSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerFiles {
+    /// Read-only job metadata and the pinned graph definition.
+    pub metadata: PathBuf,
     pub inputs: PathBuf,
     pub outputs: PathBuf,
 }
@@ -253,11 +255,13 @@ impl Containerd for DockerContainerd {
     fn spec_with_files<'a>(
         &'a self,
         job: &'a scheduler::Job,
+        metadata: &Path,
         inputs: &Path,
         outputs: &Path,
     ) -> Result<Self::Spec<'a>, Error> {
         let mut spec = DockerSpec::try_from(job)?;
         spec.files = Some(DockerFiles {
+            metadata: metadata.to_path_buf(),
             inputs: inputs.to_path_buf(),
             outputs: outputs.to_path_buf(),
         });
@@ -266,6 +270,8 @@ impl Containerd for DockerContainerd {
             !value.starts_with("RAYFLOW_INPUT_DIR=") && !value.starts_with("RAYFLOW_OUTPUT_DIR=")
         });
         env.extend([
+            "RAYFLOW_JOB_FILE=/rayflow/job.json".into(),
+            "RAYFLOW_GRAPH_FILE=/rayflow/graph.json".into(),
             "RAYFLOW_INPUT_DIR=/data/inputs".into(),
             "RAYFLOW_OUTPUT_DIR=/data/outputs".into(),
         ]);
@@ -302,6 +308,13 @@ impl Containerd for DockerContainerd {
             host_config: Some(HostConfig {
                 mounts: spec.files.as_ref().map(|files| {
                     vec![
+                        Mount {
+                            typ: Some(MountType::BIND),
+                            source: Some(files.metadata.to_string_lossy().into_owned()),
+                            target: Some("/rayflow".into()),
+                            read_only: Some(true),
+                            ..Default::default()
+                        },
                         Mount {
                             typ: Some(MountType::BIND),
                             source: Some(files.inputs.to_string_lossy().into_owned()),

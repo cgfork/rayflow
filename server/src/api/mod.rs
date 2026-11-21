@@ -1,5 +1,8 @@
 //! REST API.
 //!
+//! The Prometheus scrape endpoint is exposed at `GET /metrics` on the server's
+//! listener alongside the liveness endpoints.
+//!
 //! The server is the command *producer* of the event-sourced runtime: it appends
 //! the commands that drive a run to the command log, emits task events, and reads
 //! back the state those commands produced once a consumer has applied them.

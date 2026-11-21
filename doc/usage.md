@@ -232,8 +232,11 @@ use compatible lease and poll settings.
 
 ### Agent
 
-The agent requires a stable, non-nil UUID. The other settings have defaults:
-`server_url` is the server base URL; the agent appends `/api/v1` automatically.
+The agent identity is stable across restarts. Set `id` explicitly when managing
+multiple agents, or omit it and let the first startup generate it in
+`<workdir>/.agent-owner.json`; later starts recover that UUID. The other
+settings have defaults. `server_url` is the server base URL; the agent appends
+`/api/v1` automatically.
 
 ```yaml
 id: 12345678-1234-4234-8234-123456789abc
@@ -422,6 +425,7 @@ The service endpoints are:
 | --- | --- | --- |
 | `GET` | `/` | Embedded UI, or `rayflow` without `embed-ui`. |
 | `GET` | `/health`, `/api/v1/health` | Liveness probe; returns `ok`. |
+| `GET` | `/metrics` | Prometheus text metrics for the server process. |
 | `GET` | `/api/v1/graphs` | List published graph versions; optional `graph_id` filter. |
 | `GET` | `/api/v1/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
 | `GET` | `/api/v1/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
@@ -451,6 +455,11 @@ The service endpoints are:
 | `POST` | `/api/v1/job/input/presign` | Return a signed download URL for a declared input. |
 | `POST` | `/api/v1/runs/{run_id}/files/download` | Return a signed download URL for a succeeded declared input or output. |
 | `POST` | `/api/v1/users/resolve` | Resolve valid audit user IDs to display names for the console. |
+
+The server exports `rayflow_http_requests_total` and
+`rayflow_http_request_duration_seconds`, labeled by HTTP method, matched route
+template, and response status. Route labels use templates rather than raw URLs,
+so request IDs do not create unbounded metric cardinality.
 
 The file-download response contains `catalog`, `presigned.url`,
 `presigned.operation`, `presigned.headers`, and `presigned.expires_at`. The
@@ -622,6 +631,9 @@ directory; `job.json` is the source used to restore the job after a restart:
 {WORKDIR}/{job-uuid}/result.json
 {WORKDIR}/{job-uuid}/pid
 {WORKDIR}/{job-uuid}/runtime/started_at
+{WORKDIR}/{job-uuid}/graph.json
+{WORKDIR}/.agent.lock
+{WORKDIR}/.agent-owner.json
 ```
 
 `container.json`, `result.json`, `pid`, and `runtime/started_at` are written only
@@ -632,6 +644,16 @@ The `lock` file is held with an exclusive OS lock while a job is being
 coordinated. On startup, `Agentic` discovers existing directories, reconnects
 to containers by their persisted IDs, and retries unreported results. Keep this
 directory across agent restarts.
+
+The agent also holds a process-wide lock for the entire `workdir`. Start an
+upgraded binary only after the previous process has exited, using the same
+agent UUID, `workdir`, and `data_dir`. The new process acquires the lock,
+reconnects to persisted containers, retries durable results, and resumes
+active jobs. The owner JSON is diagnostic metadata; the OS lock is the
+authority, so a stale owner file after a crash does not block recovery. Running
+containers and unacknowledged results remain available during this handoff.
+If a persisted container ID no longer exists, recovery fails closed instead of
+creating a second container for the same job.
 
 ## Agent inputs and outputs
 
@@ -651,6 +673,11 @@ Declare outputs on the producer node and bind downstream inputs with
 `/data/outputs`). Directory outputs include an internal `.rayflow-directory.json`
 manifest. The agent downloads inputs before execution and uploads outputs before
 reporting success, with durable checkpoints for retries.
+
+Docker jobs receive the job directory as a read-only `/rayflow` mount. The
+container can read `/rayflow/job.json` and the pinned `/rayflow/graph.json`;
+`RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to those paths. Inputs and
+outputs remain mounted separately at `/data/inputs` and `/data/outputs`.
 
 Configure the server's S3-compatible storage before running nodes with artifacts.
 See [Catalog and object storage](catalog.md#job-artifact-api) for

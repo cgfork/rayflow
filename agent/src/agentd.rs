@@ -32,6 +32,7 @@ use crate::{
     fs::job::JobFs,
     fs::{Container as JobContainer, JobFs as JobFsTrait, JobResult},
     settings::Settings,
+    write_json,
 };
 
 const WATCH_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -253,7 +254,9 @@ where
                     Ok(_) => container,
                     Err(error) if is_not_found(&error) => {
                         self.inner.containers.lock().await.remove(&persisted_id);
-                        self.create_container(job_fs, &job).await?
+                        return Err(Error::Agentd(format!(
+                            "persisted container {persisted_id} is missing; refusing to create a replacement"
+                        )));
                     }
                     Err(error) => return Err(error),
                 }
@@ -387,21 +390,18 @@ where
             .load(node_run.graph_id, Some(node_run.version))
             .await
             .map_err(|error| Error::Agentd(format!("load graph: {error}")))?;
-        let node = graph
-            .nodes
-            .iter()
-            .find(|node| node.id == node_run.node_id)
-            .ok_or_else(|| Error::Agentd("job node is missing from graph".into()))?;
-        if node.inputs.is_empty() && node.outputs.is_empty() {
-            return self.inner.containerd.spec(job);
+        if !graph.nodes.iter().any(|node| node.id == node_run.node_id) {
+            return Err(Error::Agentd("job node is missing from graph".into()));
         }
+        write_json(&JobFsTrait::dir(job_fs).join("graph.json"), &graph).await?;
         fs::create_dir_all(JobFsTrait::input_dir(job_fs)).await?;
         fs::create_dir_all(JobFsTrait::output_dir(job_fs)).await?;
+        let metadata = fs::canonicalize(JobFsTrait::dir(job_fs)).await?;
         let inputs = fs::canonicalize(JobFsTrait::input_dir(job_fs)).await?;
         let outputs = fs::canonicalize(JobFsTrait::output_dir(job_fs)).await?;
         self.inner
             .containerd
-            .spec_with_files(job, &inputs, &outputs)
+            .spec_with_files(job, &metadata, &inputs, &outputs)
     }
 
     /// Persists output validation failure before reporting a failed job.

@@ -353,6 +353,7 @@ roots are scoped by the job UUID; artifact data is isolated per job:
 <metadata_dir>/<job_uuid>/result.json
 <metadata_dir>/<job_uuid>/pid
 <metadata_dir>/<job_uuid>/runtime/started_at
+<metadata_dir>/<job_uuid>/graph.json
 <data_dir>/<job_uuid>/inputs/<filename>
 <data_dir>/<job_uuid>/outputs/<filename>
 <data_dir>/<job_uuid>/.rayflow/<job_uuid>/inputs-ready.json
@@ -360,9 +361,11 @@ roots are scoped by the job UUID; artifact data is isolated per job:
 ```
 
 `metadata_dir` is the configured agent `workdir`; `data_dir` is configured
-separately (the defaults are `.rayflow/jobs` and `.rayflow/data`). The agent
-keeps input readiness, output completion, and transfer state in the per-job
-marker directory. Outputs remain available until acknowledgement, after which
-the agent removes the local artifact directory.
+separately (the defaults are `.rayflow/jobs` and `.rayflow/data`). Docker mounts
+the read-only job metadata directory at `/rayflow`, including `job.json` and
+the pinned `graph.json`; `RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to
+those files. The agent keeps input readiness, output completion, and transfer
+state in the per-job marker directory. Outputs remain available until
+acknowledgement, after which the agent removes the local artifact directory.
 Docker mounts inputs read-only at `/data/inputs` and outputs writable at
 `/data/outputs`.
