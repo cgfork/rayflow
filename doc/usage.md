@@ -425,6 +425,7 @@ The service endpoints are:
 | --- | --- | --- |
 | `GET` | `/` | Embedded UI, or `rayflow` without `embed-ui`. |
 | `GET` | `/health`, `/api/v1/health` | Liveness probe; returns `ok`. |
+| `GET` | `/metrics` | Prometheus text metrics for the server process. |
 | `GET` | `/api/v1/graphs` | List published graph versions; optional `graph_id` filter. |
 | `GET` | `/api/v1/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
 | `GET` | `/api/v1/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
@@ -454,6 +455,11 @@ The service endpoints are:
 | `POST` | `/api/v1/job/input/presign` | Return a signed download URL for a declared input. |
 | `POST` | `/api/v1/runs/{run_id}/files/download` | Return a signed download URL for a succeeded declared input or output. |
 | `POST` | `/api/v1/users/resolve` | Resolve valid audit user IDs to display names for the console. |
+
+The server exports `rayflow_http_requests_total` and
+`rayflow_http_request_duration_seconds`, labeled by HTTP method, matched route
+template, and response status. Route labels use templates rather than raw URLs,
+so request IDs do not create unbounded metric cardinality.
 
 The file-download response contains `catalog`, `presigned.url`,
 `presigned.operation`, `presigned.headers`, and `presigned.expires_at`. The
@@ -625,6 +631,7 @@ directory; `job.json` is the source used to restore the job after a restart:
 {WORKDIR}/{job-uuid}/result.json
 {WORKDIR}/{job-uuid}/pid
 {WORKDIR}/{job-uuid}/runtime/started_at
+{WORKDIR}/{job-uuid}/graph.json
 {WORKDIR}/.agent.lock
 {WORKDIR}/.agent-owner.json
 ```
@@ -666,6 +673,11 @@ Declare outputs on the producer node and bind downstream inputs with
 `/data/outputs`). Directory outputs include an internal `.rayflow-directory.json`
 manifest. The agent downloads inputs before execution and uploads outputs before
 reporting success, with durable checkpoints for retries.
+
+Docker jobs receive the job directory as a read-only `/rayflow` mount. The
+container can read `/rayflow/job.json` and the pinned `/rayflow/graph.json`;
+`RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to those paths. Inputs and
+outputs remain mounted separately at `/data/inputs` and `/data/outputs`.
 
 Configure the server's S3-compatible storage before running nodes with artifacts.
 See [Catalog and object storage](catalog.md#job-artifact-api) for

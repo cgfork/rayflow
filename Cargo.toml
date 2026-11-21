@@ -9,6 +9,7 @@ members = [
     "crates/scheduler",
     "crates/coordinator",
     "crates/catalog",
+    "crates/metrics",
 ]
 resolver = "2"
 
@@ -24,6 +25,7 @@ runtime = {path = "crates/runtime"}
 scheduler = {path = "crates/scheduler"}
 coordinator = {path = "crates/coordinator", default-features = false}
 catalog = {path = "crates/catalog"}
+metrics = {path = "crates/metrics"}
 axum = "0.8"
 fastrand = "2"
 futures-util = "0.3"
@@ -42,3 +44,4 @@ jiff = { version = "0.2", features = ["serde"] }
 tokio = { version = "1.53", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus-client = "0.25"

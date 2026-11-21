@@ -270,11 +270,13 @@ impl Containerd for FakeProvider {
     fn spec_with_files<'a>(
         &'a self,
         job: &'a Job,
+        metadata: &Path,
         inputs: &Path,
         outputs: &Path,
     ) -> Result<Self::Spec<'a>, Error> {
         let mut spec = self.spec(job)?;
         spec.files = Some(DockerFiles {
+            metadata: metadata.into(),
             inputs: inputs.into(),
             outputs: outputs.into(),
         });
@@ -330,6 +332,8 @@ async fn yield_and_resume_isolate_job_data_and_only_acknowledge_finished_jobs() 
     let mounts = spec.files.unwrap();
     assert_eq!(mounts.inputs, files.input_dir().canonicalize().unwrap());
     assert_eq!(mounts.outputs, files.output_dir().canonicalize().unwrap());
+    assert_eq!(mounts.metadata, files.dir().canonicalize().unwrap());
+    assert!(files.dir().join("graph.json").exists());
     fs::write(files.output_dir().join("result.txt"), b"checkpoint")
         .await
         .unwrap();

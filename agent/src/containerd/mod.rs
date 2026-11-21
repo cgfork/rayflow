@@ -171,6 +171,7 @@ pub trait Containerd: Clone + Send + Sync + 'static {
     fn spec_with_files<'a>(
         &'a self,
         _job: &'a Job,
+        _metadata: &std::path::Path,
         _inputs: &std::path::Path,
         _outputs: &std::path::Path,
     ) -> Result<Self::Spec<'a>, Error> {
