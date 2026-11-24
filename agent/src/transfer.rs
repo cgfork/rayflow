@@ -1,23 +1,18 @@
-//! Transfers declared inputs and outputs through the job filesystem.
+//! Transfers declared job inputs, outputs, and metadata.
 //!
-//! Metadata requests use the fleet client; object requests use a separate client
-//! without fleet credentials. Upload state survives restarts and success is
-//! reported only after every output and directory manifest has been published.
-//!
-//! Transfer operations do not acquire the job lifecycle lock. `Agentic` admits
-//! one executor per job, while the persisted markers make retries idempotent;
-//! the lock remains responsible for serializing job lifecycle changes such as
-//! start, stop, recovery, and cleanup.
+//! The fleet client authorizes transfers. The object client sends only the
+//! headers supplied with the presigned request. Transfer checkpoints live
+//! under the job's data directory.
 
 use crate::client::Transfer as CatalogTransfer;
+use catalog::PresignOperation;
 use catalog::directory::{
     DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DirectoryEntry, DirectoryManifest, EntryKind,
     MAX_MANIFEST_BYTES,
 };
 use catalog::path::validate_relative_path;
-use catalog::{PresignOperation, PresignedUrl};
 use graph::types::{Kind, Node};
-use scheduler::Job;
+use scheduler::{Job, JobArtifactName};
 use std::{
     collections::BTreeMap,
     io,
@@ -30,12 +25,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{
-    client::Client,
-    errors::Error,
-    fs::{GraphFs, JobFs as JobFsTrait, Transfer},
-    read_json, write_json,
-};
+use crate::{client::Client, errors::Error, read_json, write_json};
 
 #[derive(Clone)]
 pub struct JobTransfer {
@@ -79,43 +69,79 @@ impl JobTransfer {
         })
     }
 
-    pub async fn prepare_input<J: JobFsTrait, G: GraphFs + Clone>(
+    /// Returns false when object storage is disabled.
+    pub(crate) async fn upload_artifact(
         &self,
-        file_fs: &J,
-        graph_store: &G,
-    ) -> Result<(), Error> {
-        let job_id = file_fs.job().uuid;
-        let node_run = file_fs.job().node_run.get();
-        let graph = graph_store
-            .clone()
-            .load(node_run.graph_id, Some(node_run.version))
-            .await
-            .map_err(|error| artifact(format!("load graph: {error}")))?;
-        let node = graph
-            .nodes
-            .iter()
-            .find(|node| node.id == node_run.node_id)
-            .cloned()
-            .ok_or_else(|| artifact("job node is missing from graph"))?;
-        if node.inputs.is_empty() {
-            return Ok(());
+        job_id: Uuid,
+        filename: JobArtifactName,
+        bytes: Vec<u8>,
+    ) -> Result<bool, Error> {
+        let size = bytes.len() as u64;
+        let Some(transfer) = self
+            .client
+            .prepare_job_artifact(job_id, self.agent_id, filename, size)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let suffix = format!("/jobs/{job_id}/{}", filename.as_str());
+        if transfer.catalog.size != size
+            || transfer.catalog.format != "application/json"
+            || !transfer.catalog.key.ends_with(&suffix)
+        {
+            return Err(artifact(
+                "server returned inconsistent job artifact metadata",
+            ));
         }
-        self.download(file_fs, job_id, &node).await
+        if !transfer.catalog.uploaded {
+            if transfer.presigned.operation != PresignOperation::Upload {
+                return Err(artifact(
+                    "server returned the wrong job artifact upload operation",
+                ));
+            }
+            // Use the object client, which never carries fleet credentials.
+            let mut put = self
+                .objects
+                .put(&transfer.presigned.url)
+                .header(reqwest::header::CONTENT_LENGTH, size)
+                .body(bytes);
+            for (name, value) in &transfer.presigned.headers {
+                put = put.header(name, value);
+            }
+            let status = put
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?
+                .error_for_status()
+                .map_err(reqwest::Error::without_url)?
+                .status();
+            if !status.is_success() {
+                return Err(artifact(format!(
+                    "job artifact upload returned HTTP {status}"
+                )));
+            }
+            self.client
+                .commit_job_artifact(job_id, self.agent_id, filename, transfer.catalog.uuid)
+                .await?;
+        }
+        Ok(true)
     }
 
-    async fn download<J: JobFsTrait>(
+    pub async fn prepare_input(
         &self,
-        file_fs: &J,
-        job_id: Uuid,
+        job: &Job,
+        data_dir: &Path,
         node: &Node,
     ) -> Result<(), Error> {
+        let job_id = job.uuid;
+        let state_dir = state_dir(data_dir, job_id);
         validate_node_paths(node)?;
-        if node.inputs.is_empty() || read_marker(file_fs, job_id, "inputs-ready").await? {
+        if node.inputs.is_empty() || read_marker(&state_dir, "inputs-ready").await? {
             return Ok(());
         }
         // Before startup, unfinished staging is disposable. Never follow a link
         // supplied in place of the input root.
-        let root = file_fs.input_dir();
+        let root = data_dir.join("inputs");
         match fs::symlink_metadata(&root).await {
             Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&root).await?,
             Ok(_) => return Err(artifact("input root is not a directory")),
@@ -176,44 +202,26 @@ impl JobTransfer {
                 self.download_file(&transfer, &destination).await?;
             }
         }
-        write_marker(file_fs, job_id, "inputs-ready").await
+        write_marker(&state_dir, "inputs-ready").await
     }
 
-    pub async fn complete_output<J: JobFsTrait, G: GraphFs + Clone>(
-        &self,
-        file_fs: &J,
-        graph_store: &G,
-    ) -> Result<(), Error> {
-        let job_id = file_fs.job().uuid;
-        let node_run = file_fs.job().node_run.get();
-        let graph = graph_store
-            .clone()
-            .load(node_run.graph_id, Some(node_run.version))
-            .await
-            .map_err(|error| artifact(format!("load graph: {error}")))?;
-        let node = graph
-            .nodes
-            .iter()
-            .find(|node| node.id == node_run.node_id)
-            .cloned()
-            .ok_or_else(|| artifact("job node is missing from graph"))?;
-        if node.outputs.is_empty() {
-            return Ok(());
-        }
-        self.upload(file_fs, job_id, &node).await
+    pub(crate) async fn outputs_uploaded(data_dir: &Path, job_id: Uuid) -> Result<bool, Error> {
+        read_marker(&state_dir(data_dir, job_id), "outputs-uploaded").await
     }
 
-    async fn upload<J: JobFsTrait>(
+    pub async fn complete_output(
         &self,
-        file_fs: &J,
-        job_id: Uuid,
+        job: &Job,
+        data_dir: &Path,
         node: &Node,
     ) -> Result<(), Error> {
-        validate_node_paths(node)?;
-        if node.outputs.is_empty() || read_marker(file_fs, job_id, "outputs-uploaded").await? {
+        let job_id = job.uuid;
+        let state_dir = state_dir(data_dir, job_id);
+        if read_marker(&state_dir, "outputs-uploaded").await? {
             return Ok(());
         }
-        let root = file_fs.output_dir();
+        validate_node_paths(node)?;
+        let root = data_dir.join("outputs");
         for output in &node.outputs {
             let path = safe_existing(&root, &output.file_name).await?;
             if output.kind == Kind::Directory || output.multiple {
@@ -226,7 +234,7 @@ impl JobTransfer {
                     if entry.kind == EntryKind::File {
                         let file_path = safe_existing(&path, &entry.path).await?;
                         self.upload_one(
-                            &file_fs.state_dir(job_id),
+                            &state_dir,
                             job_id,
                             &format!("{}/{}", output.file_name, entry.path),
                             &file_path,
@@ -239,7 +247,7 @@ impl JobTransfer {
                 // Replace a previous internal manifest atomically, never follow it.
                 write_json(&manifest_path, &manifest).await?;
                 self.upload_one(
-                    &file_fs.state_dir(job_id),
+                    &state_dir,
                     job_id,
                     &format!("{}/{}", output.file_name, DIRECTORY_MANIFEST),
                     &manifest_path,
@@ -248,7 +256,7 @@ impl JobTransfer {
                 .await?;
             } else {
                 self.upload_one(
-                    &file_fs.state_dir(job_id),
+                    &state_dir,
                     job_id,
                     &output.file_name,
                     &path,
@@ -257,7 +265,7 @@ impl JobTransfer {
                 .await?;
             }
         }
-        write_marker(file_fs, job_id, "outputs-uploaded").await
+        write_marker(&state_dir, "outputs-uploaded").await
     }
 
     async fn upload_one(
@@ -292,7 +300,7 @@ impl JobTransfer {
             .prepare_upload(job_id, self.agent_id, filename, metadata.len(), format)
             .await?;
         if transfer.presigned.operation != PresignOperation::Upload {
-            return Err(artifact("server returned the wrong upload operation"));
+            return Err(io::Error::other("server returned the wrong upload operation").into());
         }
         let file = fs::File::open(path).await?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
@@ -304,11 +312,8 @@ impl JobTransfer {
         for (name, value) in &transfer.presigned.headers {
             put = put.header(name, value);
         }
-        put.send()
-            .await
-            .map_err(reqwest::Error::without_url)?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)?;
+        let response = put.send().await.map_err(reqwest::Error::without_url)?;
+        successful_upload_response(response)?;
         self.client
             .commit_upload(job_id, self.agent_id, filename, transfer.catalog.uuid)
             .await
@@ -379,9 +384,9 @@ impl JobTransfer {
             .create_multipart_upload(job_id, self.agent_id, filename, size, format)
             .await?;
         if transfer.presigned.operation != PresignOperation::CreateMultipart {
-            return Err(artifact(
-                "server returned the wrong multipart create operation",
-            ));
+            return Err(
+                io::Error::other("server returned the wrong multipart create operation").into(),
+            );
         }
         let upload_id = self.start_multipart(&transfer).await?;
         Ok(MultipartState {
@@ -398,18 +403,14 @@ impl JobTransfer {
         for (name, value) in &transfer.presigned.headers {
             request = request.header(name, value);
         }
-        let body = request
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)?
+        let response = request.send().await.map_err(reqwest::Error::without_url)?;
+        let body = successful_upload_response(response)?
             .bytes()
             .await
             .map_err(reqwest::Error::without_url)?;
         xml_element(&body, "UploadId")
             .filter(|upload_id| !upload_id.is_empty())
-            .ok_or_else(|| artifact("multipart create response has no upload ID"))
+            .ok_or_else(|| io::Error::other("multipart create response has no upload ID").into())
     }
 
     async fn upload_multipart_parts(
@@ -465,9 +466,9 @@ impl JobTransfer {
                     part_number,
                 })
             {
-                return Err(artifact(
-                    "server returned the wrong multipart part operation",
-                ));
+                return Err(
+                    io::Error::other("server returned the wrong multipart part operation").into(),
+                );
             }
             let mut request = self
                 .objects
@@ -481,15 +482,12 @@ impl JobTransfer {
                 .send()
                 .await
                 .map_err(reqwest::Error::without_url)?;
-            let etag = response
+            let etag = successful_upload_response(response)?
                 .headers()
                 .get(reqwest::header::ETAG)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned)
-                .ok_or_else(|| artifact("multipart upload part has no ETag"))?;
-            response
-                .error_for_status()
-                .map_err(reqwest::Error::without_url)?;
+                .ok_or_else(|| io::Error::other("multipart upload part has no ETag"))?;
             state.parts.insert(part_number, etag);
             write_json(checkpoint, state).await?;
             offset += length as u64;
@@ -516,23 +514,29 @@ impl JobTransfer {
                 upload_id: state.upload_id.clone(),
             })
         {
-            return Err(artifact(
-                "server returned the wrong multipart complete operation",
-            ));
+            return Err(
+                io::Error::other("server returned the wrong multipart complete operation").into(),
+            );
         }
         let body = complete_multipart_xml(&state.parts);
         let mut request = self.objects.post(&presigned.url);
         for (name, value) in &presigned.headers {
             request = request.header(name, value);
         }
-        request
+        let response = request
             .header(reqwest::header::CONTENT_TYPE, "application/xml")
             .body(body)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?
-            .error_for_status()
             .map_err(reqwest::Error::without_url)?;
+        let body = successful_upload_response(response)?
+            .bytes()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        // S3 may return HTTP 200 and put the completion error in the XML.
+        if xml_element(&body, "Code").is_some() {
+            return Err(io::Error::other("object storage rejected multipart completion").into());
+        }
         Ok(())
     }
 
@@ -745,52 +749,15 @@ impl JobTransfer {
     }
 }
 
-impl Transfer for JobTransfer {
-    type Err = Error;
-
-    async fn prepare_upload(&self, job: &Job, filename: &str) -> Result<Uuid, Self::Err> {
-        Ok(self
-            .client
-            .prepare_upload(job.uuid, self.agent_id, filename, 0, "")
-            .await?
-            .catalog
-            .uuid)
+fn successful_upload_response(response: reqwest::Response) -> Result<reqwest::Response, Error> {
+    let response = response
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(io::Error::other(format!("output upload returned HTTP {status}")).into());
     }
-
-    async fn commit_upload(
-        &self,
-        job: &Job,
-        filename: &str,
-        catalog_id: Uuid,
-    ) -> Result<(), Self::Err> {
-        self.client
-            .commit_upload(job.uuid, self.agent_id, filename, catalog_id)
-            .await
-    }
-
-    async fn presign_download(&self, job: &Job, filename: &str) -> Result<PresignedUrl, Self::Err> {
-        self.client
-            .download_input(job.uuid, self.agent_id, filename)
-            .await?
-            .map(|transfer| transfer.presigned)
-            .ok_or_else(|| artifact("input is unavailable"))
-    }
-
-    async fn prepare_input<J: JobFsTrait, G: GraphFs + Clone>(
-        &self,
-        job_fs: &J,
-        graph: &G,
-    ) -> Result<(), Self::Err> {
-        JobTransfer::prepare_input(self, job_fs, graph).await
-    }
-
-    async fn complete_output<J: JobFsTrait, G: GraphFs + Clone>(
-        &self,
-        job_fs: &J,
-        graph: &G,
-    ) -> Result<(), Self::Err> {
-        JobTransfer::complete_output(self, job_fs, graph).await
-    }
+    Ok(response)
 }
 
 fn artifact(message: impl Into<String>) -> Error {
@@ -949,18 +916,18 @@ async fn directory_manifest(root: &Path) -> Result<DirectoryManifest, Error> {
     Ok(manifest)
 }
 
-async fn read_marker<J: JobFsTrait>(file_fs: &J, job_id: Uuid, name: &str) -> Result<bool, Error> {
-    match read_json(&file_fs.state_dir(job_id).join(format!("{name}.json"))).await {
+fn state_dir(data_dir: &Path, job_id: Uuid) -> PathBuf {
+    data_dir.join(".rayflow").join(job_id.to_string())
+}
+
+async fn read_marker(state_dir: &Path, name: &str) -> Result<bool, Error> {
+    match read_json(&state_dir.join(format!("{name}.json"))).await {
         Ok(value) => Ok(value),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
-async fn write_marker<J: JobFsTrait>(file_fs: &J, job_id: Uuid, name: &str) -> Result<(), Error> {
-    write_json(
-        &file_fs.state_dir(job_id).join(format!("{name}.json")),
-        &true,
-    )
-    .await
+async fn write_marker(state_dir: &Path, name: &str) -> Result<(), Error> {
+    write_json(&state_dir.join(format!("{name}.json")), &true).await
 }

@@ -23,6 +23,8 @@
 //! * `POST /job/succeed` — complete a job and emit `TaskEvent::Succeed`.
 //! * `POST /job/fail` — fail a job and emit `TaskEvent::Fail`.
 //! * `POST /job/terminate` — terminate a job and emit `TaskEvent::Terminate`.
+//! * `POST /job/result/{prepare,commit}` — upload and acknowledge `result.json`
+//!   or `usage.json` by filename before local cleanup.
 //! * `POST /job/output/multipart/{create,upload,complete,abort}` — sign one
 //!   claim-scoped multipart output operation; the agent transfers bytes directly
 //!   to object storage and acknowledges the catalog through `/job/output/commit`.

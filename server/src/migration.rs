@@ -108,6 +108,16 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "uuid_references",
         include_str!("../migrations/0022_uuid_references.sql"),
     ),
+    MigrationFile::new(
+        23,
+        "job_result",
+        include_str!("../migrations/0023_job_result.sql"),
+    ),
+    MigrationFile::new(
+        24,
+        "job_artifact",
+        include_str!("../migrations/0024_job_artifact.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

@@ -45,6 +45,8 @@ pub enum AppError {
     JobNotFound(Uuid),
     #[error("job claim expired, changed owner, or no longer accepts this status: {0}")]
     JobConflict(Uuid),
+    #[error("terminal job has no recorded result owner: {0}")]
+    JobResultOwnerUnknown(Uuid),
     /// The requested node is not part of the graph.
     #[error("node not found in graph: {0}")]
     NodeNotFound(Uuid),
@@ -136,6 +138,9 @@ impl AppError {
             Self::TaskNotFound(_) => (Status::NOT_FOUND, "RAYFLOW_TASK_NOT_FOUND"),
             Self::JobNotFound(_) => (Status::NOT_FOUND, "RAYFLOW_JOB_NOT_FOUND"),
             Self::JobConflict(_) => (Status::CONFLICT, "RAYFLOW_JOB_CONFLICT"),
+            Self::JobResultOwnerUnknown(_) => {
+                (Status::CONFLICT, "RAYFLOW_JOB_RESULT_OWNER_UNKNOWN")
+            }
             Self::NodeNotFound(_) => (Status::NOT_FOUND, "RAYFLOW_NODE_NOT_FOUND"),
             Self::GraphIdMismatch { .. } => (Status::BAD_REQUEST, "RAYFLOW_GRAPH_ID_MISMATCH"),
             Self::GraphDraftNotFound(_) => (Status::NOT_FOUND, "RAYFLOW_GRAPH_DRAFT_NOT_FOUND"),

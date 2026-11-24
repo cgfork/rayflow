@@ -39,6 +39,7 @@ pub fn models() -> toasty::ModelSet {
     models.add(auth::Session::schema());
     models.add(auth::LoginFlow::schema());
     models.add(auth::UserRecord::schema());
+    models.add(app::job_artifact::JobArtifact::schema());
     for model in ::graph::models() {
         models.add(model);
     }

@@ -11,7 +11,7 @@ use axum::{
 use catalog::PresignedUrl;
 use event::task_event::TaskEvent;
 use graph::{GraphStore, types::DAG};
-use scheduler::{AgentRef, ResourceCapacity};
+use scheduler::{AgentRef, JobArtifactName, ResourceCapacity};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::{Instant, sleep_until};
@@ -47,6 +47,24 @@ impl PollJobsRequest {
 pub struct JobActionRequest {
     pub job_id: Uuid,
     pub agent_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrepareJobArtifactRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    #[serde(default)]
+    pub filename: JobArtifactName,
+    pub size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitJobArtifactRequest {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    #[serde(default)]
+    pub filename: JobArtifactName,
+    pub catalog_uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +150,8 @@ where
         .route("/job/succeed", post(succeed_job::<S>))
         .route("/job/fail", post(fail_job::<S>))
         .route("/job/terminate", post(terminate_job::<S>))
+        .route("/job/result/prepare", post(prepare_job_artifact::<S>))
+        .route("/job/result/commit", post(commit_job_artifact::<S>))
         .route("/job/output/prepare", post(prepare_output::<S>))
         .route("/job/output/commit", post(commit_output::<S>))
         .route(
@@ -151,6 +171,38 @@ where
             post(abort_multipart_output::<S>),
         )
         .route("/job/input/presign", post(presign_input::<S>))
+}
+
+async fn prepare_job_artifact<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<PrepareJobArtifactRequest>,
+) -> Result<Json<PrepareOutputResponse>, AppError> {
+    let transfer = app
+        .prepare_job_artifact(
+            request.job_id,
+            request.agent_id,
+            request.filename,
+            request.size,
+        )
+        .await?;
+    Ok(Json(PrepareOutputResponse {
+        catalog_uuid: transfer.catalog.uuid,
+        transfer,
+    }))
+}
+
+async fn commit_job_artifact<S>(
+    State(app): State<App<S>>,
+    Json(request): Json<CommitJobArtifactRequest>,
+) -> Result<Json<Uuid>, AppError> {
+    app.commit_job_artifact(
+        request.job_id,
+        request.agent_id,
+        request.filename,
+        request.catalog_uuid,
+    )
+    .await
+    .map(Json)
 }
 
 async fn prepare_output<S>(

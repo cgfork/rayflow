@@ -24,8 +24,8 @@ pub enum Error {
     AlreadyRunning,
     #[error("job is still running: {0}")]
     JobRunning(uuid::Uuid),
-    #[error("agentd error: {0}")]
-    Agentd(String),
+    #[error("job manager: {0}")]
+    JobManager(String),
     #[error("job node configuration is missing")]
     MissingConfig,
     #[error("job Docker image is empty")]

@@ -135,6 +135,39 @@ async fn initialization_creates_a_fresh_database_and_skips_completed_migrations(
 }
 
 #[tokio::test]
+async fn job_artifact_migration_preserves_prepared_result_catalogs() {
+    let Some((url, mut db)) = legacy_database().await else {
+        return;
+    };
+    MigrationSet::new(&MIGRATIONS.migrations()[..23])
+        .apply(&db)
+        .await
+        .unwrap();
+    let owner = Uuid::new_v4();
+    let catalog = Uuid::new_v4();
+    sql::statement("INSERT INTO job_result (job_uuid, agent_id, catalog_uuid) VALUES (?, ?, ?)")
+        .bind(JOB_UUID)
+        .bind(owner)
+        .bind(catalog)
+        .exec(&mut db)
+        .await
+        .unwrap();
+
+    assert_eq!(initialize(&url).await.unwrap().applied(), 1);
+    // Simulate the ALTER committing before its migration ID is recorded.
+    sql::statement("DELETE FROM __toasty_migrations WHERE id = 24")
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(initialize(&url).await.unwrap().applied(), 1);
+    let preserved = sql::query("SELECT id FROM job_artifact WHERE job_uuid = ? AND filename = 'result.json' AND agent_id = ? AND catalog_uuid = ?")
+        .bind(JOB_UUID).bind(owner).bind(catalog).column_types([toasty::stmt::Type::U64])
+        .exec(&mut db).await.unwrap();
+    assert_eq!(preserved.len(), 1);
+    cleanup(&url, &mut db).await;
+}
+
+#[tokio::test]
 async fn uuid_migration_resumes_every_original_statement_boundary() {
     // Include the last ALTER committing before the migration ID was recorded.
     let statements: Vec<_> = ORIGINAL_MIGRATION
@@ -153,8 +186,8 @@ async fn uuid_migration_resumes_every_original_statement_boundary() {
         let report = initialize(&url).await.unwrap_or_else(|error| {
             panic!("failed after {completed} original statements: {error}")
         });
-        assert_eq!(report.applied(), 1);
         assert_eq!(report.skipped(), 21);
+        assert_eq!(report.applied(), MIGRATIONS.migrations().len() - 21);
         assert_migrated(&mut db).await;
         let current_uuids = config_uuids(&mut db).await;
         for uuid in existing_uuids {

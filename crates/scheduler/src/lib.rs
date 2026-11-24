@@ -16,6 +16,25 @@ pub use agent_registry::{Error as AgentRegistryError, Instance as AgentInstance}
 pub use event::task_event::{TaskEvent, TaskEventEntry};
 pub use scheduler::Scheduler;
 
+/// Agent-owned job metadata that can be archived separately from graph outputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum JobArtifactName {
+    #[default]
+    #[serde(rename = "result.json")]
+    Result,
+    #[serde(rename = "usage.json")]
+    Usage,
+}
+
+impl JobArtifactName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Result => "result.json",
+            Self::Usage => "usage.json",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("job timeout gap is outside timestamp range")]

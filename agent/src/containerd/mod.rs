@@ -1,15 +1,16 @@
 //! Container runtime access.
 //!
 //! Providers translate pinned job configurations and optional artifact mounts
-//! into container specifications. `agentd` owns lifecycle and persistence.
+//! into container specifications. `JobManager` owns lifecycle and persistence.
 
 use std::pin::Pin;
 
 use futures_util::Stream;
 use jiff::Timestamp;
 use scheduler::Job;
+use uuid::Uuid;
 
-use crate::errors::Error;
+use crate::{Usage, errors::Error};
 
 pub mod docker;
 
@@ -23,8 +24,8 @@ pub type ContainerId = String;
 /// The provider-observed lifecycle state of a container.
 ///
 /// This is intentionally smaller than any provider's native state machine.
-/// `agentd` only needs the states required to recover jobs, decide whether a
-/// container can be started, and produce a durable job result.
+/// The job manager uses these states to recover jobs, decide whether a
+/// container can be started, and persist the result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContainerState {
     /// The container exists but has not started executing.
@@ -42,6 +43,8 @@ pub enum ContainerState {
         /// The process exit code. A non-zero value represents job failure
         /// unless the agent deliberately maps the result to another outcome.
         exit_code: i32,
+        /// The provider timestamp at which execution began, when available.
+        started_at: Option<Timestamp>,
         /// The provider timestamp at which execution ended, when available.
         finished_at: Option<Timestamp>,
     },
@@ -50,6 +53,14 @@ pub enum ContainerState {
 impl ContainerState {
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
+    }
+
+    /// Returns the execution start time reported by the provider.
+    pub fn started_at(&self) -> Option<Timestamp> {
+        match self {
+            Self::Running { started_at, .. } | Self::Exited { started_at, .. } => *started_at,
+            Self::Created => None,
+        }
     }
 }
 
@@ -71,7 +82,7 @@ pub struct ExitStatus {
 ///
 /// Events are hints, not durable state. A dropped event stream, an agent crash,
 /// or a provider restart must not lose a job result. The agent therefore uses
-/// the event to trigger `inspect`/`wait` and relies on the persisted job files
+/// the event to trigger inspection and relies on the persisted job files
 /// plus provider inspection for recovery.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContainerAction {
@@ -121,6 +132,11 @@ pub trait Container: Clone + Send + Sync + 'static {
     /// Reads the current provider state for crash recovery and reconciliation.
     async fn inspect(&self) -> Result<ContainerState, Error>;
 
+    /// Opens a resource-usage stream for this container.
+    fn usage(&self) -> Pin<Box<dyn Stream<Item = Result<Usage, Error>> + Send + 'static>> {
+        Box::pin(futures_util::stream::empty())
+    }
+
     /// Requests a graceful container shutdown.
     async fn stop(&self) -> Result<(), Error>;
 
@@ -131,7 +147,7 @@ pub trait Container: Clone + Send + Sync + 'static {
     async fn remove(&self) -> Result<(), Error>;
 }
 
-/// The provider connection and container factory used by `agentd`.
+/// The provider connection and container factory used by the job manager.
 ///
 /// Implementations own all provider-specific details: image preparation,
 /// resource limits, container creation, lifecycle calls, and event decoding.
@@ -189,23 +205,28 @@ pub trait Containerd: Clone + Send + Sync + 'static {
 
     /// Creates or reconnects to the provider container described by `spec`.
     ///
-    /// The returned handle must be suitable for persisting in `fs::job::JobFs` before
-    /// the caller starts the container. If creation races with recovery, an
-    /// implementation may return a handle to an already-existing container
-    /// with the same deterministic identity.
+    /// The caller persists the returned container identity before starting it.
+    /// A repeated create may return an existing container with the same job identity.
     async fn create(&self, spec: Self::Spec<'_>) -> Result<Self::Container, Error>;
+
+    /// Finds a job's container when its create reply or local metadata was lost.
+    /// Providers with a deterministic job identity can recover without creating
+    /// a container, including after the job lease expires.
+    async fn find_container(&self, _job_id: Uuid) -> Result<Option<Self::Container>, Error> {
+        Ok(None)
+    }
 
     /// Reconstructs a handle for a persisted provider container identifier.
     ///
     /// This must not contact the provider or create a new container. It is
-    /// used during startup recovery before `agentd` inspects the container.
+    /// used during startup recovery before the job manager inspects the container.
     fn container(&self, id: &str) -> Self::Container;
 
     /// Opens the provider's global event stream.
     ///
     /// The stream may end or yield an error and must be reconnectable. Events
     /// wake reconciliation; they do not replace the periodic recovery scan or
-    /// the durable result written by `agentd`.
+    /// the durable result written by the job manager.
     fn events(&self)
     -> Pin<Box<dyn Stream<Item = Result<ContainerEvent, Error>> + Send + 'static>>;
 }

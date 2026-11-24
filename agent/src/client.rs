@@ -1,6 +1,6 @@
 use graph::GraphStore;
 use graph::types::DAG;
-use scheduler::{Job, ResourceCapacity};
+use scheduler::{Job, JobArtifactName, ResourceCapacity};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,6 +46,68 @@ pub struct PollResponse {
 }
 
 impl Client {
+    /// Prepares the catalog for durable job metadata, including expired jobs.
+    /// Returns `None` when the server has no object storage configured.
+    /// Returns `ClaimLost` for terminal jobs with no recorded result owner.
+    pub async fn prepare_job_artifact(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: JobArtifactName,
+        size: u64,
+    ) -> Result<Option<Transfer>, Error> {
+        let response = self
+            .http
+            .post(format!("{}/job/result/prepare", self.base_url()))
+            .json(&serde_json::json!({
+                "job_id": job_id, "agent_id": agent_id, "filename": filename, "size": size,
+            }))
+            .send()
+            .await?;
+        if let Err(error) = response.error_for_status_ref() {
+            use reqwest::StatusCode;
+
+            let status = response.status();
+            if matches!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE | StatusCode::CONFLICT
+            ) && let Ok(body) = response.json::<serde_json::Value>().await
+            {
+                match (status, body["error_code"].as_str()) {
+                    (StatusCode::SERVICE_UNAVAILABLE, Some("RAYFLOW_STORAGE_UNAVAILABLE")) => {
+                        return Ok(None);
+                    }
+                    (StatusCode::CONFLICT, Some("RAYFLOW_JOB_RESULT_OWNER_UNKNOWN")) => {
+                        return Err(Error::ClaimLost(job_id));
+                    }
+                    _ => {}
+                }
+            }
+            return Err(error.into());
+        }
+        Ok(Some(response.json::<Transfer>().await?))
+    }
+
+    /// Publishes uploaded job metadata.
+    pub async fn commit_job_artifact(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: JobArtifactName,
+        catalog_uuid: Uuid,
+    ) -> Result<(), Error> {
+        self.http
+            .post(format!("{}/job/result/commit", self.base_url()))
+            .json(&serde_json::json!({
+                "job_id": job_id, "agent_id": agent_id, "filename": filename,
+                "catalog_uuid": catalog_uuid,
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Prepares an output catalog and returns its ordinary upload signature.
     pub async fn prepare_upload(
         &self,
@@ -61,8 +123,8 @@ impl Client {
             .post(format!("{}/job/output/prepare", self.base_url()))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = claimed_response(response, job_id)?;
         let value: serde_json::Value = response.json().await?;
         serde_json::from_value(value.get("transfer").cloned().unwrap_or(value)).map_err(Into::into)
     }
@@ -75,12 +137,13 @@ impl Client {
         catalog_uuid: Uuid,
     ) -> Result<(), Error> {
         let body = serde_json::json!({"job_id": job_id, "agent_id": agent_id, "filename": filename, "catalog_uuid": catalog_uuid});
-        self.http
+        let response = self
+            .http
             .post(format!("{}/job/output/commit", self.base_url()))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        claimed_response(response, job_id)?;
         Ok(())
     }
 
@@ -104,8 +167,8 @@ impl Client {
             .post(format!("{}/job/output/multipart/create", self.base_url()))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = claimed_response(response, job_id)?;
         let value: serde_json::Value = response.json().await?;
         serde_json::from_value(value.get("transfer").cloned().unwrap_or(value)).map_err(Into::into)
     }
@@ -115,15 +178,13 @@ impl Client {
         path: &str,
         request: MultipartPresignRequest<'_>,
     ) -> Result<catalog::PresignedUrl, Error> {
-        Ok(self
+        let response = self
             .http
             .post(format!("{}{path}", self.base_url()))
             .json(&request)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        Ok(claimed_response(response, request.job_id)?.json().await?)
     }
 
     pub async fn upload_multipart_part(
@@ -298,6 +359,15 @@ impl Client {
         response.error_for_status()?;
         Ok(())
     }
+}
+
+/// Only claim-scoped Rayflow API conflicts mean ownership was lost. Object
+/// storage conflicts remain transfer errors so callers can retry them.
+fn claimed_response(response: reqwest::Response, job_id: Uuid) -> Result<reqwest::Response, Error> {
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Err(Error::ClaimLost(job_id));
+    }
+    Ok(response.error_for_status()?)
 }
 
 impl GraphStore<Uuid> for Client {
