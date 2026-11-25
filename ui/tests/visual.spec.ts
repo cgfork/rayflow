@@ -88,6 +88,47 @@ async function mockSignIn(page: Page) {
   await page.route(`**${api}/auth/me`, (route) => route.fulfill({ status: 401, json: { error: 'Sign in required' } }));
 }
 
+test('Schedule and Agents update on manual refresh and health is checked once', async ({ page }) => {
+  await mockWorkspace(page);
+  let jobStatus: Job['status'] = 'Polled';
+  let agentOnline = true;
+  const requests = { health: 0, jobs: 0, agents: 0 };
+  await page.route(`**${api}/health`, (route) => {
+    requests.health += 1;
+    return route.fulfill({ body: 'ok' });
+  });
+  await page.route((url) => url.pathname === `${api}/jobs` && url.searchParams.get('limit') === '50', (route) => {
+    requests.jobs += 1;
+    return route.fulfill({ json: { items: [{ ...job, status: jobStatus }], next_cursor: null } });
+  });
+  await page.route(`**${api}/agents?limit=50`, (route) => {
+    requests.agents += 1;
+    return route.fulfill({ json: { items: [{ ...agent, online: agentOnline }], next_cursor: null } });
+  });
+  await page.clock.install();
+  await page.goto('/#/schedule');
+  const table = page.getByRole('table');
+  const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+  await expect(page.getByTitle('API connected', { exact: true })).toBeVisible();
+  await expect(table.getByText('Polled', { exact: true })).toBeVisible();
+  jobStatus = 'Succeeded';
+  await page.clock.fastForward(20_000);
+  await expect(table.getByText('Polled', { exact: true })).toBeVisible();
+  expect(requests).toEqual({ health: 1, jobs: 1, agents: 0 });
+  await refresh.click();
+  await expect(table.getByText('Succeeded', { exact: true })).toBeVisible();
+
+  await page.getByRole('navigation').getByRole('link', { name: /^Agents/ }).click();
+  await expect(table.getByText('Online', { exact: true })).toBeVisible();
+  agentOnline = false;
+  await page.clock.fastForward(20_000);
+  await expect(table.getByText('Online', { exact: true })).toBeVisible();
+  expect(requests).toEqual({ health: 1, jobs: 2, agents: 1 });
+  await refresh.click();
+  await expect(table.getByText('Offline', { exact: true })).toBeVisible();
+  expect(requests).toEqual({ health: 1, jobs: 2, agents: 2 });
+});
+
 async function checkLayout(page: Page, width: number, view: string, theme: ColorScheme) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth), `${view} at ${width}px`).toBeLessThanOrEqual(width);
   if (view === 'drafts' || view === 'published') {

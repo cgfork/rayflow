@@ -60,8 +60,13 @@ test('Runtime requires a workflow and scopes every refresh and page to the selec
   await choose(page, first);
   await expect(inspect(page, firstRun)).toBeVisible();
   await expect(inspect(page, secondRun)).toHaveCount(0);
-  await page.clock.fastForward(5000);
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.clock.fastForward(20_000);
+  expect(requests).toHaveLength(1);
+  await Promise.all([
+    page.waitForResponse(`**/api/v1/runs?graph_id=${first.id}&limit=50`),
+    page.getByRole('button', { name: 'Refresh', exact: true }).click(),
+  ]);
+  expect(requests).toHaveLength(2);
   await page.getByRole('button', { name: 'Next page' }).click();
   await expect(inspect(page, olderRun)).toBeVisible();
   await expect(page.getByText('Page 2', { exact: true })).toBeVisible();

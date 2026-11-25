@@ -15,7 +15,7 @@ export default function Schedule({ notify, filter, clearFilter }: { notify: (mes
   const [error, setError] = useState<string>();
   const params = new URLSearchParams(filter);
   if (status) params.set('status', status);
-  const result = usePaged<Job>(`/jobs?${params}`, 5000);
+  const result = usePaged<Job>(`/jobs?${params}`);
   const rows = result.data?.items.filter((job) => `${job.uuid} ${job.run_id} ${job.agent_id ?? ''}`.includes(search.toLowerCase())) ?? [];
   const job = selected && (result.data?.items.find((item) => item.uuid === selected.uuid) ?? selected);
   async function perform() {

@@ -8,7 +8,10 @@ use std::{
 use bollard::{
     Docker,
     errors::Error as DockerError,
-    models::{ContainerCreateBody, ContainerStateStatusEnum, HostConfig, Mount, MountType},
+    models::{
+        ContainerCreateBody, ContainerStateStatusEnum, ContainerStatsResponse, HostConfig, Mount,
+        MountType,
+    },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
     },
@@ -16,8 +19,9 @@ use bollard::{
 use futures_util::{Stream, StreamExt};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::errors::Error;
+use crate::{Usage, errors::Error};
 
 use super::{Container, ContainerAction, ContainerEvent, ContainerState, Containerd, ExitStatus};
 
@@ -67,7 +71,7 @@ impl TryFrom<&scheduler::Job> for DockerSpec {
             .ok_or(Error::MissingImage)?;
         Ok(Self {
             files: None,
-            name: format!("rayflow-{}", job.uuid),
+            name: container_name(job.uuid),
             image: image.to_owned(),
             command: config
                 .config
@@ -91,6 +95,10 @@ impl TryFrom<&scheduler::Job> for DockerSpec {
             memory_bytes: job.required_memory_bytes,
         })
     }
+}
+
+fn container_name(job_id: Uuid) -> String {
+    format!("rayflow-{job_id}")
 }
 
 /// A Docker-backed implementation of the provider boundary.
@@ -174,6 +182,10 @@ impl Container for DockerContainer {
         let state = response
             .state
             .ok_or_else(|| Error::Io(std::io::Error::other("container state is missing")))?;
+        let started_at = state
+            .started_at
+            .and_then(|value| value.parse::<Timestamp>().ok())
+            .filter(|started_at| *started_at >= Timestamp::UNIX_EPOCH);
         if state.running == Some(true)
             || matches!(
                 state.status,
@@ -186,7 +198,7 @@ impl Container for DockerContainer {
         {
             return Ok(ContainerState::Running {
                 pid: state.pid,
-                started_at: state.started_at.and_then(|value| value.parse().ok()),
+                started_at,
             });
         }
         match state.status {
@@ -197,6 +209,7 @@ impl Container for DockerContainer {
                         .exit_code
                         .and_then(|value| value.try_into().ok())
                         .unwrap_or(1),
+                    started_at,
                     finished_at: state.finished_at.and_then(|value| value.parse().ok()),
                 })
             }
@@ -204,6 +217,19 @@ impl Container for DockerContainer {
                 "container is changing state",
             ))),
         }
+    }
+
+    fn usage(&self) -> Pin<Box<dyn Stream<Item = Result<Usage, Error>> + Send + 'static>> {
+        let stats = self.docker.stats(&self.id, Some(Default::default()));
+        Box::pin(stats.filter_map(|result| async move {
+            match result {
+                Ok(stats) => container_usage(stats).map(Ok),
+                Err(DockerError::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => None,
+                Err(error) => Some(Err(error.into())),
+            }
+        }))
     }
 
     async fn stop(&self) -> Result<(), Error> {
@@ -238,6 +264,50 @@ impl Container for DockerContainer {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn container_usage(stats: ContainerStatsResponse) -> Option<Usage> {
+    // This adapter uses Linux cgroup accounting and nanosecond CPU counters.
+    // Older Windows daemons omit os_type but report num_procs.
+    if stats
+        .os_type
+        .as_deref()
+        .is_some_and(|os| !os.is_empty() && os != "linux")
+        || stats.num_procs.is_some_and(|count| count > 0)
+    {
+        return None;
+    }
+    let sampled_at = stats.read?.parse::<Timestamp>().ok()?;
+    // Stopped and restarting containers can return an empty frame with a
+    // zero-valued timestamp (year 1).
+    if sampled_at < Timestamp::UNIX_EPOCH {
+        return None;
+    }
+    let cpu_usage_ns = stats
+        .cpu_stats
+        .and_then(|stats| stats.cpu_usage)
+        .and_then(|usage| usage.total_usage);
+    let memory = stats.memory_stats.as_ref();
+    let memory_usage_bytes = memory.and_then(|memory| memory.usage);
+    if cpu_usage_ns.is_none() && memory_usage_bytes.is_none() {
+        return None;
+    }
+    let memory_working_set_bytes = memory_usage_bytes.and_then(|usage| {
+        let counters = memory?.stats.as_ref()?;
+        let inactive_file = counters
+            .get("total_inactive_file")
+            .or_else(|| counters.get("inactive_file"))?;
+        usage.checked_sub(*inactive_file)
+    });
+    Some(Usage {
+        sampled_at,
+        cpu_usage_ns,
+        memory_usage_bytes,
+        memory_working_set_bytes,
+        memory_limit_bytes: memory
+            .and_then(|memory| memory.limit)
+            .filter(|limit| *limit > 0),
+    })
 }
 
 impl Containerd for DockerContainerd {
@@ -354,6 +424,19 @@ impl Containerd for DockerContainerd {
         DockerContainer::new(self.docker.clone(), id)
     }
 
+    async fn find_container(&self, job_id: Uuid) -> Result<Option<Self::Container>, Error> {
+        let name = container_name(job_id);
+        match self.docker.inspect_container(&name, None).await {
+            Ok(response) => Ok(Some(
+                self.container(response.id.as_deref().unwrap_or(&name)),
+            )),
+            Err(DockerError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn events(
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<ContainerEvent, Error>> + Send + 'static>> {
@@ -376,5 +459,78 @@ impl Containerd for DockerContainerd {
                 .map_err(Into::into)
         });
         Box::pin(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalizes_cpu_time_and_memory_for_both_linux_cgroup_versions() {
+        let sampled_at = "2026-01-01T00:00:00.123456789Z";
+        for cache_key in ["total_inactive_file", "inactive_file"] {
+            let stats = serde_json::from_value(json!({
+                "os_type": "linux",
+                "read": sampled_at,
+                "cpu_stats": { "cpu_usage": { "total_usage": 1_500_000_000u64 } },
+                "memory_stats": {
+                    "usage": 1024,
+                    "limit": 4096,
+                    "stats": { (cache_key): 256 }
+                }
+            }))
+            .unwrap();
+            let usage = container_usage(stats).unwrap();
+            assert_eq!(usage.sampled_at, sampled_at.parse().unwrap());
+            assert_eq!(usage.cpu_usage_ns, Some(1_500_000_000));
+            assert_eq!(usage.memory_usage_bytes, Some(1024));
+            assert_eq!(usage.memory_working_set_bytes, Some(768));
+            assert_eq!(usage.memory_limit_bytes, Some(4096));
+        }
+    }
+
+    #[test]
+    fn keeps_valid_partial_samples_and_zero_cpu_time() {
+        let stats = serde_json::from_value(json!({
+            "read": "2026-01-01T00:00:00Z",
+            "cpu_stats": { "cpu_usage": { "total_usage": 0 } },
+        }))
+        .unwrap();
+        let usage = container_usage(stats).unwrap();
+        assert_eq!(usage.cpu_usage_ns, Some(0));
+        assert_eq!(usage.memory_usage_bytes, None);
+        assert_eq!(usage.memory_working_set_bytes, None);
+        assert_eq!(usage.memory_limit_bytes, None);
+
+        let stats = serde_json::from_value(json!({
+            "read": "2026-01-01T00:00:00Z",
+            "memory_stats": { "usage": 10, "stats": { "inactive_file": 20 } },
+        }))
+        .unwrap();
+        let usage = container_usage(stats).unwrap();
+        assert_eq!(usage.cpu_usage_ns, None);
+        assert_eq!(usage.memory_usage_bytes, Some(10));
+        assert_eq!(usage.memory_working_set_bytes, None);
+    }
+
+    #[test]
+    fn skips_empty_stopped_frames_and_windows_cpu_units() {
+        assert!(container_usage(ContainerStatsResponse::default()).is_none());
+        for (os_type, read, num_procs) in [
+            ("linux", "0001-01-01T00:00:00Z", 0),
+            ("windows", "2026-01-01T00:00:00Z", 0),
+            ("", "2026-01-01T00:00:00Z", 8),
+        ] {
+            let stats = serde_json::from_value(json!({
+                "os_type": os_type,
+                "read": read,
+                "num_procs": num_procs,
+                "cpu_stats": { "cpu_usage": { "total_usage": 0 } },
+            }))
+            .unwrap();
+            assert!(container_usage(stats).is_none());
+        }
     }
 }

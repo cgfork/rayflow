@@ -32,7 +32,8 @@ export interface NodeRun {
   updated_at: string;
 }
 export interface RunView { run: Run; graph: Graph; node_runs: [NodeRun, GraphNode][] }
-export interface RunFileTransfer { presigned: { url: string; operation: 'download'; headers: Record<string, string>; expires_at: string } }
+export interface PresignedDownload { url: string; operation: 'download'; headers: Record<string, string>; expires_at: string }
+export interface RunFileTransfer { presigned: PresignedDownload }
 export type JobStatus = 'Scheduled' | 'Polled' | 'Yielded' | 'Succeeded' | 'Failed' | 'Terminated';
 export interface Job { id: number; uuid: string; task_id: string; run_id: string; node_run_id: number; status: JobStatus; required_cpu_cores: number; required_memory_bytes: number; agent_id: string | null; polled_at: string | null; expired_at: string | null; created_at: string; updated_at: string }
 export interface Agent { id: number; uuid: string; cpu_cores: number; memory_bytes: number; active_jobs: number; first_seen_at: string; last_seen_at: string; online_until: string; online: boolean }

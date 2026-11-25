@@ -9,8 +9,8 @@ use std::{
 
 use agent::{
     client::{Client, Transfer},
-    fs::{GraphCache, JobFs, JobStore, JobTransfer},
     settings::Settings,
+    transfer::JobTransfer,
 };
 use axum::{
     Json, Router,
@@ -277,7 +277,7 @@ async fn upload_object(
 async fn commit_output(
     State(fixture): State<Arc<Fixture>>,
     Json(request): Json<Commit>,
-) -> StatusCode {
+) -> Json<Uuid> {
     fixture.verify_claim(&request.claim);
     let mut traffic = fixture.traffic.lock().unwrap();
     let upload = traffic.uploads.get(&request.catalog_uuid).unwrap();
@@ -286,7 +286,7 @@ async fn commit_output(
     traffic
         .calls
         .push(format!("commit {}", request.claim.filename));
-    StatusCode::NO_CONTENT
+    Json(Uuid::new_v4())
 }
 
 #[tokio::test]
@@ -315,16 +315,23 @@ async fn transfers_renamed_input_and_commits_file_and_directory_outputs_once() {
         .with_state(fixture.clone());
     let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
 
-    let cache = GraphCache::new(settings.clone());
-    cache.write_graph(fixture.graph.clone()).await.unwrap();
-    let files = JobStore::new(fixture.job.clone(), settings.clone());
+    let data = settings.data_dir.join(fixture.job.uuid.to_string());
+    let node = fixture
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.id == fixture.job.node_run.get().node_id)
+        .unwrap();
     let transfer = JobTransfer::new(Client::new(settings.clone()).unwrap()).unwrap();
-    let staged_input = files.input_dir().join("staged/renamed.bin");
-    files.prepare_input(&cache, &transfer).await.unwrap();
+    let staged_input = data.join("inputs/staged/renamed.bin");
+    transfer
+        .prepare_input(&fixture.job, &data, node)
+        .await
+        .unwrap();
     assert_eq!(fs::read(&staged_input).await.unwrap(), SOURCE);
-    assert!(!files.input_dir().join("original.bin").exists());
+    assert!(!data.join("inputs/original.bin").exists());
 
-    let output = files.output_dir();
+    let output = data.join("outputs");
     fs::create_dir_all(output.join("bundle/empty"))
         .await
         .unwrap();
@@ -335,22 +342,29 @@ async fn transfers_renamed_input_and_commits_file_and_directory_outputs_once() {
     fs::write(output.join("bundle/nested/member.txt"), MEMBER)
         .await
         .unwrap();
-    files.complete_output(&cache, &transfer).await.unwrap();
+    transfer
+        .complete_output(&fixture.job, &data, node)
+        .await
+        .unwrap();
     let manifest_filename = format!("bundle/{DIRECTORY_MANIFEST}");
     let manifest_on_disk = fs::read(output.join(&manifest_filename)).await.unwrap();
 
-    drop((files, cache, transfer));
+    drop(transfer);
     // Reopen the same workdir with fresh handles and no HTTP service. Only
     // the durable completion markers can make these retries succeed.
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
     let restored_job: Job =
         serde_json::from_slice(&serde_json::to_vec(&fixture.job).unwrap()).unwrap();
-    let files = JobStore::new(restored_job, settings.clone());
-    let cache = GraphCache::new(settings.clone());
     let transfer = JobTransfer::new(Client::new(settings).unwrap()).unwrap();
-    files.prepare_input(&cache, &transfer).await.unwrap();
-    files.complete_output(&cache, &transfer).await.unwrap();
+    transfer
+        .prepare_input(&restored_job, &data, node)
+        .await
+        .unwrap();
+    transfer
+        .complete_output(&restored_job, &data, node)
+        .await
+        .unwrap();
     assert_eq!(fs::read(staged_input).await.unwrap(), SOURCE);
 
     let traffic = fixture.traffic.lock().unwrap();

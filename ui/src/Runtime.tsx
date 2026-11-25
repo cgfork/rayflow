@@ -1,9 +1,10 @@
 import { randomUUID } from './uuid';
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { Activity, ArrowRight, ArrowUpCircle, ArrowUpRight, Box, CircleCheck, Clock3, Download, GitBranch, Play, RotateCcw, Workflow } from 'lucide-react';
-import { api, dateTime, relativeTime, send, shortId, usePaged, useRemote } from './api';
+import { api, dateTime, isHttpDownloadUrl, relativeTime, send, shortId, usePaged, useRemote } from './api';
 import { Back, Badge, Details, Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination, Refresh, SearchBox, UuidCopy, UuidText } from './components';
 import FlowCanvas from './FlowCanvas';
+import RuntimeNodeArtifacts, { useNodeArchives } from './RuntimeNodeArtifacts';
 import WorkflowPicker from './WorkflowPicker';
 import type { Graph, GraphNode, NodeRun, Run, RunFileTransfer, RunView } from './types';
 
@@ -35,7 +36,7 @@ export default function Runtime({ notify, openJobs, graphId, onGraphChange }: {
   const workflow = graphId ? { id: graphId, name: graph.data?.name ?? `Workflow ${graphId}` } : null;
   const workflowName = graph.data?.name ?? (graphId ? `Workflow ${shortId(graphId)}` : '');
   const path = graphId ? `/runs?graph_id=${encodeURIComponent(graphId)}` : null;
-  const result = usePaged<Run>(path, 5000);
+  const result = usePaged<Run>(path);
   const rows = result.data?.items.filter((run) => `${run.uuid} ${run.data_id}`.toLowerCase().includes(search.toLowerCase().trim())) ?? [];
   useEffect(() => {
     setSelected(null); setSearch(''); setStarting(false); setRerunning(null); setUpgrading(null);
@@ -44,7 +45,7 @@ export default function Runtime({ notify, openJobs, graphId, onGraphChange }: {
   return <>
     <div className="runtime-heading"><PageHeader eyebrow="OBSERVE & OPERATE" title="Runtime" description="Follow a workflow, from its first node to its final result."><WorkflowPicker value={workflow && { ...workflow, name: workflowName }} onChange={(choice) => onGraphChange(choice?.id)} /><button className="button primary" disabled={!workflow || !!graph.error} onClick={() => setStarting(true)}><Play size={16} />Start a run</button></PageHeader></div>
     {!workflow ? <section className="panel"><Empty title="Choose a workflow">Search for a published workflow in the header to view its runs.</Empty></section> : <>
-    <div className="section-callout runtime-workflow-callout"><Activity size={19} /><span title={workflow.id}>{workflowName}</span><p>Inspect node states and resume or rerun work as it progresses.</p><span className="live-label"><i />Refreshes every 5s</span></div>
+    <div className="section-callout runtime-workflow-callout"><Activity size={19} /><span title={workflow.id}>{workflowName}</span><p>Inspect node states and resume or rerun work as it progresses.</p></div>
     <ErrorBanner error={graph.error} retry={graph.refresh} />
     <ErrorBanner error={result.error} retry={result.refresh} />
     <section className="panel runtime-runs"><div className="panel-toolbar"><h2>Workflow runs <span className="count">{result.data?.items.length ?? '—'}</span></h2><div className="actions"><SearchBox value={search} onChange={setSearch} placeholder="Find a run or data ID…" /><Refresh loading={result.loading} onClick={result.refresh} /></div></div>
@@ -100,7 +101,7 @@ function StartRun({ close, completed, workflow }: { close: () => void; completed
 }
 
 function RunDetail({ id, close, notify, openJobs }: { id: string; close: () => void; notify: (message: string) => void; openJobs: (runId: string) => void }) {
-  const result = useRemote<RunView>(`/runs/${id}`, 5000);
+  const result = useRemote<RunView>(`/runs/${id}`);
   const inspector = useRef<HTMLElement>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [upgrading, setUpgrading] = useState(false);
@@ -111,17 +112,26 @@ function RunDetail({ id, close, notify, openJobs }: { id: string; close: () => v
     return Object.fromEntries(view?.graph.nodes.map((node) => [node.id, byNodeId.get(node.id) ?? 'Waiting']) ?? []);
   }, [view]);
   const [nodeRun, nodeInfo] = findNodeRun(view, selected) ?? [];
+  const archives = useNodeArchives(id, nodeRun?.uuid);
   const node = nodeInfo ?? view?.graph.nodes.find((item) => item.id === selected);
   const canRerun = view?.node_runs.some(([entry]) => canRunCommand(view.run, entry, 'rerun'));
+  function refresh() {
+    result.refresh();
+    if (nodeRun) {
+      archives.result.refresh();
+      archives.usage.refresh();
+    }
+  }
   return <>
     <Back onClick={close}>All runs</Back>
-    <div className="runtime-run-heading"><PageHeader eyebrow={<UuidCopy id={id} label="Run" notify={notify}><span title={id}>RUN {shortId(id)}</span></UuidCopy>} title={view?.graph.name ?? 'Workflow execution'} description="Live node state for this run’s pinned graph version."><button className="button primary" disabled={!canRerun || !!result.error} onClick={() => setAction({ type: 'rerun' })}><RotateCcw size={15} />Rerun</button><button className="button" disabled={!view || !!result.error} onClick={() => setUpgrading(true)}><ArrowUpCircle size={15} />Upgrade</button><button className="button" onClick={() => openJobs(id)}><Box size={15} />View jobs</button><Refresh loading={result.loading} onClick={result.refresh} /></PageHeader></div>
+    <div className="runtime-run-heading"><PageHeader eyebrow={<UuidCopy id={id} label="Run" notify={notify}><span title={id}>RUN {shortId(id)}</span></UuidCopy>} title={view?.graph.name ?? 'Workflow execution'} description="Node state for this run’s pinned graph version."><button className="button primary" disabled={!canRerun || !!result.error} onClick={() => setAction({ type: 'rerun' })}><RotateCcw size={15} />Rerun</button><button className="button" disabled={!view || !!result.error} onClick={() => setUpgrading(true)}><ArrowUpCircle size={15} />Upgrade</button><button className="button" onClick={() => openJobs(id)}><Box size={15} />View jobs</button><Refresh loading={result.loading} onClick={refresh} /></PageHeader></div>
     <ErrorBanner error={result.error} retry={result.refresh} />
     {!view ? result.loading ? <Loading /> : null : <>
       <div className="metric-grid"><div className="metric"><span><Workflow size={17} />Graph version</span><strong>v{view.run.version}</strong><small>Revision {view.run.revision}</small></div><div className="metric"><span><Activity size={17} />In progress</span><strong>{Object.values(statuses).filter((status) => status === 'Running' || status === 'Ready').length}</strong><small>Running or ready</small></div><div className="metric"><span><CircleCheck size={17} />Succeeded</span><strong>{Object.values(statuses).filter((status) => status === 'Succeeded').length}<em> / {view.graph.nodes.length}</em></strong><small>Completed nodes</small></div><div className="metric"><span><Clock3 size={17} />Needs attention</span><strong>{Object.values(statuses).filter((status) => ['Pending', 'Failed', 'Terminated'].includes(status)).length}</strong><small>Pending, failed, or terminated</small></div></div>
-      <div className="studio-body runtime-canvas"><div className="canvas-panel"><div className="canvas-toolbar"><span><GitBranch size={15} />Execution graph</span><span className="live-label"><i />Refreshes every 5s</span></div><FlowCanvas graph={view.graph} statuses={statuses} selected={selected} select={setSelected} /><div className="canvas-caption"><span>Data <UuidCopy id={view.run.data_id} label="Data" notify={notify}><UuidText id={view.run.data_id} /></UuidCopy></span><span>Select a node to inspect its state</span></div></div><aside className="inspector" ref={inspector}><div className="inspector-heading">NODE STATE<Activity size={16} /></div>{node ? <div className="inspector-fields"><h3>{node.name}</h3><Badge status={nodeRun?.status ?? 'waiting'}>{nodeRun?.status ?? 'Waiting'}</Badge>
+      <div className="studio-body runtime-canvas"><div className="canvas-panel"><div className="canvas-toolbar"><span><GitBranch size={15} />Execution graph</span></div><FlowCanvas graph={view.graph} statuses={statuses} selected={selected} select={setSelected} /><div className="canvas-caption"><span>Data <UuidCopy id={view.run.data_id} label="Data" notify={notify}><UuidText id={view.run.data_id} /></UuidCopy></span><span>Select a node to inspect its state</span></div></div><aside className="inspector" ref={inspector}><div className="inspector-heading">NODE STATE<Activity size={16} /></div>{node ? <div className="inspector-fields"><h3>{node.name}</h3><Badge status={nodeRun?.status ?? 'waiting'}>{nodeRun?.status ?? 'Waiting'}</Badge>
+      <div className="vertical-actions"><button className="button primary" disabled={!canRunCommand(view.run, nodeRun, 'resume') || !!result.error} onClick={() => setAction({ type: 'resume', nodeId: node.id })}><Play size={15} />Resume node</button><button className="button" disabled={!canRunCommand(view.run, nodeRun, 'rerun') || !!result.error} onClick={() => setAction({ type: 'rerun', nodeId: node.id })}><RotateCcw size={15} />Rerun node</button></div><p className="field-hint">Resume continues a pending node. Rerun creates a new revision.</p>
       <RuntimeNodeDetails key={`${id}-${node.id}-${view.run.revision}`} runId={id} node={node} nodeRun={nodeRun} revision={view.run.revision} inspector={inspector} />
-      <div className="vertical-actions"><button className="button primary" disabled={!canRunCommand(view.run, nodeRun, 'resume') || !!result.error} onClick={() => setAction({ type: 'resume', nodeId: node.id })}><Play size={15} />Resume node</button><button className="button" disabled={!canRunCommand(view.run, nodeRun, 'rerun') || !!result.error} onClick={() => setAction({ type: 'rerun', nodeId: node.id })}><RotateCcw size={15} />Rerun node</button></div><p className="field-hint">Resume continues a pending node. Rerun creates a new revision.</p></div> : <div className="inspector-empty"><Activity size={28} /><h3>Every node tells a story</h3><p>Select one to see its current state and available actions.</p></div>}</aside></div>
+      {nodeRun && <RuntimeNodeArtifacts {...archives} />}</div> : <div className="inspector-empty"><Activity size={28} /><h3>Every node tells a story</h3><p>Select one to see its current state and available actions.</p></div>}</aside></div>
     </>}
     {action && <RunCommand id={id} action={action.type} initialNode={action.nodeId} close={() => setAction(null)} completed={(message) => { setAction(null); result.refresh(); notify(message); }} />}
     {upgrading && <UpgradeRun id={id} close={() => setUpgrading(false)} completed={(message) => { setUpgrading(false); result.refresh(); notify(message); }} />}
@@ -129,12 +139,6 @@ function RunDetail({ id, close, notify, openJobs }: { id: string; close: () => v
 }
 
 type FileDirection = 'input' | 'output';
-
-function isHttpDownloadUrl(url: unknown): url is string {
-  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false;
-  try { return Boolean(new URL(url).hostname); }
-  catch { return false; }
-}
 
 function RuntimeNodeDetails({ runId, node, nodeRun, revision, inspector }: {
   runId: string; node: GraphNode; nodeRun?: NodeRun; revision: number; inspector: RefObject<HTMLElement | null>;
@@ -190,7 +194,7 @@ function RuntimeNodeDetails({ runId, node, nodeRun, revision, inspector }: {
 }
 
 function UpgradeRun({ id, close, completed }: { id: string; close: () => void; completed: (message: string) => void }) {
-  const result = useRemote<RunView>(`/runs/${id}`, 5000);
+  const result = useRemote<RunView>(`/runs/${id}`);
   const [busy, setBusy] = useState(false);
   return <Modal title="Upgrade workflow" close={() => { if (!busy) close(); }}>
     <ErrorBanner error={result.error} retry={result.refresh} />
@@ -246,7 +250,7 @@ function UpgradeForm({ view, stale, busy, setBusy, close, completed }: { view: R
 }
 
 function RunCommand({ id, action, initialNode, close, completed }: { id: string; action: RunAction; initialNode?: string; close: () => void; completed: (message: string) => void }) {
-  const result = useRemote<RunView>(`/runs/${id}`, 5000);
+  const result = useRemote<RunView>(`/runs/${id}`);
   const [nodeId, setNodeId] = useState(initialNode ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();

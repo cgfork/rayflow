@@ -7,7 +7,10 @@ use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode},
 };
-use catalog::directory::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST};
+use catalog::{
+    CatalogOptionalData, CatalogSystem, FileInput, FileSystem, PresignOperation, PresignedUrl,
+    directory::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST},
+};
 use graph::store::{GraphDraftRecord, GraphRecord};
 use graph::types::{DAG, Input, Kind, Node, NodeSettings, Output, Resource};
 use runtime::{backend::Backend, command::NodeRun};
@@ -187,26 +190,26 @@ async fn commit_artifact(
     catalog_uuid
 }
 
+fn storage_config() -> Config {
+    Config {
+        storage: Some(StorageConfig {
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "workflow-test".into(),
+            prefix: "artifacts".into(),
+            region: "us-east-1".into(),
+            access_key: "test-key".into(),
+            secret_key: "test-secret".into(),
+            multipart_enabled: false,
+            session_token: None,
+            credential_expiry: None,
+            presign_ttl: Duration::from_secs(900),
+        }),
+        ..Config::default()
+    }
+}
+
 async fn run_workflow(db: toasty::Db) {
-    let app = router(App::new(
-        db.clone(),
-        Config {
-            storage: Some(StorageConfig {
-                endpoint: "http://127.0.0.1:9000".into(),
-                bucket: "workflow-test".into(),
-                prefix: "artifacts".into(),
-                region: "us-east-1".into(),
-                access_key: "test-key".into(),
-                secret_key: "test-secret".into(),
-                multipart_enabled: false,
-                session_token: None,
-                credential_expiry: None,
-                presign_ttl: Duration::from_secs(900),
-            }),
-            ..Config::default()
-        },
-        db.clone(),
-    ));
+    let app = router(App::new(db.clone(), storage_config(), db.clone()));
     let mut actuator = Actuator::new(Backend::new(db.clone(), db), 64);
     let graph = workflow();
     let graph_id = graph.id;
@@ -269,6 +272,21 @@ async fn run_workflow(db: toasty::Db) {
     assert_eq!(node_run(&nodes, producer).status, "Pending");
     assert!(poll(&app, owner).await.is_empty());
 
+    let archived = post(
+        &app,
+        "/job/result/prepare",
+        json!({"job_id": initial.uuid, "agent_id": owner, "size": 32}),
+        StatusCode::OK,
+    )
+    .await;
+    post(
+        &app,
+        "/job/result/commit",
+        json!({"job_id": initial.uuid, "agent_id": owner, "catalog_uuid": archived["catalog_uuid"]}),
+        StatusCode::OK,
+    )
+    .await;
+
     post(
         &app,
         "/runs/resume",
@@ -282,6 +300,18 @@ async fn run_workflow(db: toasty::Db) {
     assert_ne!(resumed.task_id, initial.task_id);
     assert_eq!(resumed.node_run_id, initial.node_run_id);
     assert_eq!(resumed.run_id, initial.run_id);
+    let result = request(
+        &app,
+        Method::GET,
+        &format!(
+            "/runs/{}/node-runs/{}/artifacts/result.json",
+            resumed.run_id, resumed.node_run_id
+        ),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(result.is_null());
 
     post(
         &app,
@@ -424,6 +454,204 @@ async fn run_workflow(db: toasty::Db) {
 #[tokio::test]
 async fn workflow_yields_resumes_presigns_artifacts_and_stops_at_failure() {
     support::with_test_database(run_workflow).await;
+}
+
+#[tokio::test]
+async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
+    support::with_test_database(|mut db| async move {
+        let mut config = storage_config();
+        // A committed archive can be signed without contacting storage.
+        let endpoint = "https://storage.example.invalid";
+        config.storage.as_mut().unwrap().endpoint = endpoint.into();
+        let app = router(App::new(db.clone(), config, db.clone()));
+        let mut actuator = Actuator::new(Backend::new(db.clone(), db.clone()), 64);
+        let mut graph = workflow();
+        let graph_id = graph.id;
+        graph.nodes[0].outputs.push(Output {
+            file_name: "result.json".into(),
+            kind: Kind::File,
+            multiple: false,
+        });
+        request(
+            &app, Method::PUT, &format!("/graphs/{graph_id}/draft"),
+            json!({"graph": graph, "actor": "workflow-test"}), StatusCode::OK,
+        ).await;
+        post(
+            &app, &format!("/graphs/{graph_id}/publish"),
+            json!({"actor": "workflow-test"}), StatusCode::CREATED,
+        ).await;
+        post(
+            &app, "/runs/start",
+            json!({"data_id": Uuid::new_v4(), "graph_id": graph_id}), StatusCode::ACCEPTED,
+        ).await;
+        assert_eq!(actuator.tick().await.unwrap().tasks, 1);
+
+        let owner = Uuid::new_v4();
+        let job = Job::filter(Job::fields().status().eq(Status::Scheduled))
+            .first()
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = jiff::Timestamp::now();
+        // Reproduce a claim delivered by an older server without a result row.
+        Job::filter_by_id(job.id)
+            .update()
+            .status(Status::Polled)
+            .agent_id(Some(owner))
+            .polled_at(Some(now))
+            .expired_at(Some(now.checked_add(Duration::from_secs(120)).unwrap()))
+            .exec(&mut db)
+            .await
+            .unwrap();
+        let node = NodeRun::filter_by_uuid(job.node_run_id).get(&mut db).await.unwrap();
+        let archive_path = |filename| format!("/runs/{}/node-runs/{}/artifacts/{filename}", job.run_id, node.uuid);
+        let assert_signed_archive = |filename: &str, body: Value| {
+            let signed: PresignedUrl = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(body, serde_json::to_value(&signed).unwrap());
+            assert_eq!(signed.operation, PresignOperation::Download);
+            let url = reqwest::Url::parse(&signed.url).unwrap();
+            assert_eq!(url.origin().ascii_serialization(), endpoint);
+            assert_eq!(url.path(), format!("/workflow-test/artifacts/jobs/{}/{filename}", job.uuid));
+            assert!(url.query_pairs().any(|(name, value)| name == "X-Amz-Signature" && !value.is_empty()));
+        };
+        let output_key = format!(
+            "/artifacts/{}/{}/{}/{}/{}/result.json",
+            node.run_id, node.graph_id, node.version, node.node_id, node.revision,
+        );
+        let output = db.upsert_catalog(CatalogOptionalData {
+            url: Some(format!("s3://workflow-test{output_key}")),
+            key: Some(output_key),
+            size: Some(16),
+            format: Some("application/json".into()),
+            uploaded: Some(true),
+        }).await.unwrap();
+        db.upsert_file(&FileInput::new(node.uuid, "result.json", output))
+            .await.unwrap();
+        let prepare = |agent_id, size| json!({"job_id": job.uuid, "agent_id": agent_id, "size": size});
+        let commit = |agent_id, catalog_uuid| json!({"job_id": job.uuid, "agent_id": agent_id, "catalog_uuid": catalog_uuid});
+        let other_agent = Uuid::new_v4();
+        let conflict = post(&app, "/job/result/prepare", prepare(other_agent, 42), StatusCode::CONFLICT).await;
+        assert_eq!(conflict["error_code"], "RAYFLOW_JOB_CONFLICT");
+        post(&app, "/job/result/commit", commit(owner, output), StatusCode::BAD_REQUEST).await;
+
+        let without_storage = router(App::new(db.clone(), Config::default(), db.clone()));
+        let error = post(&without_storage, "/job/result/prepare", prepare(owner, 42), StatusCode::SERVICE_UNAVAILABLE).await;
+        assert_eq!(error["error_code"], "RAYFLOW_STORAGE_UNAVAILABLE");
+
+        Job::filter_by_id(job.id).update().expired_at(Some(jiff::Timestamp::UNIX_EPOCH))
+            .exec(&mut db).await.unwrap();
+        let prepared = post(&app, "/job/result/prepare", prepare(owner, 42), StatusCode::OK).await;
+        let result_id: Uuid = serde_json::from_value(prepared["catalog_uuid"].clone()).unwrap();
+        assert_ne!(result_id, output);
+        assert_eq!(prepared["catalog"]["key"], format!("/artifacts/jobs/{}/result.json", job.uuid));
+        assert_eq!(prepared["catalog"]["size"], 42);
+        assert_eq!(prepared["catalog"]["format"], "application/json");
+        assert_eq!(prepared["catalog"]["uploaded"], false);
+        assert!(request(&app, Method::GET, &archive_path("result.json"), Value::Null, StatusCode::OK).await.is_null());
+        assert_eq!(prepared["presigned"]["operation"], "upload");
+        assert_eq!(prepared["multipart"], false);
+        let retry = post(&app, "/job/result/prepare", prepare(owner, 42), StatusCode::OK).await;
+        assert_eq!(retry["catalog"], prepared["catalog"]);
+        post(&app, "/job/result/prepare", prepare(owner, 43), StatusCode::BAD_REQUEST).await;
+
+        assert_eq!(scheduler::agent::fail_expired_in(&mut db, Duration::ZERO).await.unwrap(), 1);
+        let expired = Job::filter_by_id(job.id).get(&mut db).await.unwrap();
+        assert_eq!(expired.status, Status::Failed);
+        assert_eq!(expired.agent_id, None);
+        let conflict = post(&app, "/job/result/prepare", prepare(other_agent, 42), StatusCode::CONFLICT).await;
+        assert_eq!(conflict["error_code"], "RAYFLOW_JOB_CONFLICT");
+        post(&app, "/job/result/commit", commit(other_agent, result_id), StatusCode::CONFLICT).await;
+        post(&app, "/job/result/commit", commit(owner, output), StatusCode::BAD_REQUEST).await;
+        let prepared_after_expiry = post(&app, "/job/result/prepare", prepare(owner, 42), StatusCode::OK).await;
+        assert_eq!(prepared_after_expiry["catalog_uuid"], json!(result_id));
+        for _ in 0..2 {
+            let acknowledged = post(&app, "/job/result/commit", commit(owner, result_id), StatusCode::OK).await;
+            assert_eq!(acknowledged, json!(result_id));
+        }
+        let committed = post(&app, "/job/result/prepare", prepare(owner, 42), StatusCode::OK).await;
+        assert_eq!(committed["catalog_uuid"], json!(result_id));
+        assert_eq!(committed["catalog"]["uploaded"], true);
+        assert_eq!(committed["presigned"]["operation"], "download");
+        assert_signed_archive(
+            "result.json",
+            request(&app, Method::GET, &archive_path("result.json"), Value::Null, StatusCode::OK).await,
+        );
+        let different_run = format!("/runs/{}/node-runs/{}/artifacts/result.json", Uuid::new_v4(), node.uuid);
+        assert!(request(&app, Method::GET, &different_run, Value::Null, StatusCode::OK).await.is_null());
+        let usage_prepare = |agent_id, size| json!({
+            "job_id": job.uuid, "agent_id": agent_id, "filename": "usage.json", "size": size,
+        });
+        let usage_commit = |catalog_uuid| json!({
+            "job_id": job.uuid, "agent_id": owner, "filename": "usage.json", "catalog_uuid": catalog_uuid,
+        });
+        post(&app, "/job/result/prepare", usage_prepare(other_agent, 21), StatusCode::CONFLICT).await;
+        post(&app, "/job/result/commit", usage_commit(result_id), StatusCode::BAD_REQUEST).await;
+        let usage = post(&app, "/job/result/prepare", usage_prepare(owner, 21), StatusCode::OK).await;
+        let usage_id: Uuid = serde_json::from_value(usage["catalog_uuid"].clone()).unwrap();
+        assert_ne!(usage_id, result_id);
+        assert_eq!(usage["catalog"]["key"], format!("/artifacts/jobs/{}/usage.json", job.uuid));
+        assert_eq!(usage["presigned"]["operation"], "upload");
+        assert!(request(&app, Method::GET, &archive_path("usage.json"), Value::Null, StatusCode::OK).await.is_null());
+        post(&app, "/job/result/prepare", usage_prepare(owner, 22), StatusCode::BAD_REQUEST).await;
+        post(&app, "/job/result/commit", commit(owner, usage_id), StatusCode::BAD_REQUEST).await;
+        post(&app, "/job/result/commit", usage_commit(usage_id), StatusCode::OK).await;
+        let usage = post(&app, "/job/result/prepare", usage_prepare(owner, 21), StatusCode::OK).await;
+        assert_eq!(usage["catalog_uuid"], json!(usage_id));
+        assert_eq!(usage["presigned"]["operation"], "download");
+        assert_signed_archive(
+            "usage.json",
+            request(&app, Method::GET, &archive_path("usage.json"), Value::Null, StatusCode::OK).await,
+        );
+        let invalid = json!({
+            "job_id": job.uuid, "agent_id": owner, "filename": "../usage.json", "size": 21,
+        });
+        let response = app.clone().oneshot(Request::post("/api/v1/job/result/prepare")
+            .header("content-type", "application/json")
+            .body(Body::from(invalid.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let files = catalog::model::File::filter_by_node_run_id(job.node_run_id)
+            .exec(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "result.json");
+        assert_eq!(files[0].catalog_uuid, output);
+
+        post(
+            &app, "/runs/start",
+            json!({"data_id": Uuid::new_v4(), "graph_id": graph_id}), StatusCode::ACCEPTED,
+        ).await;
+        assert_eq!(actuator.tick().await.unwrap().tasks, 1);
+        let legacy = Job::filter(Job::fields().status().eq(Status::Scheduled))
+            .first()
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy_prepare = json!({"job_id": legacy.uuid, "agent_id": owner, "size": 42});
+        let conflict = post(&app, "/job/result/prepare", legacy_prepare.clone(), StatusCode::CONFLICT).await;
+        assert_eq!(conflict["error_code"], "RAYFLOW_JOB_CONFLICT");
+        // Reproduce a job polled before upgrade and expired before any result request.
+        Job::filter_by_id(legacy.id)
+            .update()
+            .status(Status::Polled)
+            .agent_id(Some(owner))
+            .polled_at(Some(now))
+            .expired_at(Some(jiff::Timestamp::UNIX_EPOCH))
+            .exec(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(scheduler::agent::fail_expired_in(&mut db, Duration::ZERO).await.unwrap(), 1);
+        let conflict = post(&app, "/job/result/prepare", legacy_prepare, StatusCode::CONFLICT).await;
+        assert_eq!(conflict["error_code"], "RAYFLOW_JOB_RESULT_OWNER_UNKNOWN");
+        let conflict = post(
+            &app, "/job/result/commit",
+            json!({"job_id": legacy.uuid, "agent_id": owner, "catalog_uuid": result_id}),
+            StatusCode::CONFLICT,
+        ).await;
+        assert_eq!(conflict["error_code"], "RAYFLOW_JOB_CONFLICT");
+    }).await;
 }
 
 #[tokio::test]

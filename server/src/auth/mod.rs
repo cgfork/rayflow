@@ -622,6 +622,8 @@ fn agent_route(method: &Method, path: &str) -> bool {
                 | "/job/succeed"
                 | "/job/fail"
                 | "/job/terminate"
+                | "/job/result/prepare"
+                | "/job/result/commit"
                 | "/job/output/prepare"
                 | "/job/output/commit"
                 | "/job/output/multipart/create"

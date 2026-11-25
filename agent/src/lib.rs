@@ -1,7 +1,4 @@
-//! Agent-side job execution and durable per-job filesystem support.
-//!
-//! An [`Agentd`] owns its execution provider and job workdir. Remote polling
-//! and result reporting remain independent from the local daemon.
+//! Remote job polling and durable job execution.
 
 use std::{io, path::Path};
 
@@ -12,18 +9,18 @@ use tokio::{
 };
 use uuid::Uuid;
 
-pub mod agentd;
 pub mod agentic;
 pub mod client;
 pub mod containerd;
 pub mod errors;
-pub mod fs;
+pub mod job_manager;
 pub mod settings;
+pub mod transfer;
 
-pub use fs::{GraphFs, JobFs as JobFsProvider};
-
-pub use agentd::{AgentResult, Agentd, JobOutcome, StopReason};
 pub use agentic::Agentic;
+pub use job_manager::{
+    JobManager, JobOutcome, JobResult, JobUsage, StopReason, Usage, UsagePercentiles, UsageSummary,
+};
 
 pub(crate) async fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, errors::Error> {
     let contents = tokio_fs::read(path).await?;

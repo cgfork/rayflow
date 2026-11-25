@@ -14,6 +14,7 @@ use server::{
 };
 use toasty::Db;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const PUBLIC_ORIGIN: &str = "http://192.0.2.10:5173";
 const FLEET_TOKEN: &str = "rayflow-auth-http-test-agent-token";
@@ -156,6 +157,36 @@ async fn login_workflow(db: Db) {
     .await
     .unwrap();
     let app = router(App::new(db.clone(), Config::default(), db.clone()).with_auth(auth));
+
+    let id = Uuid::new_v4();
+    for (path, body) in [
+        (
+            "/api/v1/job/result/prepare",
+            json!({"job_id": id, "agent_id": id, "size": 1}),
+        ),
+        (
+            "/api/v1/job/result/commit",
+            json!({"job_id": id, "agent_id": id, "catalog_uuid": id}),
+        ),
+    ] {
+        let upload = || Request::post(path).header(header::CONTENT_TYPE, "application/json");
+        request(
+            &app,
+            upload().body(Body::from(body.to_string())).unwrap(),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let (_, error) = request(
+            &app,
+            upload()
+                .header(header::AUTHORIZATION, format!("Bearer {FLEET_TOKEN}"))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(error["error_code"], "RAYFLOW_JOB_NOT_FOUND");
+    }
 
     let (_, providers) = request(
         &app,

@@ -6,7 +6,7 @@ files (`File`). Catalog records store `id`, `uuid`, `key`, `url`, byte `size`,
 `uuid`, `node_run_id` (the producing node run's UUID), `filename`, `catalog_uuid`,
 and the same timestamps. There is no `file.fullpath`: use the referenced
 catalog's key for the path. Catalog keys and URLs have separate unique
-`VARCHAR(750)` constraints. A catalog UUID identifies one file record.
+`VARCHAR(750)` constraints. A catalog UUID identifies at most one file record.
 
 Register `catalog::models()` or use `server::models()`. Run `./init-db.sh` before
 starting updated binaries. `rayflow.sql` contains the schema for fresh installs.
@@ -325,6 +325,8 @@ Agents do not submit storage keys.
 
 | Endpoint | Request | Result |
 | --- | --- | --- |
+| `POST /api/v1/job/result/prepare` | `job_id`, `agent_id`, `size` | Result catalog UUID, catalog metadata, and a presigned upload URL |
+| `POST /api/v1/job/result/commit` | `job_id`, `agent_id`, `catalog_uuid` | Marks the job's prepared result catalog uploaded |
 | `POST /api/v1/job/output/prepare` | `job_id`, `agent_id`, `filename`, `size`, `format` | Catalog UUID and ordinary upload signature |
 | `POST /api/v1/job/output/commit` | `job_id`, `agent_id`, `filename`, `catalog_uuid` | Marks the catalog uploaded and publishes the file |
 | `POST /api/v1/job/output/multipart/create` | `job_id`, `agent_id`, `filename`, `size`, `format` | Creates the catalog and returns a multipart-create signature |
@@ -341,9 +343,32 @@ smaller files use ordinary presigned HTTP PUT and GET requests. The default
 threshold is 64 MiB. Multipart
 completion must succeed before `/job/output/commit` marks the catalog uploaded.
 
+The agent uploads `result.json` and `usage.json` as `application/json` at
+`/<prefix>/jobs/<job_uuid>/<filename>`. Their catalog associations are keyed by
+job and filename in `job_artifact`, independently of declared outputs. Apply
+migration 24 and upgrade the server before upgrading agents. Existing result
+rows remain associated with `result.json`. Both `/job/result/prepare` and
+`/job/result/commit` accept `filename`, which defaults to `result.json` for older
+agents. The assigned agent may use either filename after the lease expires or
+the scheduler clears active ownership.
+For a terminal job with a cleared claim and no recorded result owner, prepare
+returns `409 RAYFLOW_JOB_RESULT_OWNER_UNKNOWN`. The agent retains local files
+whose uploads lack a receipt.
+
+Prepare and commit are idempotent per filename. Repeated preparation returns
+the same catalog and requires the same byte size. If `catalog.uploaded` is
+already true, the agent skips PUT and commit and the returned signature permits
+download. Otherwise the agent uploads the exact local bytes using the returned
+URL and headers and commits the catalog UUID after a successful 2xx PUT.
+The archive commit must return a 2xx response with the expected catalog UUID.
+The agent validates and commits required outputs before reporting success.
+It retries the JSON uploads independently and keeps both files across restarts.
+A server without object storage returns `RAYFLOW_STORAGE_UNAVAILABLE`. Pending
+output uploads delay completion, and pending JSON uploads delay local cleanup.
+
 ### Local data layout
 
-`JobFs` stores metadata and artifact data under separate configured roots. Both
+`JobManager` stores metadata and artifact data under separate configured roots. Both
 roots are scoped by the job UUID; artifact data is isolated per job:
 
 ```text
@@ -351,6 +376,10 @@ roots are scoped by the job UUID; artifact data is isolated per job:
 <metadata_dir>/<job_uuid>/lock
 <metadata_dir>/<job_uuid>/container.json
 <metadata_dir>/<job_uuid>/result.json
+<metadata_dir>/<job_uuid>/usage.json
+<metadata_dir>/<job_uuid>/completion.json
+<metadata_dir>/<job_uuid>/result.json.upload
+<metadata_dir>/<job_uuid>/usage.json.upload
 <metadata_dir>/<job_uuid>/pid
 <metadata_dir>/<job_uuid>/runtime/started_at
 <metadata_dir>/<job_uuid>/graph.json
@@ -365,7 +394,7 @@ separately (the defaults are `.rayflow/jobs` and `.rayflow/data`). Docker mounts
 the read-only job metadata directory at `/rayflow`, including `job.json` and
 the pinned `graph.json`; `RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to
 those files. The agent keeps input readiness, output completion, and transfer
-state in the per-job marker directory. Outputs remain available until
-acknowledgement, after which the agent removes the local artifact directory.
+state in the per-job marker directory. Local artifacts stay available until the
+server acknowledges the outcome and both JSON archives have upload receipts.
 Docker mounts inputs read-only at `/data/inputs` and outputs writable at
 `/data/outputs`.

@@ -4,7 +4,7 @@ mod support;
 use std::{env, future::Future, time::Duration};
 
 use agent::{
-    Agentd, Agentic, StopReason,
+    Agentic, JobManager, StopReason,
     client::Client,
     containerd::{Container, ContainerState, Containerd, docker::DockerContainerd},
     settings::Settings,
@@ -68,17 +68,17 @@ async fn run_workflow(mut db: Db) {
     );
     settings.poll_interval = POLL;
     settings.request_timeout = Duration::from_secs(5);
-    let client = Client::new(settings.clone()).unwrap();
-    let agentd = Agentd::open(docker.clone(), client.clone(), settings.clone())
+    let client = Client::new(settings).unwrap();
+    let manager = JobManager::open(docker.clone(), client.clone(), client)
         .await
         .unwrap();
-    let agent = Agentic::with_agent(agentd.clone(), client, settings).unwrap();
+    let agent = Agentic::with_manager(manager.clone());
 
     let mut scenario = JoinSet::new();
     scenario.spawn(exercise_workflow(
         db.clone(),
         docker.clone(),
-        agentd,
+        manager,
         format!("{server_url}/api/v1"),
         image,
     ));
@@ -104,7 +104,7 @@ async fn run_workflow(mut db: Db) {
 async fn exercise_workflow(
     db: Db,
     docker: DockerContainerd,
-    agentd: Agentd<DockerContainerd, Client>,
+    manager: JobManager<DockerContainerd, Client>,
     api: String,
     image: String,
 ) {
@@ -147,7 +147,7 @@ async fn exercise_workflow(
     .await;
     let initial = wait_for_running_job(&db, &docker, None).await;
     let run_id = initial.run_id;
-    agentd
+    manager
         .stop(initial.uuid, StopReason::Yielded)
         .await
         .unwrap();

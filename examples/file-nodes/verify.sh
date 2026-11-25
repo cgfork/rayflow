@@ -12,3 +12,5 @@ else
     printf 'File comparison failed: %s and %s\n' "$1" "$2" >&2
     exit "$result"
 fi
+
+exercise_resources

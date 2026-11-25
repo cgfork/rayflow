@@ -70,6 +70,10 @@ become nil UUIDs. Missing nonzero references, or a missing owning node run,
 still stop the migration before it removes the numeric references; repair those
 references explicitly and retry.
 
+Migration 23 adds durable ownership and catalog associations for job result
+uploads. Apply it before starting servers that expose `/job/result/prepare`
+and `/job/result/commit`.
+
 Do not commit credentials in `rayflow.yaml`. Use an environment variable or a
 local, untracked configuration file for `database_url`.
 
@@ -313,12 +317,16 @@ The four sections use the same resource APIs as other clients:
 - **Agents:** inspect online/offline status, reported resource budgets, last
   activity, and reported active job counts; open the agent's claimed jobs.
 
-Runtime, job, and agent views refresh every five seconds while visible.
+Use **Refresh** in Runtime, Schedule, and Agents to get the latest data.
 Lists use cursor pagination; text search and counts cover the displayed page.
 Runtime requires a published workflow selected in the header. Search workflows
 by name or ID; the selected workflow stays visible in the search bar. Runs,
 pagination, and refreshes are scoped to that workflow across its published
 versions. Opening Runtime from a published workflow selects it automatically.
+Select a node to see the result and resource usage of its latest job attempt
+in **Node State**. In the run detail, **Refresh** also checks both archives
+for the selected node. Each archive appears once its upload is committed and
+the console fetches it.
 Start a run uses the selected workflow's latest published version. Publishing
 snapshots node settings into versioned execution configuration, so each run
 uses the settings from its pinned graph version.
@@ -410,7 +418,7 @@ and code also reflect errors wrapped by storage, runtime, or scheduler adapters.
 | `400 Bad Request` | `RAYFLOW_INVALID_CATALOG_URL`, `RAYFLOW_INVALID_CATALOG_FIELD`, `RAYFLOW_MISSING_CATALOG_FIELD`, `RAYFLOW_INVALID_ARTIFACT_PATH`, `RAYFLOW_INVALID_STORAGE_CONFIGURATION`, `RAYFLOW_INVALID_OBJECT_URL`, `RAYFLOW_INVALID_PRESIGN_EXPIRY`, `RAYFLOW_INVALID_MULTIPART_OPERATION` |
 | `404 Not Found` | `RAYFLOW_RUN_NOT_FOUND`, `RAYFLOW_NODE_RUN_NOT_FOUND`, `RAYFLOW_NODE_NOT_FOUND`, `RAYFLOW_TASK_NOT_FOUND`, `RAYFLOW_JOB_NOT_FOUND`, `RAYFLOW_GRAPH_NOT_FOUND`, `RAYFLOW_GRAPH_DRAFT_NOT_FOUND` |
 | `404 Not Found` | `RAYFLOW_ARTIFACT_NOT_FOUND`, `RAYFLOW_CATALOG_NOT_FOUND`, `RAYFLOW_FILE_NOT_FOUND`, `RAYFLOW_COMMAND_NOT_FOUND`, `RAYFLOW_TASK_EVENT_NOT_FOUND` |
-| `409 Conflict` | `RAYFLOW_JOB_CONFLICT`, `RAYFLOW_RUN_ALREADY_STARTED`, `RAYFLOW_INVALID_TRANSITION`, `RAYFLOW_CONCURRENT_UPDATE` |
+| `409 Conflict` | `RAYFLOW_JOB_CONFLICT`, `RAYFLOW_JOB_RESULT_OWNER_UNKNOWN`, `RAYFLOW_RUN_ALREADY_STARTED`, `RAYFLOW_INVALID_TRANSITION`, `RAYFLOW_CONCURRENT_UPDATE` |
 | `500 Internal Server Error` | `RAYFLOW_DATABASE_ERROR`, `RAYFLOW_GRAPH_ERROR`, `RAYFLOW_GRAPH_METADATA_MISMATCH`, `RAYFLOW_GRAPH_DRAFT_METADATA_MISMATCH`, `RAYFLOW_GRAPH_VERSION_OVERFLOW`, `RAYFLOW_STORAGE_ERROR` |
 | `500 Internal Server Error` | `RAYFLOW_INVALID_JOB_TIMEOUT_GAP`, `RAYFLOW_INVALID_JOB_LEASE`, `RAYFLOW_JOB_LEASE_NOT_FOUND` |
 | `503 Service Unavailable` | `RAYFLOW_STORAGE_UNAVAILABLE`, `RAYFLOW_STORAGE_CREDENTIALS_EXPIRED` |
@@ -450,10 +458,13 @@ The service endpoints are:
 | `POST` | `/api/v1/job/succeed` | Complete a claimed job successfully. |
 | `POST` | `/api/v1/job/fail` | Report a claimed job failure. |
 | `POST` | `/api/v1/job/terminate` | Terminate a claimed job. |
+| `POST` | `/api/v1/job/result/prepare` | Prepare a job's result catalog and return its upload signature; body has `job_id`, `agent_id`, and `size`. |
+| `POST` | `/api/v1/job/result/commit` | Acknowledge the uploaded result; body has `job_id`, `agent_id`, and `catalog_uuid`. |
 | `POST` | `/api/v1/job/output/prepare` | Create or reset an output catalog and return its upload signature. |
 | `POST` | `/api/v1/job/output/commit` | Mark an uploaded output catalog as uploaded and publish its file. |
 | `POST` | `/api/v1/job/input/presign` | Return a signed download URL for a declared input. |
 | `POST` | `/api/v1/runs/{run_id}/files/download` | Return a signed download URL for a succeeded declared input or output. |
+| `GET` | `/api/v1/runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}` | Return a signed download URL for `result.json` or `usage.json`. |
 | `POST` | `/api/v1/users/resolve` | Resolve valid audit user IDs to display names for the console. |
 
 The server exports `rayflow_http_requests_total` and
@@ -520,6 +531,14 @@ older payloads that omit them are read with default values.
 Run detail returns `{ "run": ..., "graph": ..., "node_runs": [...] }`.
 The `run` record contains the run UUID, data ID, graph/version, and revision;
 `node_runs` contains effective node-run records joined with their graph nodes.
+`GET /runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}` signs
+`result.json` or `usage.json` from the latest job for the specified node-run
+UUID. The response contains `url`, `operation`, `headers`, and `expires_at`
+after the upload is committed, or JSON `null` while the archive is unavailable.
+Runtime fetches the JSON directly from the signed URL. The storage endpoint
+must be reachable from the browser. For cross-origin downloads, configure the
+storage bucket's CORS rules to allow `GET` from the console's origin, including
+its scheme, host, and port.
 
 Example start request:
 
@@ -628,7 +647,13 @@ directory; `job.json` is the source used to restore the job after a restart:
 {WORKDIR}/{job-uuid}/job.json
 {WORKDIR}/{job-uuid}/lock
 {WORKDIR}/{job-uuid}/container.json
+{WORKDIR}/{job-uuid}/usage/checkpoint.jsonl
 {WORKDIR}/{job-uuid}/result.json
+{WORKDIR}/{job-uuid}/usage.json
+{WORKDIR}/{job-uuid}/completion.json
+{WORKDIR}/{job-uuid}/result.json.upload
+{WORKDIR}/{job-uuid}/usage.json.upload
+{WORKDIR}/{job-uuid}/cleanup-ready.json
 {WORKDIR}/{job-uuid}/pid
 {WORKDIR}/{job-uuid}/runtime/started_at
 {WORKDIR}/{job-uuid}/graph.json
@@ -641,9 +666,72 @@ when the corresponding state is available. There is no persisted `node.json` or
 container stdout file in this directory. The agent writes JSON atomically,
 persists results before reporting them, and retains job metadata for recovery.
 The `lock` file is held with an exclusive OS lock while a job is being
-coordinated. On startup, `Agentic` discovers existing directories, reconnects
-to containers by their persisted IDs, and retries unreported results. Keep this
-directory across agent restarts.
+coordinated. On startup, `JobManager` discovers existing directories and
+reconnects to containers by their persisted IDs or their Docker job names.
+It resumes pending terminal reports and uploads. Keep this directory across
+agent restarts.
+
+The usage monitor consumes each running Linux Docker container's live stats
+stream. Each job runs one container once. The monitor appends observations to
+the job's `usage/checkpoint.jsonl` file.
+If checkpoint writes fail, the agent retries on a timer and retains at most
+the 32 newest unflushed observations per job. The lifecycle monitor saves
+`result.json` at container exit. The usage monitor gives the stats stream a
+bounded window to drain, flushes the final samples, and aggregates the saved
+checkpoints outside the job lock. It writes a `JobUsage` record to `usage.json`,
+including an empty record when no samples were available. After a restart,
+the monitor can aggregate the saved checkpoints or load a summary embedded in
+an older result.
+
+- Total CPU is the latest available cumulative CPU time, in nanoseconds, up
+  to the last CPU sample. A reset or conflicting counters at the same
+  timestamp make this total unavailable.
+  Peak CPU is the highest average between adjacent valid samples, rounded
+  down to millicores (1000 millicores is one core).
+- Peak memory and working set are the highest sampled byte values. Each
+  memory total is an estimated integral in byte-seconds, calculated by
+  averaging adjacent samples and multiplying by the time between them.
+  The summary includes the milliseconds covered by each integral. Intervals
+  with missing endpoints or longer than 15 seconds are skipped. No memory
+  use is inferred before the first sample or after the last.
+- P50, P90, P95, and P99 are included as `cpu_millicores_percentiles`,
+  `memory_usage_bytes_percentiles`, and `memory_working_set_bytes_percentiles`.
+  Each object has `p50`, `p90`, `p95`, and `p99` fields. CPU uses the valid
+  interval rates used for its peak; memory uses the valid measurements at each
+  distinct timestamp. Values use the nearest rank: sort the observations and
+  select rank `ceil(percentile * count / 100)`, starting at rank one. Samples
+  have equal weight regardless of interval duration. Missing or conflicting
+  measurements are excluded, and reset-crossing CPU intervals are excluded.
+  A single memory observation supplies all four memory percentiles; CPU needs
+  two observations forming a valid interval. A metric without valid observations
+  omits its percentile object. The metrics are stored under `summary` in
+  `usage.json`.
+
+Short jobs and jobs with unavailable statistics can finish without a summary.
+Peaks reflect the recorded samples and can miss brief spikes.
+
+The lifecycle monitor validates and commits required outputs before reporting
+success. Pending output uploads delay completion. The manager records
+the terminal action and the server acknowledgment in `completion.json`.
+It archives the final `result.json` and `usage.json` through
+`/api/v1/job/result/prepare`, the returned presigned PUT, and
+`/api/v1/job/result/commit`. The archive uploads retry independently of job
+completion. The agent shares four concurrent archive uploads across both files
+and delays retries on failure. A server response indicating that storage is
+disabled pauses archive requests for 30 seconds. The manager writes each
+`.upload` receipt after the server confirms the expected catalog UUID.
+The usage monitor removes the stopped container after saving `usage.json`.
+Periodic cleanup removes checkpoints, staged inputs and outputs, and metadata
+once the terminal acknowledgment and both archive receipts are present.
+`cleanup-ready.json` lets cleanup resume after an interruption.
+
+Migration 24 generalizes `job_result` to `job_artifact` and retains existing
+catalog associations under `result.json`. Polling records ownership in the
+claim transaction, and the assignment survives expiry and terminal settlement
+for late uploads. For an older terminal job whose result owner is unknown,
+preparation returns `RAYFLOW_JOB_RESULT_OWNER_UNKNOWN`. The agent retains local
+files whose uploads lack a receipt. Object keys are
+`/<prefix>/jobs/<job_uuid>/<filename>`.
 
 The agent also holds a process-wide lock for the entire `workdir`. Start an
 upgraded binary only after the previous process has exited, using the same
@@ -657,14 +745,12 @@ creating a second container for the same job.
 
 ## Agent inputs and outputs
 
-`JobFs` keeps metadata and artifact bytes in separate roots. Metadata is under
+The manager keeps metadata and artifact bytes in separate roots. Metadata is under
 `<workdir>/<job_uuid>`. Artifact data is under
 `<data_dir>/<job_uuid>`, with `inputs/`, `outputs/`, and per-job transfer
 markers under `.rayflow/<job_uuid>/`. Each job therefore has an isolated local
-artifact directory, including resumed jobs that share a run or node-run. Job
-completion retains that job's artifact data for recovery until acknowledgement,
-then acknowledgement removes the local artifact directory after the container
-is removed.
+artifact directory, including resumed jobs that share a run or node-run.
+Artifact data stays available for upload retries until the cleanup sweep.
 
 Declare outputs on the producer node and bind downstream inputs with
 `source: "producer.output_name"`. In containers, read from

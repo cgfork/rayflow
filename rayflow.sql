@@ -151,6 +151,19 @@ CREATE TABLE IF NOT EXISTS job (
     KEY idx_job_run_config_id (run_config_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'job execution instance referencing its logical task, run, node run and configurations';
 
+CREATE TABLE IF NOT EXISTS job_artifact (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    job_uuid CHAR(36) NOT NULL,
+    filename VARCHAR(255) NOT NULL DEFAULT 'result.json',
+    agent_id CHAR(36) NOT NULL,
+    catalog_uuid CHAR(36) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_job_artifact_job_filename (job_uuid, filename),
+    UNIQUE KEY uk_job_artifact_catalog_uuid (catalog_uuid)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'job artifact owner and catalog association';
+
 CREATE TABLE IF NOT EXISTS command_entry (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key, used as the command offset',
     uuid       CHAR(36)        NOT NULL DEFAULT '' COMMENT 'command unique identifier',

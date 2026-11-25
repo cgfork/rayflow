@@ -2,6 +2,7 @@ mod agent;
 mod error;
 mod graph;
 mod job;
+pub(crate) mod job_artifact;
 mod operation;
 mod run;
 mod user;

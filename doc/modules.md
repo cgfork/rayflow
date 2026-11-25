@@ -163,18 +163,15 @@ calling the builder's `models()` repeatedly replaces the previous registration.
 
 ### `agent`
 
-The agent is the execution process. `Agentic` combines an execution `Agentd`, an
-HTTP `Client`, and `Settings` to poll for jobs, run containers, persist job
-results, and report terminal task events. The current default execution
-provider is Docker through Bollard.
+`Agentic` polls for jobs and hands them to one `JobManager`. The manager
+stages inputs, starts containers, monitors execution and usage, and reports
+outcomes and uploads files. The default provider is Docker through Bollard.
 
-`JobFs` gives each job a durable metadata directory under `workdir` and an
-isolated `<data_dir>/<job_uuid>` artifact directory under the separate
-configured `data_dir`. It owns input and output directories,
-transfer markers, and recovery state. `JobTransfer` implements the transfer
-backend used by `JobFs::prepare_input` and `JobFs::complete_output`. Docker mounts
-`inputs/` read-only and `outputs/` writable. Directory outputs use an internal
-JSON manifest. See [Catalog](catalog.md#job-artifact-api) for the protocol.
+Each job has a durable metadata directory under `workdir` and an isolated
+`<data_dir>/<job_uuid>` directory. `JobTransfer` handles HTTP downloads and
+uploads. Docker mounts `inputs/` read-only and `outputs/` writable. Directory
+outputs use an internal JSON manifest. See [Catalog](catalog.md#job-artifact-api)
+for the protocol.
 
 ## Web UI
 

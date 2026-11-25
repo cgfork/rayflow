@@ -8,7 +8,7 @@ export default function Agents({ openJobs }: { openJobs: (id: string) => void })
   const [filter, setFilter] = useState('');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<Agent | null>(null);
-  const result = usePaged<Agent>(`/agents${filter ? `?online=${filter}` : ''}`, 5000);
+  const result = usePaged<Agent>(`/agents${filter ? `?online=${filter}` : ''}`);
   const rows = result.data?.items.filter((item) => item.uuid.includes(search.toLowerCase())) ?? [];
   const agent = selected && (result.data?.items.find((item) => item.uuid === selected.uuid) ?? selected);
   return <>

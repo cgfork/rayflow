@@ -507,6 +507,7 @@ impl<S> App<S> {
                     .into();
             }
             job.job_lease()?;
+            super::job_artifact::record_assignment(&mut tx, job.uuid, polling.id()).await?;
         }
         tx.commit().await?;
         *agent = polling;
