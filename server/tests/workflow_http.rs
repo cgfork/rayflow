@@ -8,7 +8,7 @@ use axum::{
     http::{Method, Request, StatusCode},
 };
 use catalog::{
-    CatalogOptionalData, CatalogSystem, FileInput, FileSystem,
+    CatalogOptionalData, CatalogSystem, FileInput, FileSystem, PresignOperation, PresignedUrl,
     directory::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST},
 };
 use graph::store::{GraphDraftRecord, GraphRecord};
@@ -272,6 +272,21 @@ async fn run_workflow(db: toasty::Db) {
     assert_eq!(node_run(&nodes, producer).status, "Pending");
     assert!(poll(&app, owner).await.is_empty());
 
+    let archived = post(
+        &app,
+        "/job/result/prepare",
+        json!({"job_id": initial.uuid, "agent_id": owner, "size": 32}),
+        StatusCode::OK,
+    )
+    .await;
+    post(
+        &app,
+        "/job/result/commit",
+        json!({"job_id": initial.uuid, "agent_id": owner, "catalog_uuid": archived["catalog_uuid"]}),
+        StatusCode::OK,
+    )
+    .await;
+
     post(
         &app,
         "/runs/resume",
@@ -285,6 +300,18 @@ async fn run_workflow(db: toasty::Db) {
     assert_ne!(resumed.task_id, initial.task_id);
     assert_eq!(resumed.node_run_id, initial.node_run_id);
     assert_eq!(resumed.run_id, initial.run_id);
+    let result = request(
+        &app,
+        Method::GET,
+        &format!(
+            "/runs/{}/node-runs/{}/artifacts/result.json",
+            resumed.run_id, resumed.node_run_id
+        ),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(result.is_null());
 
     post(
         &app,
@@ -432,7 +459,11 @@ async fn workflow_yields_resumes_presigns_artifacts_and_stops_at_failure() {
 #[tokio::test]
 async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
     support::with_test_database(|mut db| async move {
-        let app = router(App::new(db.clone(), storage_config(), db.clone()));
+        let mut config = storage_config();
+        // A committed archive can be signed without contacting storage.
+        let endpoint = "https://storage.example.invalid";
+        config.storage.as_mut().unwrap().endpoint = endpoint.into();
+        let app = router(App::new(db.clone(), config, db.clone()));
         let mut actuator = Actuator::new(Backend::new(db.clone(), db.clone()), 64);
         let mut graph = workflow();
         let graph_id = graph.id;
@@ -474,6 +505,16 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
             .await
             .unwrap();
         let node = NodeRun::filter_by_uuid(job.node_run_id).get(&mut db).await.unwrap();
+        let archive_path = |filename| format!("/runs/{}/node-runs/{}/artifacts/{filename}", job.run_id, node.uuid);
+        let assert_signed_archive = |filename: &str, body: Value| {
+            let signed: PresignedUrl = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(body, serde_json::to_value(&signed).unwrap());
+            assert_eq!(signed.operation, PresignOperation::Download);
+            let url = reqwest::Url::parse(&signed.url).unwrap();
+            assert_eq!(url.origin().ascii_serialization(), endpoint);
+            assert_eq!(url.path(), format!("/workflow-test/artifacts/jobs/{}/{filename}", job.uuid));
+            assert!(url.query_pairs().any(|(name, value)| name == "X-Amz-Signature" && !value.is_empty()));
+        };
         let output_key = format!(
             "/artifacts/{}/{}/{}/{}/{}/result.json",
             node.run_id, node.graph_id, node.version, node.node_id, node.revision,
@@ -507,6 +548,7 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
         assert_eq!(prepared["catalog"]["size"], 42);
         assert_eq!(prepared["catalog"]["format"], "application/json");
         assert_eq!(prepared["catalog"]["uploaded"], false);
+        assert!(request(&app, Method::GET, &archive_path("result.json"), Value::Null, StatusCode::OK).await.is_null());
         assert_eq!(prepared["presigned"]["operation"], "upload");
         assert_eq!(prepared["multipart"], false);
         let retry = post(&app, "/job/result/prepare", prepare(owner, 42), StatusCode::OK).await;
@@ -531,6 +573,12 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
         assert_eq!(committed["catalog_uuid"], json!(result_id));
         assert_eq!(committed["catalog"]["uploaded"], true);
         assert_eq!(committed["presigned"]["operation"], "download");
+        assert_signed_archive(
+            "result.json",
+            request(&app, Method::GET, &archive_path("result.json"), Value::Null, StatusCode::OK).await,
+        );
+        let different_run = format!("/runs/{}/node-runs/{}/artifacts/result.json", Uuid::new_v4(), node.uuid);
+        assert!(request(&app, Method::GET, &different_run, Value::Null, StatusCode::OK).await.is_null());
         let usage_prepare = |agent_id, size| json!({
             "job_id": job.uuid, "agent_id": agent_id, "filename": "usage.json", "size": size,
         });
@@ -544,12 +592,17 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
         assert_ne!(usage_id, result_id);
         assert_eq!(usage["catalog"]["key"], format!("/artifacts/jobs/{}/usage.json", job.uuid));
         assert_eq!(usage["presigned"]["operation"], "upload");
+        assert!(request(&app, Method::GET, &archive_path("usage.json"), Value::Null, StatusCode::OK).await.is_null());
         post(&app, "/job/result/prepare", usage_prepare(owner, 22), StatusCode::BAD_REQUEST).await;
         post(&app, "/job/result/commit", commit(owner, usage_id), StatusCode::BAD_REQUEST).await;
         post(&app, "/job/result/commit", usage_commit(usage_id), StatusCode::OK).await;
         let usage = post(&app, "/job/result/prepare", usage_prepare(owner, 21), StatusCode::OK).await;
         assert_eq!(usage["catalog_uuid"], json!(usage_id));
         assert_eq!(usage["presigned"]["operation"], "download");
+        assert_signed_archive(
+            "usage.json",
+            request(&app, Method::GET, &archive_path("usage.json"), Value::Null, StatusCode::OK).await,
+        );
         let invalid = json!({
             "job_id": job.uuid, "agent_id": owner, "filename": "../usage.json", "size": 21,
         });

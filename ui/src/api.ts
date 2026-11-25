@@ -26,7 +26,16 @@ export function send<T>(path: string, body: unknown, method = 'POST') {
   return api<T>(path, { method, body: JSON.stringify(body) });
 }
 
-export function useRemote<T>(path: string | null, interval = 0) {
+export function isHttpDownloadUrl(url: unknown): url is string {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false;
+  try { return Boolean(new URL(url).hostname); }
+  catch { return false; }
+}
+
+export function useRemote<T>(
+  path: string | null,
+  request: (path: string, options: RequestInit) => Promise<T> = api<T>,
+) {
   const [result, setResult] = useState<{ path: string | null; data?: T; error?: string }>({ path });
   const [loading, setLoading] = useState(true);
   const [revision, setRevision] = useState(0);
@@ -34,11 +43,11 @@ export function useRemote<T>(path: string | null, interval = 0) {
   useEffect(() => {
     if (!path) { setLoading(false); return; }
     const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout>;
-    async function load() {
+    // Let StrictMode clean up its first setup before sending a request.
+    const timer = setTimeout(async () => {
       setLoading(true);
       try {
-        const data = await api<T>(path!, { signal: controller.signal });
+        const data = await request(path, { signal: controller.signal });
         if (!controller.signal.aborted) setResult({ path, data });
       } catch (error) {
         if (!controller.signal.aborted) setResult((previous) => ({
@@ -46,28 +55,19 @@ export function useRemote<T>(path: string | null, interval = 0) {
           error: error instanceof Error ? error.message : 'Request failed',
         }));
       } finally {
-        if (!controller.signal.aborted) {
-          setLoading(false);
-          if (interval) timer = setTimeout(tick, interval);
-        }
+        if (!controller.signal.aborted) setLoading(false);
       }
-    }
-    function tick() {
-      if (document.hidden) timer = setTimeout(tick, interval);
-      else void load();
-    }
-    // Let StrictMode clean up its first setup before sending a request.
-    timer = setTimeout(load, 0);
+    }, 0);
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [path, interval, revision]);
+  }, [path, request, revision]);
   return { data: result.path === path ? result.data : undefined, error: result.path === path ? result.error : undefined, loading, refresh };
 }
 
-export function usePaged<T>(path: string | null, interval = 0) {
+export function usePaged<T>(path: string | null) {
   const [navigation, setNavigation] = useState<{ path: string | null; cursors: (number | undefined)[] }>({ path, cursors: [undefined] });
   const cursors = navigation.path === path ? navigation.cursors : [undefined];
   const before = cursors[cursors.length - 1];
-  const result = useRemote<Page<T>>(path === null ? null : `${path}${path.includes('?') ? '&' : '?'}limit=50${before === undefined ? '' : `&before=${before}`}`, interval);
+  const result = useRemote<Page<T>>(path === null ? null : `${path}${path.includes('?') ? '&' : '?'}limit=50${before === undefined ? '' : `&before=${before}`}`);
   return { ...result, page: cursors.length,
     next: () => { if (result.data?.next_cursor != null) setNavigation({ path, cursors: [...cursors, result.data.next_cursor] }); },
     previous: () => setNavigation({ path, cursors: cursors.slice(0, -1) }),

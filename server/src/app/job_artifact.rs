@@ -1,6 +1,6 @@
-//! Storage and claim checks for job metadata uploads.
+//! Storage and claim checks for job metadata archives.
 
-use catalog::{CatalogOptionalData, CatalogSystem, ObjectStorage, PresignOperation};
+use catalog::{CatalogOptionalData, CatalogSystem, ObjectStorage, PresignOperation, PresignedUrl};
 use jiff::Timestamp;
 use scheduler::{Job, JobArtifactName, actuator::Status};
 use toasty::{Executor, Transaction, schema::Model};
@@ -112,6 +112,49 @@ async fn find_artifact(
 }
 
 impl<S> App<S> {
+    /// Signs an uploaded archive for the latest job attempt of the given node run.
+    pub(crate) async fn presign_run_job_artifact(
+        &self,
+        run_id: Uuid,
+        node_run_id: Uuid,
+        filename: JobArtifactName,
+    ) -> Result<Option<PresignedUrl>, AppError> {
+        let mut db = self.db.clone();
+        let Some(job) = Job::filter_by_node_run_id(node_run_id)
+            .filter(Job::fields().run_id().eq(run_id))
+            .order_by(Job::fields().id().desc())
+            .first()
+            .exec(&mut db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let artifact = JobArtifact::filter_by_job_uuid_and_filename(job.uuid, filename.as_str())
+            .first()
+            .exec(&mut db)
+            .await?;
+        let Some(catalog_uuid) = artifact.and_then(|artifact| artifact.catalog_uuid) else {
+            return Ok(None);
+        };
+        let Some(catalog) = db
+            .get_catalog(catalog_uuid)
+            .await?
+            .filter(|catalog| catalog.uploaded)
+        else {
+            return Ok(None);
+        };
+        let config = self
+            .config
+            .storage
+            .as_ref()
+            .ok_or(AppError::StorageUnavailable)?;
+        let storage = config.object_storage(self.db.clone())?;
+        storage
+            .presign_catalog(&catalog, PresignOperation::Download, config.presign_ttl)
+            .map(Some)
+            .map_err(|error| AppError::Storage(Box::new(error)))
+    }
+
     pub async fn prepare_job_artifact(
         &self,
         job_id: Uuid,

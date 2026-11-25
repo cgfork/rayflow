@@ -13,3 +13,5 @@ while [ "$#" -gt 0 ]; do
     cp -- "$input_dir/$input" "$destination"
     printf 'Renamed %s to %s\n' "$input" "$output"
 done
+
+exercise_resources

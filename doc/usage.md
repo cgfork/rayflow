@@ -317,12 +317,16 @@ The four sections use the same resource APIs as other clients:
 - **Agents:** inspect online/offline status, reported resource budgets, last
   activity, and reported active job counts; open the agent's claimed jobs.
 
-Runtime, job, and agent views refresh every five seconds while visible.
+Use **Refresh** in Runtime, Schedule, and Agents to get the latest data.
 Lists use cursor pagination; text search and counts cover the displayed page.
 Runtime requires a published workflow selected in the header. Search workflows
 by name or ID; the selected workflow stays visible in the search bar. Runs,
 pagination, and refreshes are scoped to that workflow across its published
 versions. Opening Runtime from a published workflow selects it automatically.
+Select a node to see the result and resource usage of its latest job attempt
+in **Node State**. In the run detail, **Refresh** also checks both archives
+for the selected node. Each archive appears once its upload is committed and
+the console fetches it.
 Start a run uses the selected workflow's latest published version. Publishing
 snapshots node settings into versioned execution configuration, so each run
 uses the settings from its pinned graph version.
@@ -460,6 +464,7 @@ The service endpoints are:
 | `POST` | `/api/v1/job/output/commit` | Mark an uploaded output catalog as uploaded and publish its file. |
 | `POST` | `/api/v1/job/input/presign` | Return a signed download URL for a declared input. |
 | `POST` | `/api/v1/runs/{run_id}/files/download` | Return a signed download URL for a succeeded declared input or output. |
+| `GET` | `/api/v1/runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}` | Return a signed download URL for `result.json` or `usage.json`. |
 | `POST` | `/api/v1/users/resolve` | Resolve valid audit user IDs to display names for the console. |
 
 The server exports `rayflow_http_requests_total` and
@@ -526,6 +531,14 @@ older payloads that omit them are read with default values.
 Run detail returns `{ "run": ..., "graph": ..., "node_runs": [...] }`.
 The `run` record contains the run UUID, data ID, graph/version, and revision;
 `node_runs` contains effective node-run records joined with their graph nodes.
+`GET /runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}` signs
+`result.json` or `usage.json` from the latest job for the specified node-run
+UUID. The response contains `url`, `operation`, `headers`, and `expires_at`
+after the upload is committed, or JSON `null` while the archive is unavailable.
+Runtime fetches the JSON directly from the signed URL. The storage endpoint
+must be reachable from the browser. For cross-origin downloads, configure the
+storage bucket's CORS rules to allow `GET` from the console's origin, including
+its scheme, host, and port.
 
 Example start request:
 

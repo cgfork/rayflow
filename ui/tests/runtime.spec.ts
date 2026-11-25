@@ -49,6 +49,7 @@ async function mockRuntime(page: Page) {
   await page.route('**/api/v1/graphs?limit=200', (route) => route.fulfill({ json: { items: [graph], next_cursor: null } }));
   await page.route(`**/api/v1/graphs/${graph.id}`, (route) => route.fulfill({ json: graph }));
   await page.route(`**/api/v1/runs?graph_id=${graph.id}&limit=50`, (route) => route.fulfill({ json: { items: [run], next_cursor: null } }));
+  await page.route('**/api/v1/runs/*/node-runs/*/artifacts/*', (route) => route.fulfill({ json: null }));
 }
 
 async function selectWorkflow(page: Page) {
@@ -63,11 +64,132 @@ function inspectRun(page: Page) {
   return page.getByRole('button', { name: `Inspect run ${run.uuid}`, exact: true });
 }
 
+test('Node State loads result and usage on selection, manual refresh, and retry', async ({ page }) => {
+  await mockRuntime(page);
+  await page.route(`**${detailPath}`, (route) => route.fulfill({ json: view }));
+  const storageOrigin = 'https://rayflow-archives.example.invalid';
+  const makeArchive = (nodeRun: NodeRun, filename: string, body: object) => ({
+    path: `${detailPath}/node-runs/${nodeRun.uuid}/artifacts/${filename}`,
+    signed: {
+      url: `${storageOrigin}/jobs/${nodeRun.uuid}/${filename}?X-Amz-Security-Token=fixture%2Btoken%3D&X-Amz-Signature=0123456789abcdef`,
+      operation: 'download', headers: {}, expires_at: '2030-01-01T00:00:00Z',
+    },
+    body,
+  });
+  const result = makeArchive(succeeded, 'result.json', { outcome: 'succeed', exit_code: 0, duration_ms: 1250, finished_at: timestamp });
+  const usage = makeArchive(succeeded, 'usage.json', {
+    summary: { sampled_at: timestamp, peak_cpu_millicores: 750, peak_memory_usage_bytes: 536_870_912 },
+  });
+  const archives = [result, usage, makeArchive(pending, 'result.json', { outcome: 'yield', exit_code: 0 }), makeArchive(pending, 'usage.json', {})];
+  let usageReady = false;
+  let usageDownloadFails = true;
+  let resultRequests = 0;
+  let usageRequests = 0;
+  for (const archive of archives) {
+    await page.route(`**${archive.path}`, (route) => {
+      if (archive === result) resultRequests += 1;
+      if (archive === usage) usageRequests += 1;
+      return route.fulfill({ json: archive === usage && !usageReady ? null : archive.signed });
+    });
+  }
+  await page.route((url) => url.origin === storageOrigin, (route) => {
+    const headers = { 'Access-Control-Allow-Origin': '*' };
+    const archive = archives.find(({ signed }) => signed.url === route.request().url());
+    if (!archive) return route.fulfill({ headers, status: 403 });
+    if (archive === usage && usageDownloadFails) return route.fulfill({ headers, status: 503 });
+    return route.fulfill({ headers, json: archive.body });
+  });
+
+  await page.clock.install();
+  await selectWorkflow(page);
+  await inspectRun(page).click();
+  const canvas = page.getByTestId('flow-canvas');
+  const graphPanel = page.locator('.runtime-canvas .canvas-panel');
+  await expect(graphPanel).toBeVisible();
+  const initialHeight = (await graphPanel.boundingBox())!.height;
+  const [download] = await Promise.all([
+    page.waitForRequest((request) => new URL(request.url()).origin === storageOrigin),
+    canvas.getByText(prepare.name, { exact: true }).click(),
+  ]);
+  expect(download.url()).toBe(result.signed.url);
+  expect(download.method()).toBe('GET');
+  const headers = await download.allHeaders();
+  expect(headers['x-rayflow-request']).toBeUndefined();
+  expect(headers.referer).toBeUndefined();
+  const resultPanel = page.getByRole('region', { name: 'Result' });
+  const usagePanel = page.getByRole('region', { name: 'Usage' });
+  await expect(resultPanel.getByText('Succeeded', { exact: true })).toBeVisible();
+  await expect(resultPanel.getByText('1.25 s', { exact: true })).toBeVisible();
+  await expect(usagePanel).toContainText('Usage has not been archived.');
+
+  usageReady = true;
+  await page.clock.fastForward(20_000);
+  await expect(usagePanel).toContainText('Usage has not been archived.');
+  expect([resultRequests, usageRequests]).toEqual([1, 1]);
+  await Promise.all([
+    page.waitForResponse((response) => response.url() === result.signed.url),
+    page.getByRole('button', { name: 'Refresh', exact: true }).click(),
+  ]);
+  const usageError = usagePanel.getByRole('alert');
+  await expect(usageError).toContainText('Archive download failed (HTTP 503).');
+  await expect(resultPanel.getByText('Succeeded', { exact: true })).toBeVisible();
+  expect([resultRequests, usageRequests]).toEqual([2, 2]);
+
+  usageDownloadFails = false;
+  await usageError.getByRole('button', { name: 'Try again' }).click();
+  await expect(usagePanel).toContainText('0.75 cores');
+  await expect(usagePanel).toContainText('512 MiB');
+  expect([resultRequests, usageRequests]).toEqual([2, 3]);
+  expect((await graphPanel.boundingBox())!.height).toBeCloseTo(initialHeight, 1);
+  const inspector = page.getByRole('complementary').filter({ hasText: 'NODE STATE' });
+  const scrollTop = await inspector.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    return element.scrollTop;
+  });
+  expect(scrollTop).toBeGreaterThan(0);
+
+  await canvas.getByText(process.name, { exact: true }).click();
+  await expect(resultPanel.getByText('Yielded', { exact: true })).toBeVisible();
+  await expect(usagePanel).toContainText('No usage samples were recorded.');
+  await expect(usagePanel).not.toContainText('512 MiB');
+});
+
+test('Node State matches the Execution Graph height on desktop and the panel meets the footer', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1400 });
+  await mockRuntime(page);
+  await page.route(`**${detailPath}`, (route) => route.fulfill({ json: view }));
+  await selectWorkflow(page);
+  await inspectRun(page).click();
+
+  const panel = page.locator('.runtime-canvas').filter({ hasText: 'Execution graph' });
+  const footer = page.getByRole('contentinfo').filter({ hasText: 'Workflow console' });
+  await expect(panel).toBeVisible();
+  await expect(footer).toBeVisible();
+  const graph = (await panel.locator('.canvas-panel').boundingBox())!;
+  const inspector = (await panel.getByRole('complementary').boundingBox())!;
+  expect(inspector.x).toBeCloseTo(graph.x + graph.width, 1);
+  expect(inspector.y).toBeCloseTo(graph.y, 1);
+  expect(inspector.height).toBeCloseTo(graph.height, 1);
+  const desktopPanel = (await panel.boundingBox())!;
+  const desktopFooter = (await footer.boundingBox())!;
+  expect(desktopPanel.y + desktopPanel.height).toBeCloseTo(desktopFooter.y, 1);
+  expect(desktopFooter.y + desktopFooter.height).toBeCloseTo(1400, 1);
+
+  await page.setViewportSize({ width: 320, height: 844 });
+  const mobileGraph = (await panel.locator('.canvas-panel').boundingBox())!;
+  const mobileInspector = (await panel.getByRole('complementary').boundingBox())!;
+  expect(mobileInspector.y).toBeCloseTo(mobileGraph.y + mobileGraph.height, 1);
+  expect(mobileInspector.width).toBeCloseTo(mobileGraph.width, 1);
+  const mobilePanel = (await panel.boundingBox())!;
+  const mobileFooter = (await footer.boundingBox())!;
+  expect(mobilePanel.y + mobilePanel.height).toBeCloseTo(mobileFooter.y, 1);
+});
+
 declare global {
   interface Window { runDetailSignals: (AbortSignal | null)[] }
 }
 
-test('Inspect requests the run once and keeps refreshing the execution graph', async ({ page }) => {
+test('Inspect loads the execution graph once and updates it on manual refresh', async ({ page }) => {
   const running: RunView = { ...view, node_runs: [[succeeded, prepareResult], [{ ...pending, status: 'Running' }, process]] };
   let response: RunView = view;
   let fail = false;
@@ -101,12 +223,16 @@ test('Inspect requests the run once and keeps refreshing the execution graph', a
   await expect(canvas.getByText('Waiting', { exact: true })).toBeVisible();
 
   response = running;
-  await page.clock.fastForward(5000);
+  await page.clock.fastForward(20_000);
+  await expect(canvas.getByText('Pending', { exact: true })).toBeVisible();
+  expect(await signals()).toEqual([false]);
+  const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+  await refresh.click();
   await expect(canvas.getByText('Running', { exact: true })).toBeVisible();
-  expect(await signals()).toEqual([false, false]);
+  expect(await signals()).toEqual([true, false]);
 
   fail = true;
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await refresh.click();
   const error = page.getByRole('alert');
   await expect(error.getByText('Unable to load run')).toBeVisible();
   expect(await signals()).toHaveLength(3);
@@ -117,8 +243,8 @@ test('Inspect requests the run once and keeps refreshing the execution graph', a
   expect(await signals()).toHaveLength(4);
 
   await page.getByRole('button', { name: 'All runs' }).click();
-  await page.clock.fastForward(5000);
-  expect(await signals()).toHaveLength(4);
+  await page.clock.fastForward(20_000);
+  expect(await signals()).toEqual([true, true, true, true]);
   await inspectRun(page).click();
   await expect(page.getByRole('heading', { name: graph.name })).toBeVisible();
   expect(await signals()).toHaveLength(5);
@@ -142,7 +268,14 @@ test('Runtime shows node run ports and offers eligible node commands', async ({ 
 
   await canvas.getByText(prepare.name, { exact: true }).click();
   await expect(inspector.getByText('#2', { exact: true })).toBeVisible();
-  await expect(inspector.getByRole('button', { name: 'Resume node' })).toBeDisabled();
+  const resumeNode = inspector.getByRole('button', { name: 'Resume node' });
+  const rerunNode = inspector.getByRole('button', { name: 'Rerun node' });
+  await expect(resumeNode).toBeDisabled();
+  const firstDetail = (await inspector.getByText('Type', { exact: true }).boundingBox())!;
+  for (const action of [resumeNode, rerunNode]) {
+    const bounds = (await action.boundingBox())!;
+    expect(bounds.y + bounds.height).toBeLessThan(firstDetail.y);
+  }
   const outputFiles = inspector.getByRole('button', { name: 'View output files', exact: true });
   await outputFiles.click();
   const outputDrawer = page.getByRole('dialog', { name: 'Output files', exact: true });
@@ -151,15 +284,15 @@ test('Runtime shows node run ports and offers eligible node commands', async ({ 
   await expect(outputDrawer).toBeHidden();
   await expect(outputFiles).toBeFocused();
 
-  await inspector.getByRole('button', { name: 'Rerun node' }).click();
+  await rerunNode.click();
   const rerun = page.getByRole('dialog', { name: 'Rerun workflow' });
   await expect(rerun.getByLabel('Start from node')).toHaveValue(prepare.id);
   expect(await submit('/runs/rerun', rerun.getByRole('button', { name: 'Confirm command' }))).toEqual({ ...command, node: prepare.id });
   await expect(rerun).toBeHidden();
 
   await canvas.getByText(process.name, { exact: true }).click();
-  await expect(inspector.getByRole('button', { name: 'Rerun node' })).toBeDisabled();
-  await inspector.getByRole('button', { name: 'Resume node' }).click();
+  await expect(rerunNode).toBeDisabled();
+  await resumeNode.click();
   const resume = page.getByRole('dialog', { name: `Resume ${process.name}?` });
   expect(await submit('/runs/resume', resume.getByRole('button', { name: 'Confirm command' }))).toEqual({ ...command, node: process.id });
   await expect(resume).toBeHidden();

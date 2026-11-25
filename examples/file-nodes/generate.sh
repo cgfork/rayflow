@@ -11,3 +11,5 @@ for output in "$@"; do
     head -c "$size" /dev/zero > "$destination"
     printf 'Generated %s (%s bytes)\n' "$output" "$size"
 done
+
+exercise_resources

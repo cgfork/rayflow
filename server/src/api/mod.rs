@@ -29,6 +29,8 @@
 //!   claim-scoped multipart output operation; the agent transfers bytes directly
 //!   to object storage and acknowledges the catalog through `/job/output/commit`.
 //! * `GET  /runs/graph_state` — read the current state of a run.
+//! * `GET  /runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}` — sign an
+//!   uploaded result or usage archive from the latest job for that node run.
 //! * `POST /runs/{run_id}/files/download` — return the provider's signed download URL
 //!   for a declared file; clients fetch the returned URL directly.
 //! * `POST /users/resolve` — look up display names for user IDs.

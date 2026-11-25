@@ -1,13 +1,14 @@
 //! Run commands and state endpoints.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use catalog::{PresignedUrl, model::Catalog};
 use graph::GraphStore;
 use graph::types::DAG;
+use scheduler::JobArtifactName;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,6 +24,10 @@ where
     Router::new()
         .route("/runs", get(list_runs::<S>))
         .route("/runs/{run_id}", get(inspect_run::<S>))
+        .route(
+            "/runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}",
+            get(presign_job_artifact::<S>),
+        )
         .route("/runs/start", post(start_run::<S>))
         .route("/runs/rerun", post(rerun_run::<S>))
         .route("/runs/upgrade", post(upgrade_run::<S>))
@@ -61,6 +66,16 @@ where
     S::Err: Send + Sync + 'static,
 {
     app.inspect_run_at(id, query.revision).await.map(Json)
+}
+
+async fn presign_job_artifact<S>(
+    State(app): State<App<S>>,
+    Path((run_id, node_run_id, filename)): Path<(Uuid, Uuid, JobArtifactName)>,
+) -> Result<impl IntoResponse, AppError> {
+    let download = app
+        .presign_run_job_artifact(run_id, node_run_id, filename)
+        .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(download)))
 }
 
 /// Request body for `POST /runs/start`.
