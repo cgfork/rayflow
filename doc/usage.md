@@ -703,11 +703,14 @@ the terminal action and the server acknowledgment in `completion.json`.
 It archives the final `result.json` and `usage.json` through
 `/api/v1/job/result/prepare`, the returned presigned PUT, and
 `/api/v1/job/result/commit`. The archive uploads retry independently of job
-completion. The manager writes each `.upload` receipt after the server confirms
-the archive commit. Its periodic cleanup removes the stopped container,
-checkpoints, staged inputs and outputs, and metadata once the terminal
-acknowledgment and both archive receipts are present. `cleanup-ready.json`
-lets cleanup resume after an interruption.
+completion. The agent shares four concurrent archive uploads across both files
+and delays retries on failure. A server response indicating that storage is
+disabled pauses archive requests for 30 seconds. The manager writes each
+`.upload` receipt after the server confirms the expected catalog UUID.
+The usage monitor removes the stopped container after saving `usage.json`.
+Periodic cleanup removes checkpoints, staged inputs and outputs, and metadata
+once the terminal acknowledgment and both archive receipts are present.
+`cleanup-ready.json` lets cleanup resume after an interruption.
 
 Migration 24 generalizes `job_result` to `job_artifact` and retains existing
 catalog associations under `result.json`. Polling records ownership in the

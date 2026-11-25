@@ -10,6 +10,13 @@ pub enum Error {
     Docker(#[from] bollard::errors::Error),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    #[error("unexpected HTTP status {0}")]
+    UnexpectedStatus(reqwest::StatusCode),
+    #[error("archive commit acknowledged catalog {actual}, expected {expected}")]
+    CatalogMismatch {
+        expected: uuid::Uuid,
+        actual: uuid::Uuid,
+    },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("job claim lost: {0}")]

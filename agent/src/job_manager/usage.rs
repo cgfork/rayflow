@@ -170,8 +170,7 @@ where
     async fn advance_usage(&self, job_id: Uuid, summaries: &Semaphore) -> Result<(), Error> {
         let job_dir = self.job_dir(job_id);
         let usage_path = job_dir.join(JobArtifactName::Usage.as_str());
-        if fs::try_exists(job_dir.join("usage.json.upload")).await?
-            || fs::try_exists(job_dir.join(CLEANUP_FILE)).await?
+        if fs::try_exists(job_dir.join(CLEANUP_FILE)).await?
             || !fs::try_exists(job_dir.join("job.json")).await?
         {
             return Ok(());
@@ -198,11 +197,21 @@ where
                 }
             };
             let _lock = self.lock_job(job_id).await?;
-            if fs::try_exists(&result_path).await? && !fs::try_exists(&usage_path).await? {
+            if !fs::try_exists(&result_path).await? {
+                return Ok(());
+            }
+            if !fs::try_exists(&usage_path).await? {
                 write_json(&usage_path, &JobUsage { summary }).await?;
             }
         }
-        if self.upload_artifact(job_id, JobArtifactName::Usage).await? {
+        if let Err(error) = self.reclaim_container(job_id).await
+            && !is_not_found(&error)
+        {
+            tracing::warn!(%job_id, %error, "could not reclaim stopped container");
+        }
+        if !fs::try_exists(job_dir.join("usage.json.upload")).await?
+            && self.upload_artifact(job_id, JobArtifactName::Usage).await?
+        {
             self.inner.lifecycle_changed.notify_one();
         }
         Ok(())

@@ -813,6 +813,7 @@ async fn usage_includes_a_sample_received_after_the_result_is_saved() {
     let job = workflow.claim("fixture-image", "sleep 30");
     let dir = workflow.job_dir(job.uuid);
     manager.start(job.clone()).await;
+    let container = provider.container(&format!("rayflow-{}", job.uuid));
 
     let sample = example_usage();
     let opened = Arc::new(Notify::new());
@@ -837,10 +838,32 @@ async fn usage_includes_a_sample_received_after_the_result_is_saved() {
         let result = manager.result(job.uuid).await.unwrap().unwrap();
         assert_outcome(&result, JobOutcome::Terminated);
         assert!(!dir.join("usage.json").exists());
+        assert!(matches!(
+            container.inspect().await.unwrap(),
+            ContainerState::Exited { .. }
+        ));
         release.notify_one();
-        read_usage(&dir).await
+        let usage = read_usage(&dir).await;
+        loop {
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.join("container.json")).await.unwrap())
+                    .unwrap();
+            assert_eq!(metadata["id"], container.id());
+            if metadata["removed"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        usage
     })
     .await;
+    assert_eq!(
+        container.inspect().await.unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(dir.join("result.json").exists());
+    assert!(dir.join("usage.json").exists());
+    assert!(!dir.join("usage.json.upload").exists());
     assert_eq!(usage.summary.unwrap().latest, sample);
 }
 

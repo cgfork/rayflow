@@ -17,7 +17,7 @@ use scheduler::{Job, JobArtifactName};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     fs,
-    sync::{Mutex as AsyncMutex, Notify},
+    sync::{Mutex as AsyncMutex, Notify, Semaphore},
     time::{self, Instant, MissedTickBehavior},
 };
 use uuid::Uuid;
@@ -41,6 +41,8 @@ pub use usage::{JobUsage, Usage, UsagePercentiles, UsageSummary};
 
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_ARCHIVE_UPLOADS: usize = 4;
+const CONTAINER_FILE: &str = "container.json";
 
 /// The terminal action reported to the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +101,8 @@ impl JobResult {
 struct JobContainer {
     r#type: String,
     id: String,
+    #[serde(default)]
+    removed: bool,
 }
 
 /// The outcome to record when explicitly stopping a job.
@@ -114,6 +118,8 @@ struct Inner<C, R> {
     graph_store: R,
     client: Client,
     transfer: JobTransfer,
+    archive_slots: Semaphore,
+    archive_retry_after: Mutex<Option<Instant>>,
     _owner: File,
     active: Mutex<HashSet<Uuid>>,
     containers: Mutex<HashMap<String, Uuid>>,
@@ -146,6 +152,8 @@ where
                 graph_store,
                 client,
                 transfer,
+                archive_slots: Semaphore::new(MAX_ARCHIVE_UPLOADS),
+                archive_retry_after: Mutex::default(),
                 _owner: owner,
                 active: Mutex::default(),
                 containers: Mutex::default(),
@@ -629,7 +637,7 @@ where
     }
 
     async fn read_container(&self, job_id: Uuid) -> Result<Option<JobContainer>, Error> {
-        read_optional_json(&self.job_dir(job_id).join("container.json")).await
+        read_optional_json(&self.job_dir(job_id).join(CONTAINER_FILE)).await
     }
 
     async fn find_container(&self, job_id: Uuid) -> Result<Option<JobContainer>, Error> {
@@ -647,8 +655,9 @@ where
         let metadata = JobContainer {
             r#type: self.inner.containerd.name().into(),
             id: container.id().into(),
+            removed: false,
         };
-        write_json(&self.job_dir(job_id).join("container.json"), &metadata).await?;
+        write_json(&self.job_dir(job_id).join(CONTAINER_FILE), &metadata).await?;
         self.inner.usage_changed.notify_one();
         Ok(metadata)
     }

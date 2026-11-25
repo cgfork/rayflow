@@ -85,7 +85,7 @@ impl Client {
             }
             return Err(error.into());
         }
-        Ok(Some(response.json::<Transfer>().await?))
+        Ok(Some(successful_response(response)?.json().await?))
     }
 
     /// Publishes uploaded job metadata.
@@ -96,15 +96,22 @@ impl Client {
         filename: JobArtifactName,
         catalog_uuid: Uuid,
     ) -> Result<(), Error> {
-        self.http
+        let response = self
+            .http
             .post(format!("{}/job/result/commit", self.base_url()))
             .json(&serde_json::json!({
                 "job_id": job_id, "agent_id": agent_id, "filename": filename,
                 "catalog_uuid": catalog_uuid,
             }))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let acknowledged: Uuid = successful_response(response)?.json().await?;
+        if acknowledged != catalog_uuid {
+            return Err(Error::CatalogMismatch {
+                expected: catalog_uuid,
+                actual: acknowledged,
+            });
+        }
         Ok(())
     }
 
@@ -143,7 +150,8 @@ impl Client {
             .json(&body)
             .send()
             .await?;
-        claimed_response(response, job_id)?;
+        // The output commit returns the published file UUID.
+        claimed_response(response, job_id)?.json::<Uuid>().await?;
         Ok(())
     }
 
@@ -353,10 +361,7 @@ impl Client {
             .json(&serde_json::json!({ "job_id": job_id, "agent_id": agent_id }))
             .send()
             .await?;
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            return Err(Error::ClaimLost(job_id));
-        }
-        response.error_for_status()?;
+        claimed_response(response, job_id)?;
         Ok(())
     }
 }
@@ -367,7 +372,15 @@ fn claimed_response(response: reqwest::Response, job_id: Uuid) -> Result<reqwest
     if response.status() == reqwest::StatusCode::CONFLICT {
         return Err(Error::ClaimLost(job_id));
     }
-    Ok(response.error_for_status()?)
+    successful_response(response)
+}
+
+fn successful_response(response: reqwest::Response) -> Result<reqwest::Response, Error> {
+    let response = response.error_for_status()?;
+    if !response.status().is_success() {
+        return Err(Error::UnexpectedStatus(response.status()));
+    }
+    Ok(response)
 }
 
 impl GraphStore<Uuid> for Client {

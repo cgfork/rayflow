@@ -83,6 +83,8 @@ struct ArtifactTraffic {
     prepared_size: Option<u64>,
     uploaded: bool,
     upload_failure: Option<StatusCode>,
+    commit_error: Option<StatusCode>,
+    wrong_commit_catalog: Option<Uuid>,
     lose_commit_reply: bool,
 }
 
@@ -94,8 +96,7 @@ struct Traffic {
     graph_requests: usize,
     fail_graph: bool,
     prepare_error: Option<(StatusCode, &'static str)>,
-    fail_action: bool,
-    conflict_action: bool,
+    action_error: Option<StatusCode>,
     output_prepare_error: Option<StatusCode>,
     output_commit_error: Option<StatusCode>,
     output_committed: bool,
@@ -220,17 +221,24 @@ async fn commit(
     State(fixture): State<Arc<Fixture>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> StatusCode {
+) -> impl IntoResponse {
     fixture.claim(&headers, &body);
     let filename = serde_json::from_value(body["filename"].clone()).unwrap();
-    assert_eq!(body["catalog_uuid"], json!(fixture.catalog_id(filename)));
+    let catalog_id = fixture.catalog_id(filename);
+    assert_eq!(body["catalog_uuid"], json!(catalog_id));
     let mut traffic = fixture.traffic.lock().unwrap();
     let traffic = traffic.record(filename, "commit");
+    if let Some(status) = traffic.commit_error.take() {
+        return status.into_response();
+    }
+    if let Some(id) = traffic.wrong_commit_catalog.take() {
+        return Json(id).into_response();
+    }
     traffic.uploaded = true;
     if std::mem::take(&mut traffic.lose_commit_reply) {
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
     } else {
-        StatusCode::OK
+        Json(catalog_id).into_response()
     }
 }
 
@@ -249,13 +257,10 @@ async fn action(
         );
     }
     traffic.calls.push(action);
-    if std::mem::take(&mut traffic.fail_action) {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else if traffic.conflict_action {
-        StatusCode::CONFLICT
-    } else {
-        StatusCode::NO_CONTENT
-    }
+    traffic
+        .action_error
+        .take()
+        .unwrap_or(StatusCode::NO_CONTENT)
 }
 
 async fn read_graph(State(fixture): State<Arc<Fixture>>) -> impl IntoResponse {
@@ -322,16 +327,16 @@ async fn commit_output(
     State(fixture): State<Arc<Fixture>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> StatusCode {
+) -> impl IntoResponse {
     fixture.claim(&headers, &body);
     assert_eq!(body["catalog_uuid"], json!(fixture.output_catalog_id));
     let mut traffic = fixture.traffic.lock().unwrap();
     traffic.calls.push("output commit".into());
     if let Some(status) = traffic.output_commit_error {
-        return status;
+        return status.into_response();
     }
     traffic.output_committed = true;
-    StatusCode::NO_CONTENT
+    Json(Uuid::new_v4()).into_response()
 }
 
 struct Harness {
@@ -661,10 +666,92 @@ async fn retains_local_files_when_archival_is_disabled_or_unavailable() {
     harness.report(&manager).await.unwrap();
     assert!(result_path.exists());
     assert!(!harness.metadata().join("result.json.upload").exists());
+    assert!(!harness.upload_usage(&manager).await.unwrap());
+    harness.report(&manager).await.unwrap();
     assert_eq!(
         harness.fixture.traffic.lock().unwrap().calls,
         ["succeed", "prepare", "prepare"]
     );
+
+    harness.fixture.traffic.lock().unwrap().prepare_error = None;
+    *manager.inner.archive_retry_after.lock().unwrap() = Some(Instant::now());
+    assert!(harness.upload_usage(&manager).await.unwrap());
+    harness.report(&manager).await.unwrap();
+    assert!(!harness.metadata().exists());
+}
+
+#[tokio::test]
+async fn limits_archive_requests_across_jobs_and_pauses_after_storage_is_disabled() {
+    use super::super::MAX_ARCHIVE_UPLOADS;
+    use tokio::sync::{Semaphore, mpsc};
+
+    let root = tempdir().unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let settings = Settings::new(
+        Uuid::new_v4(),
+        format!("http://{}", listener.local_addr().unwrap()),
+        root.path().join("jobs"),
+        ResourceCapacity {
+            cpu_cores: 1,
+            memory_bytes: 1024,
+        },
+    );
+    let client = Client::new(settings).unwrap();
+    let manager = JobManager::open(NoContainers, client.clone(), client)
+        .await
+        .unwrap();
+    let (arrived, mut requests) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let handler = {
+        let release = release.clone();
+        move || {
+            let arrived = arrived.clone();
+            let release = release.clone();
+            async move {
+                arrived.send(()).unwrap();
+                release.acquire().await.unwrap().forget();
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error_code": "RAYFLOW_STORAGE_UNAVAILABLE"})),
+                )
+            }
+        }
+    };
+    let router = Router::new().route("/api/v1/job/result/prepare", post(handler));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let mut uploads = Vec::new();
+    for _ in 0..MAX_ARCHIVE_UPLOADS {
+        let job_id = Uuid::new_v4();
+        let dir = manager.job_dir(job_id);
+        write_json(&dir.join("result.json"), &JobResult::default())
+            .await
+            .unwrap();
+        write_json(&dir.join("usage.json"), &JobUsage::default())
+            .await
+            .unwrap();
+        uploads.push(manager.upload_artifact(job_id, JobArtifactName::Result));
+        uploads.push(manager.upload_artifact(job_id, JobArtifactName::Usage));
+    }
+    let release_requests = async {
+        for _ in 0..MAX_ARCHIVE_UPLOADS {
+            requests.recv().await.unwrap();
+        }
+        assert!(
+            time::timeout(Duration::from_millis(100), requests.recv())
+                .await
+                .is_err()
+        );
+        release.add_permits(MAX_ARCHIVE_UPLOADS);
+    };
+    let (results, ()) = time::timeout(Duration::from_secs(5), async {
+        tokio::join!(futures_util::future::join_all(uploads), release_requests)
+    })
+    .await
+    .unwrap();
+    assert!(results.into_iter().all(|result| !result.unwrap()));
+    assert!(requests.try_recv().is_err());
+    server.abort();
 }
 
 #[tokio::test]
@@ -722,6 +809,81 @@ async fn redirected_result_upload_is_retried_with_the_same_bytes() {
 }
 
 #[tokio::test]
+async fn requires_archive_commit_acknowledgment_before_cleanup() {
+    let harness = Harness::new("succeed", None).await;
+    let manager = harness.manager().await;
+    harness.report(&manager).await.unwrap();
+    let dir = harness.metadata();
+    assert!(dir.join("result.json.upload").exists());
+
+    harness.fixture.traffic.lock().unwrap().usage.commit_error = Some(StatusCode::FOUND);
+    assert!(matches!(
+        harness.upload_usage(&manager).await,
+        Err(Error::UnexpectedStatus(StatusCode::FOUND))
+    ));
+    harness.report(&manager).await.unwrap();
+    assert!(dir.join("usage.json").exists());
+    assert!(!dir.join("usage.json.upload").exists());
+    assert!(harness.data().join("outputs/result.bin").exists());
+
+    harness
+        .fixture
+        .traffic
+        .lock()
+        .unwrap()
+        .usage
+        .wrong_commit_catalog = Some(harness.fixture.catalog_id);
+    assert!(matches!(
+        harness.upload_usage(&manager).await,
+        Err(Error::CatalogMismatch { .. })
+    ));
+    assert!(!dir.join("usage.json.upload").exists());
+    assert!(harness.upload_usage(&manager).await.unwrap());
+    harness.report(&manager).await.unwrap();
+    assert!(!dir.exists());
+    assert!(!harness.data().exists());
+}
+
+#[tokio::test]
+async fn retries_unacknowledged_output_commits_and_terminal_reports() {
+    let harness = Harness::new("succeed", Some("result.bin")).await;
+    let manager = harness.manager().await;
+    let dir = harness.metadata();
+    let id = harness.fixture.job.uuid;
+    for status in [StatusCode::FOUND, StatusCode::NO_CONTENT] {
+        harness.fixture.traffic.lock().unwrap().output_commit_error = Some(status);
+        assert!(harness.report(&manager).await.is_err());
+        assert!(manager.active_job_ids().contains(&id));
+        assert!(!dir.join(COMPLETION_FILE).exists());
+        assert!(
+            !JobTransfer::outputs_uploaded(&harness.data(), id)
+                .await
+                .unwrap()
+        );
+    }
+
+    {
+        let mut traffic = harness.fixture.traffic.lock().unwrap();
+        traffic.output_commit_error = None;
+        traffic.action_error = Some(StatusCode::FOUND);
+    }
+    assert!(matches!(
+        harness.report(&manager).await,
+        Err(Error::UnexpectedStatus(StatusCode::FOUND))
+    ));
+    assert!(manager.active_job_ids().contains(&id));
+    assert!(!dir.join("result.json.upload").exists());
+    assert!(
+        JobTransfer::outputs_uploaded(&harness.data(), id)
+            .await
+            .unwrap()
+    );
+    harness.report(&manager).await.unwrap();
+    assert!(!manager.active_job_ids().contains(&id));
+    assert!(dir.join("result.json.upload").exists());
+}
+
+#[tokio::test]
 async fn recovers_a_lost_commit_reply_without_uploading_the_result_twice() {
     let harness = Harness::new("fail", None).await;
     harness
@@ -747,7 +909,7 @@ async fn recovers_a_lost_commit_reply_without_uploading_the_result_twice() {
 #[tokio::test]
 async fn retries_a_terminal_action_after_restart_with_the_graph_offline() {
     let harness = Harness::new("succeed", None).await;
-    harness.fixture.traffic.lock().unwrap().fail_action = true;
+    harness.fixture.traffic.lock().unwrap().action_error = Some(StatusCode::SERVICE_UNAVAILABLE);
     let manager = harness.manager().await;
     assert!(harness.report(&manager).await.is_err());
     drop(manager);
@@ -790,7 +952,7 @@ async fn retries_the_initial_graph_read_without_rewriting_a_successful_result() 
 #[tokio::test]
 async fn archives_the_output_validation_failure_even_after_terminal_conflict() {
     let harness = Harness::new("succeed", Some("../invalid")).await;
-    harness.fixture.traffic.lock().unwrap().conflict_action = true;
+    harness.fixture.traffic.lock().unwrap().action_error = Some(StatusCode::CONFLICT);
     let manager = harness.manager().await;
     harness.report(&manager).await.unwrap();
     let traffic = harness.fixture.traffic.lock().unwrap();
@@ -914,4 +1076,40 @@ async fn cleans_shared_metadata_and_data_directory() {
     harness.report(&manager).await.unwrap();
     assert!(harness.fixture.traffic.lock().unwrap().output_committed);
     assert!(!metadata.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resumes_cleanup_after_a_relinked_data_root_is_restored() {
+    let mut harness = Harness::new("succeed", None).await;
+    let data_root = harness.settings.data_dir.clone();
+    harness.settings.data_dir.push("");
+    let manager = harness.manager().await;
+    harness.report(&manager).await.unwrap();
+    assert!(harness.upload_usage(&manager).await.unwrap());
+
+    let original = harness._root.path().join("original-data");
+    let replacement = harness._root.path().join("replacement");
+    let sentinel = replacement.join(harness.fixture.job.uuid.to_string());
+    fs::create_dir_all(&sentinel).await.unwrap();
+    fs::write(sentinel.join("unrelated.txt"), b"unrelated")
+        .await
+        .unwrap();
+    fs::rename(&data_root, &original).await.unwrap();
+    std::os::unix::fs::symlink(&replacement, &data_root).unwrap();
+
+    let error = harness.report(&manager).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(sentinel.join("unrelated.txt").exists());
+    assert!(harness.metadata().join(CLEANUP_FILE).exists());
+    assert!(harness.metadata().join("result.json").exists());
+    drop(manager);
+
+    fs::remove_file(&data_root).await.unwrap();
+    fs::rename(&original, &data_root).await.unwrap();
+    let manager = harness.manager().await;
+    harness.report(&manager).await.unwrap();
+    assert!(sentinel.join("unrelated.txt").exists());
+    assert!(!harness.metadata().exists());
+    assert!(!harness.data().exists());
 }

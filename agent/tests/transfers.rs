@@ -277,7 +277,7 @@ async fn upload_object(
 async fn commit_output(
     State(fixture): State<Arc<Fixture>>,
     Json(request): Json<Commit>,
-) -> StatusCode {
+) -> Json<Uuid> {
     fixture.verify_claim(&request.claim);
     let mut traffic = fixture.traffic.lock().unwrap();
     let upload = traffic.uploads.get(&request.catalog_uuid).unwrap();
@@ -286,7 +286,7 @@ async fn commit_output(
     traffic
         .calls
         .push(format!("commit {}", request.claim.filename));
-    StatusCode::NO_CONTENT
+    Json(Uuid::new_v4())
 }
 
 #[tokio::test]

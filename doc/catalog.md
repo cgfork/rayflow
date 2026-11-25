@@ -360,6 +360,7 @@ the same catalog and requires the same byte size. If `catalog.uploaded` is
 already true, the agent skips PUT and commit and the returned signature permits
 download. Otherwise the agent uploads the exact local bytes using the returned
 URL and headers and commits the catalog UUID after a successful 2xx PUT.
+The archive commit must return a 2xx response with the expected catalog UUID.
 The agent validates and commits required outputs before reporting success.
 It retries the JSON uploads independently and keeps both files across restarts.
 A server without object storage returns `RAYFLOW_STORAGE_UNAVAILABLE`. Pending
