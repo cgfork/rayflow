@@ -284,6 +284,43 @@ test('Node Properties saves Docker arguments and environment entries from the fo
   expect(draft.nodes[0].settings.config).toEqual({ ...config, env: ['DISABLE_FROM_IMAGE', 'MODE=region=eu', 'EMPTY='] });
 });
 
+test('The draft editor saves output kinds and converts legacy multi-file JSON', async ({ page }) => {
+  await mockGraphs(page);
+  let draft = report;
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+  await page.goto(home);
+  await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+
+  await page.getByRole('button', { name: 'Edit JSON' }).click();
+  const editor = page.getByRole('dialog', { name: 'Workflow JSON' });
+  const [node] = draft.nodes;
+  await editor.getByRole('textbox', { name: 'Workflow JSON' }).fill(JSON.stringify({
+    ...draft,
+    nodes: [{
+      ...node,
+      outputs: [
+        { file_name: 'bundle', kind: 'File', multiple: true },
+        { file_name: 'report.json', kind: 'File' },
+      ],
+    }],
+  }));
+  await editor.getByRole('button', { name: 'Apply changes' }).click();
+
+  const inspector = page.getByRole('complementary');
+  await expect(inspector.getByRole('checkbox', { name: 'Multiple files' })).toHaveCount(0);
+  await expect(inspector.getByRole('combobox', { name: 'Output 1 kind' })).toHaveValue('Directory');
+  await expect(inspector.getByRole('combobox', { name: 'Output 2 kind' })).toHaveValue('File');
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].outputs).toEqual([
+    { file_name: 'bundle', kind: 'Directory' },
+    { file_name: 'report.json', kind: 'File' },
+  ]);
+});
+
 test('The draft table shows workflow metadata, row actions, and copyable IDs', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await mockGraphs(page);
@@ -566,7 +603,7 @@ test('Diff shows node and connection changes on the canvas and their before and 
   const [load, plan, review, obsolete, archive] = graph(cleanup.id, cleanup.name, 0, [
     'Load inventory', 'List candidates', 'Review candidates', 'Remove expired records', 'Clean archive',
   ]).nodes;
-  const inventory: GraphNode = { ...load, outputs: [{ file_name: 'inventory.json', kind: 'File', multiple: false }] };
+  const inventory: GraphNode = { ...load, outputs: [{ file_name: 'inventory.json', kind: 'File' }] };
   const beforePlan: GraphNode = {
     ...plan,
     settings: {
@@ -580,7 +617,7 @@ test('Diff shows node and connection changes on the canvas and their before and 
     name: 'Plan cleanup',
     settings: { config: { image: 'alpine', command: ['run'] }, resource: { cpu_cores: 2, memory_bytes: 1024 }, timeout: '20s' },
     inputs: [{ ...beforePlan.inputs[0], required: false }],
-    outputs: [{ file_name: 'summary.txt', kind: 'File', multiple: false }],
+    outputs: [{ file_name: 'summary.txt', kind: 'File' }],
   };
   const before: Graph = {
     ...olderCleanup, node_count: 4, nodes: [inventory, beforePlan, review, obsolete],

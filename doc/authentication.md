@@ -98,10 +98,12 @@ ten-second deadline.
 For Active Directory, a filter could be
 `(&(objectClass=user)(sAMAccountName={username})(memberOf=CN=Rayflow Users,OU=Groups,DC=example,DC=com))`.
 This checks direct group membership; customize it to your directory policy.
-`ldap://` always requires StartTLS before any bind; `ldaps://` uses TLS immediately.
-Certificate verification is always enabled. Install your company's CA in the
-server's certificate trust store if needed. LDAP identities use the configured
-URL and entry DN; renaming an entry changes its Rayflow identity.
+`ldap://` uses StartTLS by default. To connect to a plain LDAP endpoint, set
+`auth.ldap.start_tls: false` or `RAYFLOW_AUTH__LDAP__START_TLS=false`. This sends
+LDAP credentials in cleartext. `ldaps://` always uses TLS from the start of the
+connection. TLS connections verify the directory certificate. Install your
+company's CA in the server's certificate trust store if needed. LDAP identities
+use the configured URL and entry DN. Renaming an entry changes its Rayflow identity.
 
 ## Local accounts
 

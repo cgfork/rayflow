@@ -40,7 +40,7 @@ function nodeRun(id: number, uuid: string, node: GraphNode, revision: number, st
 
 const succeeded = nodeRun(1, 'fc000001-0000-4000-8000-000000000001', prepare, 2, 'Succeeded');
 const pending = nodeRun(2, 'fc000002-0000-4000-8000-000000000002', process, 3, 'Pending');
-const prepareResult = { ...prepare, outputs: [{ file_name: 'prepared.json', kind: 'File' as const, multiple: false }] };
+const prepareResult = { ...prepare, outputs: [{ file_name: 'prepared.json', kind: 'File' as const }] };
 const view: RunView = { run, graph, node_runs: [[succeeded, prepareResult], [pending, process]] };
 
 async function mockRuntime(page: Page) {
@@ -341,7 +341,7 @@ test('Node file drawers align to the inspector and preserve download eligibility
   await mockRuntime(page);
   const fileName = 'warehouse counts.csv';
   const otherFile = 'warehouse manifest.json';
-  const pendingOutputs = Array.from({ length: 24 }, (_, index) => ({ file_name: `report-${index + 1}.json`, kind: 'File' as const, multiple: false }));
+  const pendingOutputs = Array.from({ length: 24 }, (_, index) => ({ file_name: `report-${index + 1}.json`, kind: 'File' as const }));
   const inputNode = { ...process, inputs: [
     { file_name: fileName, source: 'prepare.counts.csv', required: true, format: 'csv' },
     { file_name: otherFile, source: 'prepare.manifest.json', required: false, format: 'json' },

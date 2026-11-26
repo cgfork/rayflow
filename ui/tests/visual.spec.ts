@@ -41,8 +41,8 @@ const inputFiles = [
   { file_name: 'warehouse manifest.json', source: 'collect.manifest.json', required: true, format: 'json' },
 ];
 const outputFiles = [
-  { file_name: 'validated warehouse counts.csv', kind: 'File' as const, multiple: false },
-  { file_name: 'reconciliation manifest.json', kind: 'File' as const, multiple: false },
+  { file_name: 'validated warehouse counts.csv', kind: 'File' as const },
+  { file_name: 'reconciliation manifest.json', kind: 'File' as const },
 ];
 const nodesWithFiles = [{ ...published.nodes[0], outputs: outputFiles }, { ...published.nodes[1], inputs: inputFiles }, published.nodes[2]];
 const runView: RunView = {

@@ -382,7 +382,6 @@ impl Harness {
                     vec![Output {
                         file_name: filename.into(),
                         kind: graph::types::Kind::File,
-                        multiple: false,
                     }]
                 } else {
                     vec![]

@@ -46,7 +46,7 @@ interface GraphComparison {
 
 const nodeFields: Record<string, string> = {
   id: 'Node ID', name: 'Name', node_type: 'Node type', file_name: 'File name',
-  source: 'Source', required: 'Required', format: 'Format', kind: 'Kind', multiple: 'Multiple',
+  source: 'Source', required: 'Required', format: 'Format', kind: 'Kind',
   cpu_cores: 'CPU cores', memory_bytes: 'Memory (bytes)',
 };
 

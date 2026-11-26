@@ -224,7 +224,7 @@ impl JobTransfer {
         let root = data_dir.join("outputs");
         for output in &node.outputs {
             let path = safe_existing(&root, &output.file_name).await?;
-            if output.kind == Kind::Directory || output.multiple {
+            if output.kind == Kind::Directory {
                 let manifest = directory_manifest(&path).await?;
                 let bytes = serde_json::to_vec(&manifest)?;
                 if bytes.len() as u64 > MAX_MANIFEST_BYTES {

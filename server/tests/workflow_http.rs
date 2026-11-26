@@ -146,12 +146,10 @@ fn workflow() -> DAG {
     nodes[0].outputs.push(Output {
         file_name: "result.txt".into(),
         kind: Kind::File,
-        multiple: false,
     });
     nodes[0].outputs.push(Output {
         file_name: "report".into(),
         kind: Kind::Directory,
-        multiple: false,
     });
     nodes[1].inputs.push(Input {
         file_name: "input.txt".into(),
@@ -860,7 +858,6 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
         graph.nodes[0].outputs.push(Output {
             file_name: "result.json".into(),
             kind: Kind::File,
-            multiple: false,
         });
         request(
             &app, Method::PUT, &format!("/graphs/{graph_id}/draft"),

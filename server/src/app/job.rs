@@ -20,12 +20,8 @@ use uuid::Uuid;
 
 use super::{App, AppError, Page, PageQuery};
 
-fn is_directory_output(output: &Output) -> bool {
-    output.kind == Kind::Directory || output.multiple
-}
-
 pub(super) fn output_catalog_filename(output: &Output) -> Cow<'_, str> {
-    if is_directory_output(output) {
+    if output.kind == Kind::Directory {
         format!("{}/{DIRECTORY_MANIFEST}", output.file_name).into()
     } else {
         output.file_name.as_str().into()
@@ -71,7 +67,7 @@ impl<S> App<S> {
             .ok_or(AppError::NodeNotFound(node_run.node_id))?;
         if !node.data.outputs.iter().any(|output| {
             output.file_name == filename
-                || (is_directory_output(output)
+                || (output.kind == Kind::Directory
                     && filename
                         .strip_prefix(output.file_name.as_str())
                         .is_some_and(|suffix| suffix.starts_with('/')))
@@ -417,7 +413,7 @@ impl<S> App<S> {
             return Err(AppError::ArtifactNotFound(filename));
         }
         let filename = match member_suffix {
-            Some(suffix) if is_directory_output(output) => {
+            Some(suffix) if output.kind == Kind::Directory => {
                 format!("{}/{suffix}", output.file_name).into()
             }
             Some(_) => return Err(AppError::ArtifactNotFound(filename)),

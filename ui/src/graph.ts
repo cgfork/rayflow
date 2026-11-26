@@ -1,5 +1,5 @@
 import { randomUUID } from './uuid';
-import type { Graph, GraphNode, NodeSettings } from './types';
+import type { Graph, GraphNode, NodeSettings, Output } from './types';
 
 const utf8 = new TextEncoder();
 
@@ -23,7 +23,18 @@ export function createNode(name: string): GraphNode {
 }
 
 export function normalizeGraph(graph: Graph): Graph {
-  return { ...graph, node_count: graph.nodes.length, nodes: graph.nodes.map((node) => ({ ...node, settings: node.settings ?? { config: {}, resource: { cpu_cores: 0, memory_bytes: 0 }, timeout: '0s' } })) };
+  return {
+    ...graph,
+    node_count: graph.nodes.length,
+    nodes: graph.nodes.map((node) => ({
+      ...node,
+      settings: node.settings ?? { config: {}, resource: { cpu_cores: 0, memory_bytes: 0 }, timeout: '0s' },
+      outputs: node.outputs.map(({ file_name, kind, multiple }: Output & { multiple?: boolean }) => ({
+        file_name,
+        kind: multiple === true ? 'Directory' : kind,
+      })),
+    })),
+  };
 }
 
 export function upstreamIds(graph: Graph, nodeId: string): Set<string> {
