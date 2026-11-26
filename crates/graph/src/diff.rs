@@ -5,6 +5,35 @@ use std::{
 
 use crate::{Diff, Graph};
 
+impl Diff for uuid::Uuid {
+    type Item = ();
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self != other).then_some(())
+    }
+}
+
+impl Diff for String {
+    type Item = ();
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self != other).then_some(())
+    }
+}
+
+impl<T: Diff> Diff for Vec<T> {
+    type Item = ();
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        (self.len() != other.len()
+            || self
+                .iter()
+                .zip(other)
+                .any(|(left, right)| left.diff(right).is_some()))
+        .then_some(())
+    }
+}
+
 /// Structural differences from `self` to `other`, ignoring graph metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphDiff<NodeDiff, NodeId> {

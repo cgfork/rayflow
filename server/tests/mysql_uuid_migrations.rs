@@ -101,6 +101,7 @@ async fn assert_migrated(db: &mut Db) {
     assert!(!node_config.uuid.is_nil());
     assert_eq!(run_config.annotation.0["label"], "original");
     assert_eq!(node_config.config["image"], "example");
+    assert_eq!(node_config.name, "default");
     assert_eq!(run_config.created_by, "creator");
     assert_eq!(run_config.updated_by, "updater");
     assert_eq!(node_config.created_by, "creator");
@@ -153,7 +154,10 @@ async fn job_artifact_migration_preserves_prepared_result_catalogs() {
         .await
         .unwrap();
 
-    assert_eq!(initialize(&url).await.unwrap().applied(), 1);
+    assert_eq!(
+        initialize(&url).await.unwrap().applied(),
+        MIGRATIONS.migrations().len() - 23
+    );
     // Simulate the ALTER committing before its migration ID is recorded.
     sql::statement("DELETE FROM __toasty_migrations WHERE id = 24")
         .exec(&mut db)
@@ -164,6 +168,141 @@ async fn job_artifact_migration_preserves_prepared_result_catalogs() {
         .bind(JOB_UUID).bind(owner).bind(catalog).column_types([toasty::stmt::Type::U64])
         .exec(&mut db).await.unwrap();
     assert_eq!(preserved.len(), 1);
+    cleanup(&url, &mut db).await;
+}
+
+#[tokio::test]
+async fn run_config_migration_keeps_one_snapshot_per_run_and_preserves_job_references() {
+    let Some((url, mut db)) = legacy_database().await else {
+        return;
+    };
+    MigrationSet::new(&MIGRATIONS.migrations()[..24])
+        .apply(&db)
+        .await
+        .unwrap();
+    let original = RunConfig::filter_by_id(33).get(&mut db).await.unwrap();
+    let run_id = original.run_id.unwrap();
+    let latest_id = Uuid::new_v4();
+    sql::statement("INSERT INTO run_config (uuid, run_id, annotation) VALUES (?, ?, '{}')")
+        .bind(latest_id)
+        .bind(run_id)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let legacy_unattached = Uuid::new_v4();
+    sql::statement("INSERT INTO run_config (uuid, annotation) VALUES (?, '{}')")
+        .bind(legacy_unattached)
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let existing_timestamps = timestamps(&mut db).await;
+
+    assert_eq!(
+        initialize(&url).await.unwrap().applied(),
+        MIGRATIONS.migrations().len() - 24
+    );
+    sql::statement("DELETE FROM __toasty_migrations WHERE id = 25")
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(initialize(&url).await.unwrap().applied(), 1);
+    assert_eq!(timestamps(&mut db).await, existing_timestamps);
+
+    let latest = RunConfig::filter_by_run_id(run_id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(latest.uuid, latest_id);
+    for uuid in [original.uuid, legacy_unattached] {
+        let config = RunConfig::filter_by_uuid(uuid).get(&mut db).await.unwrap();
+        assert_eq!(config.run_id, None);
+    }
+    assert_migrated(&mut db).await;
+    assert!(
+        sql::statement("INSERT INTO run_config (uuid, run_id, annotation) VALUES (?, ?, '{}')")
+            .bind(Uuid::new_v4())
+            .bind(run_id)
+            .exec(&mut db)
+            .await
+            .is_err()
+    );
+    sql::statement("INSERT INTO run_config (uuid, annotation) VALUES (?, '{}')")
+        .bind(Uuid::new_v4())
+        .exec(&mut db)
+        .await
+        .unwrap();
+    cleanup(&url, &mut db).await;
+}
+
+#[tokio::test]
+async fn node_config_migration_preserves_legacy_configs_and_allows_named_versions() {
+    let Some((url, mut db)) = legacy_database().await else {
+        return;
+    };
+    MigrationSet::new(&MIGRATIONS.migrations()[..25])
+        .apply(&db)
+        .await
+        .unwrap();
+    let existing_uuids = config_uuids(&mut db).await;
+    let existing_timestamps = timestamps(&mut db).await;
+
+    assert_eq!(
+        initialize(&url).await.unwrap().applied(),
+        MIGRATIONS.migrations().len() - 25
+    );
+    assert_eq!(config_uuids(&mut db).await, existing_uuids);
+    assert_eq!(timestamps(&mut db).await, existing_timestamps);
+    assert_migrated(&mut db).await;
+    let legacy = NodeConfig::filter_by_id(22).get(&mut db).await.unwrap();
+
+    let insert = |node_id: Uuid, version: u64, name: &str| {
+        sql::statement("INSERT INTO node_config (uuid, node_id, version, name, config) VALUES (?, ?, ?, ?, '{}')")
+            .bind(Uuid::new_v4()).bind(node_id).bind(version).bind(name)
+    };
+    for (node_id, version, name) in [
+        (legacy.node_id, legacy.version, "large"),
+        (legacy.node_id, legacy.version, "Large"),
+        (legacy.node_id, legacy.version + 1, "large"),
+        (Uuid::new_v4(), legacy.version, "large"),
+    ] {
+        insert(node_id, version, name).exec(&mut db).await.unwrap();
+    }
+    for name in ["default", "large"] {
+        assert!(
+            insert(legacy.node_id, legacy.version, name)
+                .exec(&mut db)
+                .await
+                .is_err()
+        );
+    }
+    let defaulted_id = Uuid::new_v4();
+    sql::statement("INSERT INTO node_config (uuid, node_id, config) VALUES (?, ?, '{}')")
+        .bind(defaulted_id)
+        .bind(Uuid::new_v4())
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(
+        NodeConfig::filter_by_uuid(defaulted_id)
+            .get(&mut db)
+            .await
+            .unwrap()
+            .name,
+        "default"
+    );
+
+    // The DDL can commit before Toasty records the migration.
+    sql::statement("DELETE FROM __toasty_migrations WHERE id = 26")
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(initialize(&url).await.unwrap().applied(), 1);
+    let named =
+        NodeConfig::filter_by_node_id_and_version_and_name(legacy.node_id, legacy.version, "large")
+            .get(&mut db)
+            .await
+            .unwrap();
+    assert_eq!(named.name, "large");
     cleanup(&url, &mut db).await;
 }
 

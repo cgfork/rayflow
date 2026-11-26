@@ -118,6 +118,16 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "job_artifact",
         include_str!("../migrations/0024_job_artifact.sql"),
     ),
+    MigrationFile::new(
+        25,
+        "unique_run_config",
+        include_str!("../migrations/0025_unique_run_config.sql"),
+    ),
+    MigrationFile::new(
+        26,
+        "named_node_config",
+        include_str!("../migrations/0026_named_node_config.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

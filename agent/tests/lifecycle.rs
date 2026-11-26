@@ -149,6 +149,7 @@ impl Workflow {
             uuid: Uuid::new_v4(),
             node_id: self.node_run.node_id,
             version: self.run.version,
+            name: "default".into(),
             annotation_match: String::new(),
             config: json!({"image": image, "command": ["/bin/sh", "-c", command]}),
             lease: Some(30_000),
@@ -636,12 +637,25 @@ async fn recovering_an_expired_unrecorded_container_keeps_its_identity_for_clean
     job.expired_at = Some(Timestamp::now());
     let dir = workflow.job_dir(job.uuid);
     fs::create_dir(&dir).await.unwrap();
-    fs::write(dir.join("job.json"), serde_json::to_vec(&job).unwrap())
-        .await
-        .unwrap();
+    let mut persisted = serde_json::to_value(&job).unwrap();
+    persisted["node_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("name");
+    fs::write(
+        dir.join("job.json"),
+        serde_json::to_vec(&persisted).unwrap(),
+    )
+    .await
+    .unwrap();
     provider.create(provider.spec(&job).unwrap()).await.unwrap();
 
-    manager.start(recover_job(&manager, job.uuid).await).await;
+    let recovered = recover_job(&manager, job.uuid).await;
+    assert_eq!(
+        recovered.node_config.get().as_ref().unwrap().name,
+        "default"
+    );
+    manager.start(recovered).await;
 
     assert!(dir.join("container.json").exists());
     let result = manager.result(job.uuid).await.unwrap().unwrap();

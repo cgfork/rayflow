@@ -93,29 +93,32 @@ impl<S> App<S> {
         tx.publish(graph_id, actor).await?;
         let graph = tx.load(graph_id, None).await?;
         for node in &graph.nodes {
-            if graph.updated_at.checked_add(node.settings.timeout).is_err()
-                || graph.updated_at.checked_sub(node.settings.timeout).is_err()
-            {
-                return Err(AppError::InvalidRequest(format!(
-                    "{}: timeout is outside timestamp range",
-                    node.name
-                )));
+            for settings in node.settings.named_settings() {
+                if graph.updated_at.checked_add(settings.timeout).is_err()
+                    || graph.updated_at.checked_sub(settings.timeout).is_err()
+                {
+                    return Err(AppError::InvalidRequest(format!(
+                        "{}: timeout is outside timestamp range",
+                        node.name
+                    )));
+                }
+                NodeConfig::create()
+                    .uuid(Uuid::new_v4())
+                    .node_id(node.id)
+                    .version(graph.version)
+                    .name(settings.name)
+                    .annotation_match(settings.annotation_match)
+                    .config(settings.config.clone())
+                    .lease(settings.timeout_ms())
+                    .required_cpu_cores(settings.resource.cpu_cores)
+                    .required_memory_bytes(settings.resource.memory_bytes)
+                    .created_at(graph.created_at)
+                    .updated_at(graph.updated_at)
+                    .created_by(actor.to_owned())
+                    .updated_by(actor.to_owned())
+                    .exec(&mut tx)
+                    .await?;
             }
-            NodeConfig::create()
-                .uuid(Uuid::new_v4())
-                .node_id(node.id)
-                .version(graph.version)
-                .annotation_match(String::new())
-                .config(node.settings.config.clone())
-                .lease(node.settings.timeout_ms())
-                .required_cpu_cores(node.settings.resource.cpu_cores)
-                .required_memory_bytes(node.settings.resource.memory_bytes)
-                .created_at(graph.created_at)
-                .updated_at(graph.updated_at)
-                .created_by(actor.to_owned())
-                .updated_by(actor.to_owned())
-                .exec(&mut tx)
-                .await?;
         }
         tx.commit().await?;
         Ok(graph)

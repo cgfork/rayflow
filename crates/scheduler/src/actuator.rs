@@ -1,15 +1,17 @@
 //! Consumes runtime logs and materializes jobs from logical tasks.
 use crate::Error;
 use event::{Emit, command::CommandEntry, task::Task, task_event::TaskEventEntry};
+use graph::types::DEFAULT_NODE_CONFIG_NAME;
 use graph::{ForkPoint, GraphStore};
 use jiff::Timestamp;
-pub use runtime::command::CommandResult;
+pub use runtime::command::{CommandResult, RunConfig};
 use runtime::{
     backend::Backend,
     command::{NodeRun, Run},
 };
-use std::{collections::HashMap, time::Duration};
-use toasty::{Executor, Json};
+use serde_json_path::JsonPath;
+use std::time::Duration;
+use toasty::Executor;
 use uuid::Uuid;
 
 /// Counts committed log consumption during one actuator pass.
@@ -202,35 +204,10 @@ pub fn models() -> toasty::ModelSet {
     )
 }
 
-/// A run's annotation snapshot, referenced by jobs through its ID.
-/// Execution version and revision belong to `Run`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, toasty::Model)]
-#[table = "run_config"]
-pub struct RunConfig {
-    #[key]
-    #[auto]
-    pub id: u64,
-    #[unique]
-    pub uuid: Uuid,
-    #[index]
-    pub run_id: Uuid,
-    #[column(type = json)]
-    pub annotation: Json<HashMap<String, String>>,
-    pub created_at: Timestamp,
-    pub updated_at: Timestamp,
-    #[column(type = varchar(64))]
-    pub created_by: String,
-    #[column(type = varchar(64))]
-    pub updated_by: String,
-    #[belongs_to(key = run_id, references = uuid)]
-    #[serde(skip)]
-    pub run: toasty::Deferred<Run>,
-}
-
-/// A node's configuration payload at a given version.
+/// A named configuration for a node at a given version.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, toasty::Model)]
 #[table = "node_config"]
-#[unique(node_id, version)]
+#[unique(node_id, version, name)]
 pub struct NodeConfig {
     #[key]
     #[auto]
@@ -240,6 +217,10 @@ pub struct NodeConfig {
     #[index]
     pub node_id: Uuid,
     pub version: u64,
+    #[column(type = varchar(255))]
+    #[default(default_node_config_name())]
+    #[serde(default = "default_node_config_name")]
+    pub name: String,
     #[column(type = varchar(255))]
     pub annotation_match: String,
     #[column(type = json)]
@@ -259,7 +240,25 @@ pub struct NodeConfig {
     pub updated_by: String,
 }
 
+fn default_node_config_name() -> String {
+    DEFAULT_NODE_CONFIG_NAME.to_owned()
+}
+
 impl NodeConfig {
+    fn matches_annotations(&self, annotations: &serde_json::Value) -> bool {
+        let expression = self.annotation_match.trim();
+        if expression.is_empty() {
+            return false;
+        }
+        match JsonPath::parse(expression) {
+            Ok(path) => !path.query(annotations).is_empty(),
+            Err(error) => {
+                tracing::warn!(node_config_id = %self.uuid, %error, "ignoring invalid annotation_match");
+                false
+            }
+        }
+    }
+
     /// Resolves the claim lease, rejecting values that cannot be used in timestamp arithmetic.
     pub fn job_lease(&self) -> Result<Duration, Error> {
         match self.lease {
@@ -404,23 +403,34 @@ impl Job {
             .exec(&mut *backend)
             .await?
             .ok_or(Error::RunNotFound(node_run.run_id))?;
-        let node_config = NodeConfig::filter_by_node_id(task.node_id)
-            .filter(NodeConfig::fields().version().le(run.version))
-            .order_by(NodeConfig::fields().version().desc())
+        let run_config = RunConfig::filter_by_run_id(run.uuid)
             .first()
             .exec(&mut *backend)
-            .await?
+            .await?;
+        let run_config_id = run_config.as_ref().map_or(Uuid::nil(), |row| row.uuid);
+        let annotations = run_config.map(|row| serde_json::json!(row.annotation.0));
+
+        let node_configs = NodeConfig::filter_by_node_id(task.node_id)
+            .filter(NodeConfig::fields().version().eq(node_run.version))
+            .order_by(NodeConfig::fields().name().asc())
+            .exec(&mut *backend)
+            .await?;
+        let node_config = annotations
+            .as_ref()
+            .and_then(|annotations| {
+                node_configs.iter().find(|config| {
+                    config.name != DEFAULT_NODE_CONFIG_NAME
+                        && config.matches_annotations(annotations)
+                })
+            })
+            .or_else(|| {
+                node_configs
+                    .iter()
+                    .find(|config| config.name == DEFAULT_NODE_CONFIG_NAME)
+            })
             .ok_or(Error::JobLeaseNotFound(0))?;
         node_config.job_lease()?;
-        let node_config_id = node_config.uuid;
-        let run_config_id = RunConfig::filter_by_run_id(run.uuid)
-            .order_by(RunConfig::fields().id().desc())
-            .first()
-            .exec(&mut *backend)
-            .await?
-            .map(|row| row.uuid)
-            .unwrap_or_else(Uuid::nil);
-        let mut entry = Self::new(task, run.uuid, node_config_id, run_config_id);
+        let mut entry = Self::new(task, run.uuid, node_config.uuid, run_config_id);
         entry.node_run_id = node_run.uuid;
         entry.required_cpu_cores = node_config.required_cpu_cores;
         entry.required_memory_bytes = node_config.required_memory_bytes;

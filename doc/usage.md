@@ -74,6 +74,9 @@ Migration 23 adds durable ownership and catalog associations for job result
 uploads. Apply it before starting servers that expose `/job/result/prepare`
 and `/job/result/commit`.
 
+Migration 26 names existing node configs `default` and allows additional
+named configs for each node version while preserving job references.
+
 Do not commit credentials in `rayflow.yaml`. Use an environment variable or a
 local, untracked configuration file for `database_url`.
 
@@ -343,7 +346,13 @@ Node execution settings are stored together under `settings`:
       "working_dir": "/tmp"
     },
     "resource": { "cpu_cores": 1, "memory_bytes": 268435456 },
-    "timeout": "10s"
+    "timeout": "10s",
+    "overrides": {
+      "long": {
+        "annotation_match": "$[?($.priority == 'high')]",
+        "timeout": "2m"
+      }
+    }
   }
 }
 ```
@@ -356,6 +365,16 @@ strings such as `10s`, `250ms`, and `2m`, with positive whole-millisecond precis
 Timeouts use the existing job lease: delivery starts the expiry clock, and
 active polls do not extend it. Older graph JSON without settings remains
 readable but needs valid settings before republishing.
+
+Publishing creates a `default` config and one config for each key in
+`settings.overrides`. Each override can supply `annotation_match`, `config`,
+`resource`, or `timeout`. Omitted settings inherit the base values. A supplied
+`config` replaces the base JSON object as a whole. A nonempty `annotation_match`
+must be a JSONPath expression. It matches when it selects at least one value
+from the run's `annotations` object. For example, the override above matches
+`{"priority": "high"}`, and `$.priority` checks for the key's presence. If
+multiple overrides match, the one whose name sorts first wins. When none
+match, the job uses `default` from the node run's graph version.
 
 Choose an input's source from another node's declared outputs. Selection creates
 the dependency when needed and excludes sources that would create a cycle.
@@ -440,7 +459,7 @@ The service endpoints are:
 | `GET` | `/api/v1/graph_drafts` | List editable DAGs. |
 | `GET` | `/api/v1/runs` | List runs; optional `graph_id` filter. |
 | `GET` | `/api/v1/runs/{run_id}` | Inspect the exact run UUID, its state, and its pinned graph. |
-| `POST` | `/api/v1/runs/start` | Start a run; body has `data_id`, `graph_id`, and optional `nodes`. |
+| `POST` | `/api/v1/runs/start` | Start a run with `data_id`, `graph_id`, optional `nodes`, and optional `annotations`. |
 | `POST` | `/api/v1/runs/rerun` | Rerun one node; body has `data_id`, `graph_id`, and `node`. |
 | `POST` | `/api/v1/runs/upgrade` | Upgrade an existing run; body has `data_id`, `graph_id`, the newer published `version`, and a `node` selected from the shared nodes. |
 | `POST` | `/api/v1/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
@@ -540,7 +559,7 @@ must be reachable from the browser. For cross-origin downloads, configure the
 storage bucket's CORS rules to allow `GET` from the console's origin, including
 its scheme, host, and port.
 
-Example start request:
+To start a run with annotations, pass a map of string keys to string values.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/api/v1/runs/start \
@@ -548,12 +567,15 @@ curl -X POST http://127.0.0.1:8080/api/v1/runs/start \
   -d '{
     "data_id": "00000000-0000-0000-0000-000000000001",
     "graph_id": "00000001-0000-0000-0000-000000000000",
-    "nodes": []
+    "nodes": [],
+    "annotations": {"dataset": "filetest"}
   }'
 ```
 
-An empty `nodes` array starts graph roots. `graph_state` returns the run
-revision, graph edges, and each node's current state.
+An empty `nodes` array starts graph roots. When `annotations` is supplied, the
+server saves a config and queues `Start` with its UUID. All jobs for that run
+reference the attached config. `graph_state` returns the run revision, graph
+edges, and each node's current state.
 
 ### Graph drafts
 
@@ -785,9 +807,7 @@ that an old table name or status value is compatible with the current models.
 
 Migration 9 removes `version` and `revision` from `run_config`, including its
 revision uniqueness index. Run annotation rows and job references are preserved.
-Apply it with `./init-db.sh` before using the updated binaries. New jobs use the
-newest annotation snapshot for their run; execution version and revision remain
-on `run`.
+Execution version and revision live on `run`.
 
 Migration 10 adds the catalog `uploaded` acknowledgement, initially false for
 both new and existing records. Job upload commit sets it true; job downloads
@@ -813,3 +833,10 @@ add auto-incrementing numeric primary IDs. The former `auth_user.id` becomes
 unique `user_id`, preserving existing sessions and audit identities. Token and
 state hashes retain unique keys. Apply migrations before deploying matching
 server binaries.
+
+Migration 25 makes `run_config.run_id` nullable and unique. A config starts
+unattached and gains its run UUID when `Start` applies. For runs with several
+legacy snapshots, the row with the highest numeric ID stays attached. Older
+rows keep their UUIDs and annotations so jobs can still read their pinned
+snapshots. Apply the migration with `./init-db.sh` before starting the updated
+server and pilot.

@@ -72,7 +72,8 @@ while traversing pages. Database cursors remain stable when newer rows arrive.
 ## Diffing
 
 `Diff` returns `None` for equal values and `Some(Item)` for changes. `Kind`,
-`Input`, `Output`, and `Node` return before/after pairs. Graph diffing matches
+`Input`, `Output`, and `Node` return before/after pairs. `Node` delegates to
+each field's diff. `NodeSettings` always returns `None`. Graph diffing matches
 nodes by ID, reports changed payloads, and separately reports missing/extra nodes
 and edges. Graph metadata and iteration order do not affect structural diffs.
 
@@ -166,14 +167,19 @@ whose expiry is beyond the configured grace period. External implementations may
 submit jobs to systems such as Kubernetes or Volcano, but must use durable request
 records and reconcile retries after rollback.
 
-`Run` stores the execution graph version and revision. `RunConfig` stores
-annotation snapshots without duplicating those fields. New jobs select the
-newest snapshot ID for their run; existing jobs retain their configuration ID.
-Each graph
-node carries JSON task configuration, resource requirements, and a duration
-timeout. Publishing snapshots these settings to `NodeConfig`, keyed by graph
-version; job creation selects the latest node configuration no newer than the
-run's pinned version. This keeps historical executions reproducible.
+`Run` stores the execution graph version and revision. `RunConfig` stores a
+run's optional annotation snapshot. The start API saves supplied annotations
+under a config UUID and queues `Start` with that UUID in the same transaction.
+Applying `Start` attaches the config before creating tasks. Jobs pin the UUID
+of their run's single config when one is present.
+
+Each graph node carries JSON task configuration, resource requirements, and a
+duration timeout. Publishing snapshots the base settings as `default` and
+each named override as a separate `NodeConfig`, keyed by node ID, graph version,
+and name. Job creation loads the configs for the node run's exact graph
+version. A named override matches when its JSONPath selects a value in the
+run's annotation snapshot. The first matching name in ascending order wins.
+Job creation falls back to `default` from the same version.
 
 ## Agent Claims
 

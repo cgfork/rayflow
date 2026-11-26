@@ -1,10 +1,10 @@
 //! [`CommandApply`] implementation driving the node state of a run.
 
 use graph::{ForkPoint, Graph};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use jiff::Timestamp;
-use toasty::Executor;
+use toasty::{Executor, Json};
 use uuid::Uuid;
 
 use crate::{CommandApply, backend::Status};
@@ -32,6 +32,31 @@ pub struct Run {
     pub revision: u64,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+/// An annotation snapshot created before a run starts and referenced by its jobs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, toasty::Model)]
+#[table = "run_config"]
+pub struct RunConfig {
+    #[key]
+    #[auto]
+    pub id: u64,
+    #[unique]
+    pub uuid: Uuid,
+    /// The owning run, assigned when Start applies the config.
+    #[unique]
+    pub run_id: Option<Uuid>,
+    #[column(type = json)]
+    pub annotation: Json<HashMap<String, String>>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[column(type = varchar(64))]
+    pub created_by: String,
+    #[column(type = varchar(64))]
+    pub updated_by: String,
+    #[belongs_to(key = run_id, references = uuid)]
+    #[serde(skip)]
+    pub run: toasty::Deferred<Option<Run>>,
 }
 
 /// A node's status within a run, one row per revision.
@@ -95,6 +120,7 @@ pub struct CommandResult {
 pub fn models() -> toasty::ModelSet {
     toasty::models!(
         Run,
+        RunConfig,
         NodeRun,
         CommandResult,
         event::command::CommandEntry,
@@ -143,12 +169,16 @@ impl<S> Backend<S> {
     {
         let mut command_tx = tx.transaction().await?;
         let result = match &entry.command.0 {
-            Command::Start { nodes } => {
+            Command::Start {
+                nodes,
+                run_config_id,
+            } => {
                 self.start(
                     &mut command_tx,
                     entry.data_id,
                     entry.graph_id,
                     nodes.clone(),
+                    *run_config_id,
                 )
                 .await
             }
@@ -257,7 +287,8 @@ impl<S> Backend<S> {
     /// The graph is loaded from the backend's graph store. When `nodes` is empty
     /// every root node of the graph is started; otherwise the listed nodes are
     /// started. A fresh `run` and a `Ready` node run per started node are created,
-    /// and a task is enqueued for each.
+    /// and a task is enqueued for each. If given, the config is bound to the run
+    /// before any tasks are enqueued.
     ///
     /// Starting is a one-time operation per `(data_id, graph_id)`; an existing
     /// run must be rerun instead, even when a newer graph version is published.
@@ -267,6 +298,7 @@ impl<S> Backend<S> {
         data_id: Uuid,
         graph_id: Uuid,
         nodes: Vec<Uuid>,
+        run_config_id: Option<Uuid>,
     ) -> Result<Uuid, Error>
     where
         S: GraphStore<Uuid>,
@@ -313,6 +345,25 @@ impl<S> Backend<S> {
             .exec(&mut *tx)
             .await?;
         let run_id = run.uuid;
+
+        if let Some(config_id) = run_config_id {
+            // Only an unattached config can be claimed, even if two starts race.
+            RunConfig::filter_by_uuid(config_id)
+                .filter(RunConfig::fields().run_id().is_none())
+                .update()
+                .run_id(run_id)
+                .updated_at(now)
+                .exec(&mut *tx)
+                .await?;
+            let config = RunConfig::filter_by_uuid(config_id)
+                .first()
+                .exec(&mut *tx)
+                .await?
+                .ok_or(Error::RunConfigNotFound(config_id))?;
+            if config.run_id != Some(run_id) {
+                return Err(Error::RunConfigInUse(config_id));
+            }
+        }
 
         for node_id in &targets {
             let node_run = NodeRun::create()

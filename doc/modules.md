@@ -95,13 +95,13 @@ The runtime applies commands to persisted execution state. It provides:
 - `CommandApply` for applying a `CommandEntry`.
 - `backend::Backend` for MySQL-backed state transitions.
 - `backend::Status` for node-run state.
-- `command::{Run, NodeRun}` for run and node-run models.
+- `command::{Run, RunConfig, NodeRun}` for run state and annotations.
 - `models()` for registering runtime, event, and coordination models.
 
 The backend accepts a caller-owned transaction through `apply_in`, allowing a
-command effect and its log acknowledgement to commit atomically. Runtime
-configuration models are owned by `scheduler`, so applications using the
-actuator normally register `scheduler::models()`.
+command effect and its log acknowledgement to commit atomically. `Start` binds
+its optional `RunConfig` UUID to the run before creating tasks. Applications
+using the actuator normally register `scheduler::models()`.
 
 ### `scheduler`
 
@@ -115,10 +115,10 @@ The scheduler crate connects logical tasks to executable jobs:
   schedulers.
 - `AgentScheduler` and `AgentRef` implement resource-aware polling and guarded
   job claims.
-- `RunConfig` holds annotation snapshots; jobs select the newest ID for their
-  run and retain that reference. Execution version and revision live on `Run`.
-  `NodeConfig` pins node configuration to jobs. The publish API snapshots
-  `Node.settings` into `NodeConfig` at the published graph version.
+- Jobs pin the UUID of the run's `RunConfig` when present. `NodeConfig` pins
+  node configuration to jobs. The publish API snapshots the base
+  `Node.settings` and each named override into separate `NodeConfig` rows at
+  the published graph version.
 
 The default `AgentScheduler` handles timeout recovery while agents claim jobs
 through the server API. External scheduler adapters must make submissions

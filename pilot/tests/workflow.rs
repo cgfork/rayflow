@@ -102,10 +102,17 @@ async fn start_run(
     data_id: Uuid,
     graph_id: Uuid,
 ) {
-    CommandEntry::new(data_id, graph_id, Command::Start { nodes: vec![] })
-        .emit(db)
-        .await
-        .expect("emit start command");
+    CommandEntry::new(
+        data_id,
+        graph_id,
+        Command::Start {
+            nodes: vec![],
+            run_config_id: None,
+        },
+    )
+    .emit(db)
+    .await
+    .expect("emit start command");
     let step = pilot.step().await.expect("consume start and first task");
     assert_eq!((step.commands, step.tasks, step.events), (1, 1, 0));
 }
@@ -308,10 +315,17 @@ async fn rollback_then_retry(mut db: toasty::Db) {
     .with_scheduler(RejectScheduling);
     let mut retry = Pilot::new(election("retry"), backend, 16, Duration::from_millis(10))
         .with_gap_timeout(Duration::from_millis(10));
-    CommandEntry::new(data_id, graph_id, Command::Start { nodes: vec![] })
-        .emit(&mut db)
-        .await
-        .unwrap();
+    CommandEntry::new(
+        data_id,
+        graph_id,
+        Command::Start {
+            nodes: vec![],
+            run_config_id: None,
+        },
+    )
+    .emit(&mut db)
+    .await
+    .unwrap();
 
     assert!(matches!(
         rejecting.step().await,

@@ -1,6 +1,11 @@
+use std::collections::HashMap;
+
 use event::Emit as CommandEmit;
 use event::command::Command;
 use event::command::CommandEntry;
+use jiff::Timestamp;
+use runtime::command::RunConfig;
+use toasty::Json;
 use uuid::Uuid;
 
 use crate::app::{AppError, RunApp};
@@ -19,7 +24,42 @@ impl<S> RunApp<S> {
     ///
     /// Returns the emitted command entry.
     pub async fn start(&mut self, nodes: Vec<Uuid>) -> Result<CommandEntry, AppError> {
-        self.emit(Command::Start { nodes }).await
+        self.emit(Command::Start {
+            nodes,
+            run_config_id: None,
+        })
+        .await
+    }
+
+    /// Saves the annotations and enqueues Start with their config UUID in one transaction.
+    pub async fn start_with_annotations(
+        &mut self,
+        nodes: Vec<Uuid>,
+        annotations: HashMap<String, String>,
+        actor: &str,
+    ) -> Result<CommandEntry, AppError> {
+        let mut tx = self.db.transaction().await?;
+        let now = Timestamp::now();
+        let config = RunConfig::create()
+            .uuid(Uuid::new_v4())
+            .annotation(Json(annotations))
+            .created_at(now)
+            .updated_at(now)
+            .created_by(actor)
+            .updated_by(actor)
+            .exec(&mut tx)
+            .await?;
+        let mut entry = CommandEntry::new(
+            self.data_id,
+            self.graph_id,
+            Command::Start {
+                nodes,
+                run_config_id: Some(config.uuid),
+            },
+        );
+        entry.command_offset = entry.emit(&mut tx).await?;
+        tx.commit().await?;
+        Ok(entry)
     }
 
     /// Starts the run and waits until the command has been consumed.
@@ -27,7 +67,9 @@ impl<S> RunApp<S> {
     /// Waits on the emitted command's offset via [`wait_offset`](Self::wait_offset),
     /// so it resolves once a consumer advances past the command.
     pub async fn start_wait(&mut self, nodes: Vec<Uuid>) -> Result<(), AppError> {
-        self.emit_and_wait(Command::Start { nodes }).await
+        let entry = self.start(nodes).await?;
+        self.wait_offset(entry.command_offset).await;
+        Ok(())
     }
 
     /// Reruns `node`, resetting it to `Ready` at a new revision.

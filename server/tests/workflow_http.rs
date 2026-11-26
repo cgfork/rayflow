@@ -11,10 +11,20 @@ use catalog::{
     CatalogOptionalData, CatalogSystem, FileInput, FileSystem, PresignOperation, PresignedUrl,
     directory::{DIRECTORY_FORMAT, DIRECTORY_MANIFEST},
 };
+use event::{
+    Emit,
+    command::{Command, CommandEntry},
+};
 use graph::store::{GraphDraftRecord, GraphRecord};
 use graph::types::{DAG, Input, Kind, Node, NodeSettings, Output, Resource};
-use runtime::{backend::Backend, command::NodeRun};
-use scheduler::{Actuator, Job, actuator::Status};
+use runtime::{
+    backend::Backend,
+    command::{CommandResult, NodeRun, Run, RunConfig},
+};
+use scheduler::{
+    Actuator, Job,
+    actuator::{NodeConfig, Status},
+};
 use serde_json::{Value, json};
 use server::{App, Config, api::PollJobsResponse, config::StorageConfig, router};
 use tower::ServiceExt;
@@ -125,6 +135,7 @@ fn workflow() -> DAG {
                     memory_bytes: 512,
                 },
                 timeout: Duration::from_secs(120),
+                overrides: Default::default(),
             },
             inputs: vec![],
             outputs: vec![],
@@ -208,13 +219,22 @@ fn storage_config() -> Config {
     }
 }
 
-async fn run_workflow(db: toasty::Db) {
+async fn run_workflow(mut db: toasty::Db) {
     let app = router(App::new(db.clone(), storage_config(), db.clone()));
-    let mut actuator = Actuator::new(Backend::new(db.clone(), db), 64);
+    let mut actuator = Actuator::new(Backend::new(db.clone(), db.clone()), 64);
     let graph = workflow();
     let graph_id = graph.id;
     let producer = graph.nodes[0].id;
     let consumer = graph.nodes[1].id;
+    let normal_priority = "$[?($.priority == 'normal')]";
+    let mut graph = json!(graph);
+    graph["nodes"][0]["settings"]["overrides"] = json!({
+        "large": {
+            "annotation_match": normal_priority,
+            "resource": {"cpu_cores": 4, "memory_bytes": 1024}
+        },
+        "short": {"config": {"image": "alternate"}, "timeout": "5s"}
+    });
     let data_id = Uuid::new_v4();
     let owner = Uuid::new_v4();
     let other_agent = Uuid::new_v4();
@@ -226,22 +246,74 @@ async fn run_workflow(db: toasty::Db) {
         StatusCode::OK,
     )
     .await;
-    post(
+    let published = post(
         &app,
         &format!("/graphs/{graph_id}/publish"),
         json!({"actor": "workflow-test"}),
         StatusCode::CREATED,
     )
     .await;
-    post(
+    let version = published["version"].as_u64().unwrap();
+    let configs = NodeConfig::filter_by_node_id(producer)
+        .filter(NodeConfig::fields().version().eq(version))
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(configs.len(), 3);
+    for (name, annotation_match, config, lease, cpu, memory) in [
+        ("default", "", json!({}), 120_000, 1, 512),
+        ("large", normal_priority, json!({}), 120_000, 4, 1024),
+        ("short", "", json!({"image": "alternate"}), 5_000, 1, 512),
+    ] {
+        let row = configs.iter().find(|row| row.name == name).unwrap();
+        assert_eq!(row.annotation_match, annotation_match);
+        assert_eq!(row.config, config);
+        assert_eq!(row.lease, Some(lease));
+        assert_eq!(row.required_cpu_cores, cpu);
+        assert_eq!(row.required_memory_bytes, memory);
+        assert_eq!(row.created_by, "workflow-test");
+        assert_eq!(row.updated_by, "workflow-test");
+    }
+    let annotations = json!({"dataset": "filetest", "priority": "normal"});
+    let started = post(
         &app,
         "/runs/start",
-        json!({"data_id": data_id, "graph_id": graph_id}),
+        json!({"data_id": data_id, "graph_id": graph_id, "annotations": annotations}),
         StatusCode::ACCEPTED,
     )
     .await;
+    let command_id: Uuid = serde_json::from_value(started["id"].clone()).unwrap();
+    let entry = CommandEntry::filter_by_id(command_id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    let Command::Start {
+        run_config_id: Some(config_id),
+        ..
+    } = entry.command.0
+    else {
+        panic!("Start command must reference the saved config");
+    };
+    let config = RunConfig::filter_by_uuid(config_id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(config.run_id, None);
+    assert_eq!(json!(config.annotation.0), annotations);
+
     assert_eq!(actuator.tick().await.unwrap().tasks, 1);
     let initial = poll_one(&app, owner, producer).await;
+    assert_eq!(initial.node_config.get().as_ref().unwrap().name, "large");
+    assert_eq!(initial.required_cpu_cores, 4);
+    assert_eq!(initial.required_memory_bytes, 1024);
+    assert_eq!(initial.run_config_id, config_id);
+    let config = RunConfig::filter_by_run_id(initial.run_id)
+        .get(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(config.uuid, config_id);
+    assert_eq!(config.run_id, Some(initial.run_id));
+    assert_eq!(json!(config.annotation.0), annotations);
 
     let rejection = post(
         &app,
@@ -300,6 +372,8 @@ async fn run_workflow(db: toasty::Db) {
     assert_ne!(resumed.task_id, initial.task_id);
     assert_eq!(resumed.node_run_id, initial.node_run_id);
     assert_eq!(resumed.run_id, initial.run_id);
+    assert_eq!(resumed.run_config_id, config_id);
+    assert_eq!(resumed.node_config_id, initial.node_config_id);
     let result = request(
         &app,
         Method::GET,
@@ -360,6 +434,7 @@ async fn run_workflow(db: toasty::Db) {
     assert_eq!(actuator.tick().await.unwrap().tasks, 1);
 
     let downstream = poll_one(&app, owner, consumer).await;
+    assert_eq!(downstream.run_config_id, config_id);
     let input = post(
         &app,
         "/job/input/presign",
@@ -457,6 +532,206 @@ async fn workflow_yields_resumes_presigns_artifacts_and_stops_at_failure() {
 }
 
 #[tokio::test]
+async fn job_config_matching_and_fallback_use_the_node_run_version() {
+    support::with_test_database(|mut db| async move {
+        let app = router(App::new(db.clone(), Config::default(), db.clone()));
+        let mut actuator = Actuator::new(Backend::new(db.clone(), db.clone()), 64);
+        let graph = workflow();
+        let graph_id = graph.id;
+        let node_id = graph.nodes[0].id;
+        let mut graph = json!(graph);
+        let high_priority = "$[?($.priority == 'high')]";
+        for (version, overrides, cases) in [
+            (
+                1,
+                json!({
+                    "zeta": {"annotation_match": high_priority},
+                    "alpha": {"annotation_match": high_priority, "timeout": "5s"}
+                }),
+                vec![(Some("high"), "alpha"), (Some("low"), "default"), (None, "default")],
+            ),
+            (
+                2,
+                json!({"legacy": {"annotation_match": "$.other"}}),
+                vec![(Some("high"), "default")],
+            ),
+        ] {
+            graph["nodes"][0]["settings"]["overrides"] = overrides;
+            request(
+                &app,
+                Method::PUT,
+                &format!("/graphs/{graph_id}/draft"),
+                json!({"graph": graph}),
+                StatusCode::OK,
+            )
+            .await;
+            let published = post(
+                &app,
+                &format!("/graphs/{graph_id}/publish"),
+                json!({}),
+                StatusCode::CREATED,
+            )
+            .await;
+            assert_eq!(published["version"], version);
+
+            if version == 2 {
+                // Simulate a row published before JSONPath was validated.
+                NodeConfig::filter_by_node_id_and_version_and_name(node_id, version, "legacy")
+                    .update()
+                    .annotation_match("priority=high")
+                    .exec(&mut db)
+                    .await
+                    .unwrap();
+            }
+            for (priority, expected) in cases {
+                let annotations = priority.map(|priority| json!({"priority": priority}));
+                post(
+                    &app,
+                    "/runs/start",
+                    json!({"data_id": Uuid::new_v4(), "graph_id": graph_id, "annotations": annotations}),
+                    StatusCode::ACCEPTED,
+                )
+                .await;
+                assert_eq!(actuator.tick().await.unwrap().tasks, 1);
+                let job = poll_one(&app, Uuid::new_v4(), node_id).await;
+                let config = job.node_config.get().as_ref().unwrap();
+                assert_eq!(job.node_run.get().version, version);
+                assert_eq!(config.version, version);
+                assert_eq!(config.name, expected);
+                assert_eq!(config.lease, Some(if expected == "alpha" { 5_000 } else { 120_000 }));
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn invalid_node_overrides_leave_the_graph_unpublished() {
+    support::with_test_database(|mut db| async move {
+        let app = router(App::new(db.clone(), Config::default(), db.clone()));
+        let graph = workflow();
+        let graph_id = graph.id;
+        let node_id = graph.nodes[0].id;
+        let mut graph = json!(graph);
+        for (name, value) in [
+            ("default", json!({})),
+            ("short", json!({"timeout": "1us"})),
+            ("broken", json!({"annotation_match": "$[?"})),
+        ] {
+            graph["nodes"][0]["settings"]["overrides"] = json!({(name): value});
+            request(
+                &app,
+                Method::PUT,
+                &format!("/graphs/{graph_id}/draft"),
+                json!({"graph": graph}),
+                StatusCode::OK,
+            )
+            .await;
+            let error = post(
+                &app,
+                &format!("/graphs/{graph_id}/publish"),
+                json!({}),
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+            assert_eq!(error["error_code"], "RAYFLOW_INVALID_GRAPH");
+            assert!(error["error"].as_str().unwrap().contains(name));
+        }
+        assert!(
+            GraphRecord::filter_by_uuid(graph_id)
+                .first()
+                .exec(&mut db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            NodeConfig::filter_by_node_id(node_id)
+                .first()
+                .exec(&mut db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn start_rejects_missing_and_attached_config_ids() {
+    support::with_test_database(|mut db| async move {
+        let app = router(App::new(db.clone(), Config::default(), db.clone()));
+        let mut actuator = Actuator::new(Backend::new(db.clone(), db.clone()), 64);
+        let graph = workflow();
+        let graph_id = graph.id;
+        request(
+            &app,
+            Method::PUT,
+            &format!("/graphs/{graph_id}/draft"),
+            json!({"graph": graph}),
+            StatusCode::OK,
+        )
+        .await;
+        post(
+            &app,
+            &format!("/graphs/{graph_id}/publish"),
+            json!({}),
+            StatusCode::CREATED,
+        )
+        .await;
+        post(
+            &app,
+            "/runs/start",
+            json!({"data_id": Uuid::new_v4(), "graph_id": graph_id, "annotations": {}}),
+            StatusCode::ACCEPTED,
+        )
+        .await;
+        assert_eq!(actuator.tick().await.unwrap().tasks, 1);
+        let job = poll_one(&app, Uuid::new_v4(), graph.nodes[0].id).await;
+        let config_id = job.run_config_id;
+
+        for (run_config_id, code) in [
+            (Uuid::new_v4(), "RAYFLOW_RUN_CONFIG_NOT_FOUND"),
+            (config_id, "RAYFLOW_RUN_CONFIG_IN_USE"),
+        ] {
+            let data_id = Uuid::new_v4();
+            let entry = CommandEntry::new(
+                data_id,
+                graph_id,
+                Command::Start {
+                    nodes: vec![],
+                    run_config_id: Some(run_config_id),
+                },
+            );
+            entry.emit(&mut db).await.unwrap();
+            let step = actuator.tick().await.unwrap();
+            assert_eq!(step.commands, 1);
+            assert_eq!(step.tasks, 0);
+            let failure = CommandResult::filter_by_command_id(entry.id)
+                .get(&mut db)
+                .await
+                .unwrap();
+            assert_eq!(failure.error_code, code);
+            assert!(
+                Run::filter_by_data_id_and_graph_id(data_id, graph_id)
+                    .first()
+                    .exec(&mut db)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let config = RunConfig::filter_by_uuid(config_id)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(config.run_id, Some(job.run_id));
+        assert!(config.annotation.0.is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
     support::with_test_database(|mut db| async move {
         let mut config = storage_config();
@@ -493,6 +768,8 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
             .await
             .unwrap()
             .unwrap();
+        assert!(job.run_config_id.is_nil());
+        assert!(RunConfig::all().first().exec(&mut db).await.unwrap().is_none());
         let now = jiff::Timestamp::now();
         // Reproduce a claim delivered by an older server without a result row.
         Job::filter_by_id(job.id)

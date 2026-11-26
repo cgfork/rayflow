@@ -8,6 +8,7 @@ license.workspace = true
 jiff = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
+serde_json_path = { workspace = true }
 thiserror = { workspace = true }
 toasty = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }

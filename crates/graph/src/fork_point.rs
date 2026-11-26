@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{ForkPoint, Graph, types::DAG};
+use crate::{Diff, ForkPoint, Graph, types::DAG};
 
 impl ForkPoint for DAG {
     fn fork_point(&self, other: &Self) -> Option<Self::NodeId> {
@@ -13,7 +13,7 @@ impl ForkPoint for DAG {
         for node in &self.nodes {
             if other_nodes
                 .get(&node.id)
-                .is_none_or(|other_node| node != *other_node)
+                .is_none_or(|other_node| node.diff(other_node).is_some())
             {
                 changed.insert(node.id);
             }
