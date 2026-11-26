@@ -16,7 +16,9 @@ use event::{
     command::{Command, CommandEntry},
 };
 use graph::store::{GraphDraftRecord, GraphRecord};
-use graph::types::{DAG, Input, Kind, Node, NodeSettings, Output, Resource};
+use graph::types::{
+    AnnotationMatchNodeSettings, DAG, Input, Kind, Node, NodeSettings, Output, Resource,
+};
 use runtime::{
     backend::Backend,
     command::{CommandResult, NodeRun, Run, RunConfig},
@@ -1178,6 +1180,115 @@ async fn graph_responses_expose_persisted_audit_fields() {
         )
         .await;
         assert_eq!(graphs, json!({"items": [read], "next_cursor": null}));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn graph_diff_compares_exact_published_versions() {
+    support::with_test_database(|db| async move {
+        let app = router(App::new(db.clone(), Config::default(), db));
+        let mut before = workflow();
+        before.nodes[1].settings.timeout = Duration::from_secs(10);
+        let graph_id = before.id;
+        let node_id = before.nodes[1].id.to_string();
+        let expression = "has(annotations.priority) && annotations.priority == 'high'";
+        let mut after = before.clone();
+        after.nodes[1].name = "process".into();
+        after.nodes[1].inputs[0].required = false;
+        after.nodes[1].inputs[0].format = None;
+        let settings = &mut after.nodes[1].settings;
+        settings.config = json!({"image": "build:v2", "args": ["--safe"]});
+        settings.resource.cpu_cores = 2;
+        settings.resource.memory_bytes = 1024;
+        settings.timeout = Duration::from_secs(20);
+        settings.overrides.insert("high".into(), AnnotationMatchNodeSettings {
+            annotation_match: Some(expression.into()),
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        });
+        let other = workflow();
+        let other_id = other.id;
+
+        for (graph, version) in [(&before, 1), (&after, 2), (&other, 1)] {
+            let id = graph.id;
+            request(
+                &app,
+                Method::PUT,
+                &format!("/graphs/{id}/draft"),
+                json!({"graph": graph}),
+                StatusCode::OK,
+            )
+            .await;
+            let published = post(
+                &app,
+                &format!("/graphs/{id}/publish"),
+                json!({}),
+                StatusCode::CREATED,
+            )
+            .await;
+            assert_eq!(published["version"], version);
+        }
+
+        let diff = request(
+            &app,
+            Method::GET,
+            &format!("/graphs/{graph_id}/diff?from_version=1&version=2"),
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(diff["before_node_names"][&node_id], "consume");
+        assert_eq!(diff["after_node_names"][&node_id], "process");
+        let changes = diff["changes"].as_array().unwrap();
+        assert!(changes.contains(&json!({"field": "version", "change": [1, 2]})));
+        let structure = changes
+            .iter()
+            .find(|item| item["field"] == "structure")
+            .unwrap();
+        assert_eq!(
+            structure["change"]["node_diffs"],
+            json!([[node_id, [
+                {"field": "name", "change": ["consume", "process"]},
+                {"field": "settings", "change": [
+                    {"field": "config", "change": [{}, {"image": "build:v2", "args": ["--safe"]}]},
+                    {"field": "resource", "change": [
+                        {"field": "cpu_cores", "change": [1, 2]},
+                        {"field": "memory_bytes", "change": [512, 1024]},
+                    ]},
+                    {"field": "timeout", "change": ["10s", "20s"]},
+                    {"field": "overrides", "change": [{
+                        "name": "high", "before": null,
+                        "after": {"annotation_match": expression, "config": null, "resource": null, "timeout": "5s"},
+                    }]},
+                ]},
+                {"field": "inputs", "change": [{"kind": "changed", "index": 0, "changes": [
+                    {"field": "required", "change": [true, false]},
+                    {"field": "format", "change": ["text/plain", null]},
+                ]}]},
+            ]]]),
+        );
+
+        let diff = request(
+            &app,
+            Method::GET,
+            &format!("/graphs/{graph_id}/diff?from_graph_id={other_id}&from_version=1&version=2"),
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+        let changes = diff["changes"].as_array().unwrap();
+        assert!(changes.contains(&json!({"field": "id", "change": [other_id, graph_id]})));
+
+        let missing = request(
+            &app,
+            Method::GET,
+            &format!("/graphs/{graph_id}/diff?from_version=1&version=3"),
+            Value::Null,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(missing["error_code"], "RAYFLOW_GRAPH_NOT_FOUND");
     })
     .await;
 }

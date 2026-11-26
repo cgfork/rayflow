@@ -1,10 +1,26 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{Diff, ForkPoint, Graph, diff::GraphDiff, types::DAG};
+use crate::{
+    ForkPoint, Graph,
+    diff::GraphDiff,
+    types::{DAG, Node},
+};
+
+// Nodes with the same identity and ports can restart with new settings after an upgrade.
+fn same_node_structure(before: &Node, after: &Node) -> bool {
+    before.id == after.id
+        && before.name == after.name
+        && before.node_type == after.node_type
+        && before.inputs == after.inputs
+        && before.outputs == after.outputs
+}
 
 impl ForkPoint for DAG {
     fn same_structure(&self, other: &Self) -> bool {
-        GraphDiff::between(self, other).is_none()
+        GraphDiff::between_by(self, other, |before, after| {
+            (!same_node_structure(before, after)).then_some(())
+        })
+        .is_none()
     }
 
     fn fork_point(&self, other: &Self) -> Option<Self::NodeId> {
@@ -17,7 +33,7 @@ impl ForkPoint for DAG {
         for node in &self.nodes {
             if other_nodes
                 .get(&node.id)
-                .is_none_or(|other_node| node.diff(other_node).is_some())
+                .is_none_or(|other_node| !same_node_structure(node, other_node))
             {
                 changed.insert(node.id);
             }
@@ -64,7 +80,6 @@ impl ForkPoint for DAG {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Node;
     use uuid::Uuid;
 
     #[test]

@@ -1,5 +1,8 @@
 use jiff::Timestamp;
-use std::{collections::HashMap, convert::Infallible, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    time::Duration,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -35,7 +38,8 @@ pub struct Output {
 }
 
 /// A changed output field and its before and after values.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "field", content = "change", rename_all = "snake_case")]
 pub enum OutputDiff {
     FileName((String, String)),
     Kind((Kind, Kind)),
@@ -70,7 +74,8 @@ pub struct Input {
 }
 
 /// A changed input field and its before and after values.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "field", content = "change", rename_all = "snake_case")]
 pub enum InputDiff {
     FileName((String, String)),
     Source((String, String)),
@@ -100,7 +105,8 @@ pub struct Resource {
 }
 
 /// A changed resource field and its before and after values.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "field", content = "change", rename_all = "snake_case")]
 pub enum ResourceDiff {
     CpuCores((u32, u32)),
     MemoryBytes((u64, u64)),
@@ -192,11 +198,59 @@ fn timeout_ms(timeout: Duration) -> Option<u64> {
         .then_some(milliseconds)
 }
 
-impl Diff for NodeSettings {
-    type Item = Infallible;
+/// A named override added, removed, or updated between two settings.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct OverrideDiff {
+    pub name: String,
+    pub before: Option<AnnotationMatchNodeSettings>,
+    pub after: Option<AnnotationMatchNodeSettings>,
+}
 
-    fn diff(&self, _other: &Self) -> Option<Self::Item> {
-        None
+/// Changes to a node's base settings and named annotation overrides.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "field", content = "change", rename_all = "snake_case")]
+pub enum NodeSettingsDiff {
+    Config((serde_json::Value, serde_json::Value)),
+    Resource(<Resource as Diff>::Item),
+    Timeout(
+        #[serde(with = "jiff::fmt::serde::unsigned_duration::friendly::compact::required")]
+        Duration,
+        #[serde(with = "jiff::fmt::serde::unsigned_duration::friendly::compact::required")]
+        Duration,
+    ),
+    Overrides(Vec<OverrideDiff>),
+}
+
+impl Diff for NodeSettings {
+    type Item = Vec<NodeSettingsDiff>;
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        let names: BTreeSet<_> = self
+            .overrides
+            .keys()
+            .chain(other.overrides.keys())
+            .collect();
+        let overrides: Vec<_> = names
+            .into_iter()
+            .filter_map(|name| {
+                let before = self.overrides.get(name);
+                let after = other.overrides.get(name);
+                (before != after).then(|| OverrideDiff {
+                    name: name.clone(),
+                    before: before.cloned(),
+                    after: after.cloned(),
+                })
+            })
+            .collect();
+        field_diffs([
+            value_diff(&self.config, &other.config).map(NodeSettingsDiff::Config),
+            self.resource
+                .diff(&other.resource)
+                .map(NodeSettingsDiff::Resource),
+            value_diff(&self.timeout, &other.timeout)
+                .map(|(before, after)| NodeSettingsDiff::Timeout(before, after)),
+            (!overrides.is_empty()).then_some(NodeSettingsDiff::Overrides(overrides)),
+        ])
     }
 }
 
@@ -217,8 +271,9 @@ pub struct Node {
     pub outputs: Vec<Output>,
 }
 
-/// A changed node field, including item-level changes for inputs and outputs.
-#[derive(Clone, Debug, PartialEq)]
+/// A changed node field, including settings and individual input and output changes.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "field", content = "change", rename_all = "snake_case")]
 pub enum NodeDiff {
     Id((Uuid, Uuid)),
     Name((String, String)),
@@ -337,15 +392,30 @@ impl Graph for DAG {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ForkPoint, diff::VecDiff};
+    use crate::{
+        ForkPoint,
+        diff::{DagDiff, VecDiff},
+    };
+    use serde_json::json;
 
     #[test]
-    fn settings_only_changes_do_not_affect_structural_diffs() {
+    fn settings_only_changes_appear_in_diffs_and_keep_nodes_shared() {
+        let timeout_override = |seconds| AnnotationMatchNodeSettings {
+            timeout: Some(Duration::from_secs(seconds)),
+            ..Default::default()
+        };
         let node = Node {
             id: Uuid::new_v4(),
             name: "task".into(),
             node_type: "docker".into(),
-            settings: NodeSettings::default(),
+            settings: NodeSettings {
+                overrides: HashMap::from([
+                    ("large".into(), timeout_override(3)),
+                    ("old".into(), timeout_override(2)),
+                    ("same".into(), timeout_override(5)),
+                ]),
+                ..Default::default()
+            },
             inputs: vec![Input {
                 file_name: "input.txt".into(),
                 source: "build.result.txt".into(),
@@ -363,19 +433,60 @@ mod tests {
             ..DAG::default()
         };
         let mut current = previous.clone();
-        current.nodes[0].settings = serde_json::from_value(serde_json::json!({
+        current.nodes[0].settings = serde_json::from_value(json!({
             "config": {"image": "alpine"},
             "resource": {"cpu_cores": 1, "memory_bytes": 512},
             "timeout": "2s",
-            "overrides": {"large": {"timeout": "4s"}}
+            "overrides": {"extra": {"timeout": "6s"}, "large": {"timeout": "4s"}, "same": {"timeout": "5s"}}
         }))
         .unwrap();
 
-        assert_ne!(node, current.nodes[0]);
-        assert_eq!(node.settings.diff(&current.nodes[0].settings), None);
-        assert_eq!(node.diff(&current.nodes[0]), None);
-        assert_eq!(current.diff(&previous), None);
+        let expected = vec![
+            NodeSettingsDiff::Config((json!(null), json!({"image": "alpine"}))),
+            NodeSettingsDiff::Resource(vec![
+                ResourceDiff::CpuCores((0, 1)),
+                ResourceDiff::MemoryBytes((0, 512)),
+            ]),
+            NodeSettingsDiff::Timeout(Duration::ZERO, Duration::from_secs(2)),
+            NodeSettingsDiff::Overrides(vec![
+                OverrideDiff {
+                    name: "extra".into(),
+                    before: None,
+                    after: Some(timeout_override(6)),
+                },
+                OverrideDiff {
+                    name: "large".into(),
+                    before: Some(timeout_override(3)),
+                    after: Some(timeout_override(4)),
+                },
+                OverrideDiff {
+                    name: "old".into(),
+                    before: Some(timeout_override(2)),
+                    after: None,
+                },
+            ]),
+        ];
+        assert_eq!(node.settings.diff(&node.settings), None);
+        assert_eq!(
+            node.settings.diff(&current.nodes[0].settings),
+            Some(expected.clone())
+        );
+        let changes = previous.diff(&current).unwrap();
+        let [DagDiff::Structure(changes)] = changes.as_slice() else {
+            panic!("expected only node changes, got {changes:?}");
+        };
+        assert_eq!(
+            changes.node_diffs,
+            vec![(node.id, vec![NodeDiff::Settings(expected)])]
+        );
         assert_eq!(current.fork_point(&previous), None);
+        assert_eq!(
+            current
+                .shared_nodes(&previous)
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            [node.id]
+        );
 
         current.nodes[0].outputs[0].multiple = true;
         assert!(current.diff(&previous).is_some());

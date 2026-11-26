@@ -299,11 +299,16 @@ RAYFLOW_API_URL=http://127.0.0.1:8081 npm run dev --prefix ui
 
 The four sections use the same resource APIs as other clients:
 
-- **Orchestration:** create graphs, connect nodes, edit inputs and outputs,
-  save drafts, and publish immutable versions. The JSON editor supports import
-  through pasted JSON and export. The editor flags cycles and invalid roots;
-  unreferenced outputs are informational. Publishing also runs the existing
-  server validator. Node positions are local to the open editor.
+- **Orchestration** lets you create graphs, connect nodes, edit inputs and
+  outputs, save drafts, and publish immutable versions. The Drafts table lists
+  editable workflows. In Published versions, choose **Diff** on a target row
+  and select a base version to compare workflow fields, nodes, node settings,
+  ports, and connections. **Include other workflows** expands the choice of
+  base versions.
+  The JSON editor supports import through pasted JSON and export. It flags
+  cycles and invalid roots and marks unreferenced outputs as informational.
+  Publishing also runs the server validator. Node positions are local to the
+  open editor.
 - **Runtime:** start runs and inspect every node in a run's pinned graph version.
   Use **Rerun** in the run list or detail header to choose a starting node, or
   select a node on the graph and use **Rerun node**. Ready, succeeded, failed,
@@ -460,6 +465,7 @@ The service endpoints are:
 | `GET` | `/metrics` | Prometheus text metrics for the server process. |
 | `GET` | `/api/v1/graphs` | List published graph versions; optional `graph_id` filter. |
 | `GET` | `/api/v1/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
+| `GET` | `/api/v1/graphs/{graph_id}/diff` | Compare exact published `from_version` and `version` values. Set `from_graph_id` to use a base version from another workflow. |
 | `GET` | `/api/v1/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
 | `GET` | `/api/v1/graph_drafts` | List editable DAGs. |
 | `GET` | `/api/v1/runs` | List runs; optional `graph_id` filter. |

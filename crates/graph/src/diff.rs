@@ -37,7 +37,8 @@ impl Diff for String {
 }
 
 /// An item change in an ordered vector. Items are compared at matching indices.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VecDiff<T, D> {
     Changed { index: usize, changes: D },
     Added { index: usize, value: T },
@@ -83,7 +84,7 @@ impl<T: Clone + Diff> Diff for Vec<T> {
 }
 
 /// Structural differences from `self` to `other`, ignoring graph metadata.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct GraphDiff<NodeDiff, NodeId> {
     /// The stable node ID and payload differences for each modified node.
     pub node_diffs: Vec<(NodeId, NodeDiff)>,
@@ -103,6 +104,17 @@ impl<NodeDiff, NodeId: Id> GraphDiff<NodeDiff, NodeId> {
     where
         G: Graph<NodeId = NodeId>,
         G::NodeData<'a>: Diff<Item = NodeDiff>,
+    {
+        Self::between_by(before, after, Diff::diff)
+    }
+
+    pub(crate) fn between_by<'a, G>(
+        before: &'a G,
+        after: &'a G,
+        compare_nodes: impl Fn(&G::NodeData<'a>, &G::NodeData<'a>) -> Option<NodeDiff>,
+    ) -> Option<Self>
+    where
+        G: Graph<NodeId = NodeId>,
     {
         let nodes: Vec<_> = before.nodes().collect();
         let other_nodes: Vec<_> = after.nodes().collect();
@@ -125,7 +137,8 @@ impl<NodeDiff, NodeId: Id> GraphDiff<NodeDiff, NodeId> {
 
         for node in &nodes {
             if let Some(other_node) = other_nodes_by_id.get(&node.id) {
-                if let Some(node_diff) = node.data.borrow().diff(other_node.data.borrow()) {
+                if let Some(node_diff) = compare_nodes(node.data.borrow(), other_node.data.borrow())
+                {
                     diff.node_diffs.push((node.id, node_diff));
                 }
             } else {
@@ -166,7 +179,8 @@ impl<NodeDiff, NodeId: Id> GraphDiff<NodeDiff, NodeId> {
 }
 
 /// A changed field or structural change in a DAG, from `self` to `other`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "field", content = "change", rename_all = "snake_case")]
 pub enum DagDiff {
     Id((Uuid, Uuid)),
     Name((String, String)),

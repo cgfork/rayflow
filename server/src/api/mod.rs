@@ -14,6 +14,7 @@
 //! * `POST /runs/dryrun` — emit `Command::Dryrun` for the given nodes.
 //! * `GET  /graphs/{graph_id}/draft` — read an editable graph draft.
 //! * `GET  /graphs/{graph_id}` — read a published graph, optionally by version.
+//! * `GET  /graphs/{graph_id}/diff` — compare two exact published graph versions.
 //! * `PUT  /graphs/{graph_id}/draft` — create or replace an editable graph draft.
 //! * `POST /graphs/{graph_id}/publish` — validate and publish the draft.
 //! * `POST /task_events` — emit a `TaskEvent` for a task.

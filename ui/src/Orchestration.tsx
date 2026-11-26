@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowLeft, Box, CalendarClock, CalendarPlus, Check, Code2, Copy, Download, GitBranch, LayoutGrid, Link2, Pencil, Plus, Rocket, Save, Star, Trash2, UserPen, UserPlus, Workflow, X } from 'lucide-react';
+import { Activity, ArrowLeft, Box, CalendarClock, CalendarPlus, Check, Code2, Copy, Download, GitBranch, GitCompare, LayoutGrid, Link2, Pencil, Plus, Rocket, Save, Star, Trash2, UserPen, UserPlus, Workflow, X } from 'lucide-react';
 import { api, dateTime, send, usePaged } from './api';
 import { useAuditActorName } from './audit';
 import { Badge, Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination, Refresh, SearchBox, UuidText } from './components';
 import { DockerConfigInput, parseDockerConfig } from './DockerConfigInput';
 import FlowCanvas from './FlowCanvas';
+import GraphDiffDialog from './GraphDiffDialog';
 import NodeOverrides from './NodeOverrides';
 import { createGraph, createNode, disconnectEdges, isJsonObject, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
 import { copyUuid } from './uuid';
@@ -39,6 +40,7 @@ export default function Orchestration({ actor, user, notify, dirtyChanged, openR
   const [favorites, setFavorites] = useState(loadFavorites);
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [versions, setVersions] = useState<Pick<Graph, 'id' | 'name'> | null>(null);
+  const [diffTarget, setDiffTarget] = useState<Pick<Graph, 'id' | 'name' | 'version'> | null>(null);
   const [manualCopyId, setManualCopyId] = useState<string | null>(null);
   const manualCopyInput = useRef<HTMLInputElement>(null);
   const [editor, setEditor] = useState<{ graph: Graph; isNew: boolean } | null>(null);
@@ -140,14 +142,8 @@ export default function Orchestration({ actor, user, notify, dirtyChanged, openR
         <button type="button" className="button" disabled={opening} aria-label="Clear workflow filter" onClick={() => setVersions(null)}><X size={14} />All workflows</button>
       </div>}
       {!result.data ? (!result.error && <Loading />) : rows.length > 0 ? (
-        tab === 'drafts' ? (
-          <ul className="workflow-grid" aria-label="Workflows" role="list">
-            {rows.map((row) => <WorkflowCard key={row.id} graph={row} favorite={favorites.has(row.id)} opening={opening} auditActorName={auditActorName}
-              open={() => void open(row)} copy={() => void copy(row.id)} toggleFavorite={() => toggleFavorite(row.id)} showVersions={() => showVersions(row)} openRuntime={() => openRuntime(row.id)} />)}
-          </ul>
-        ) : (
-          <PublishedVersions rows={rows} opening={opening} auditActorName={auditActorName} edit={(row) => void open(row)} copy={(id) => void copy(id)} openRuntime={openRuntime} />
-        )
+        <WorkflowTable rows={rows} opening={opening} auditActorName={auditActorName} edit={(row) => void open(row)} copy={(id) => void copy(id)} openRuntime={openRuntime}
+          mode={tab === 'drafts' ? { tab, favorites, toggleFavorite, showVersions } : { tab, diff: setDiffTarget }} />
       ) : query ? (
         <Empty title="No matching workflows">Try a different name or workflow ID, or move to another page.</Empty>
       ) : filterFavorites ? (
@@ -159,6 +155,7 @@ export default function Orchestration({ actor, user, notify, dirtyChanged, openR
       )}
       <Pagination page={result.page} count={rows.length} more={result.data?.next_cursor != null} previous={result.previous} next={result.next} />
     </section>
+    {diffTarget && <GraphDiffDialog target={diffTarget} close={() => setDiffTarget(null)} />}
     {creating && <Modal title="Create a workflow" close={() => setCreating(false)}><form onSubmit={(event) => { event.preventDefault(); if (!name.trim()) return; setEditor({ graph: createGraph(name.trim()), isNew: true }); setCreating(false); }}><p className="muted">Start with a root node and build out your workflow on the canvas.</p><label className="field">Workflow name<input autoFocus required maxLength={255} value={name} placeholder="e.g. daily-data-pipeline" onChange={(event) => setName(event.target.value)} /></label><div className="modal-actions"><button type="button" className="button" onClick={() => setCreating(false)}>Cancel</button><button className="button primary" type="submit"><Plus size={16} />Create workflow</button></div></form></Modal>}
     {manualCopyId && <Modal title="Copy workflow ID" close={() => setManualCopyId(null)}>
       <p>Clipboard access is unavailable. Copy the selected workflow ID manually.</p>
@@ -190,65 +187,30 @@ function AuditTimestamp({ value }: { value?: string }) {
 
 function AuditActor({ id, name }: { id?: string; name: string }) {
   const tooltip = id && id !== name ? `${name} (${id})` : name;
-  return <dd className="workflow-audit-actor" title={tooltip}>{name}</dd>;
+  return <td className="workflow-audit-cell" title={tooltip}>{name}</td>;
 }
 
-function WorkflowCard({ graph, favorite, opening, auditActorName, open, copy, toggleFavorite, showVersions, openRuntime }: {
-  graph: Graph;
-  favorite: boolean;
-  opening: boolean;
-  auditActorName: (actor?: string) => string;
-  open: () => void;
-  copy: () => void;
-  toggleFavorite: () => void;
-  showVersions: () => void;
-  openRuntime: () => void;
-}) {
-  const connectionCount = graph.edges.length;
-  return <li className="workflow-card">
-    <div className="workflow-card-header">
-      <span className="workflow-card-icon"><Workflow size={23} /></span>
-      <div className="workflow-card-identity">
-        <h2><button type="button" className="workflow-card-title" title={graph.name} disabled={opening} onClick={open}>{graph.name}</button></h2>
-        <WorkflowId id={graph.id} copy={copy} />
-      </div>
-      <button type="button" className="icon-button workflow-card-favorite" aria-label="Favorite workflow" aria-pressed={favorite} title={favorite ? 'Remove from favorites' : 'Add to favorites'} onClick={toggleFavorite}><Star size={18} /></button>
-    </div>
-    <div className="workflow-card-body">
-      <div className="workflow-card-meta">
-        <span><Box size={15} />{graph.node_count} {graph.node_count === 1 ? 'node' : 'nodes'}</span>
-        <span><Link2 size={15} />{connectionCount} {connectionCount === 1 ? 'connection' : 'connections'}</span>
-      </div>
-      <dl className="workflow-audit">
-        <div><dt><AuditLabel field="created_by" /></dt><AuditActor id={graph.created_by} name={auditActorName(graph.created_by)} /></div>
-        <div><dt><AuditLabel field="created_at" /></dt><dd><AuditTimestamp value={graph.created_at} /></dd></div>
-        <div><dt><AuditLabel field="updated_by" /></dt><AuditActor id={graph.updated_by} name={auditActorName(graph.updated_by)} /></div>
-        <div><dt><AuditLabel field="updated_at" /></dt><dd><AuditTimestamp value={graph.updated_at} /></dd></div>
-      </dl>
-    </div>
-    <div className="workflow-card-footer">
-      <button type="button" className="button workflow-editor-button" disabled={opening} onClick={open}><Pencil size={14} />Edit</button>
-      <button type="button" className="button" disabled={opening} onClick={showVersions}>Versions</button>
-      <button type="button" className="button" disabled={opening} onClick={openRuntime}><Activity size={14} />Runtime</button>
-    </div>
-  </li>;
-}
+type WorkflowTableMode =
+  | { tab: 'drafts'; favorites: ReadonlySet<string>; toggleFavorite: (id: string) => void; showVersions: (graph: Graph) => void }
+  | { tab: 'published'; diff: (graph: Graph) => void };
 
-function PublishedVersions({ rows, opening, auditActorName, edit, copy, openRuntime }: {
+function WorkflowTable({ rows, opening, auditActorName, edit, copy, openRuntime, mode }: {
   rows: Graph[];
   opening: boolean;
   auditActorName: (actor?: string) => string;
   edit: (graph: Graph) => void;
   copy: (id: string) => void;
   openRuntime: (graphId: string) => void;
+  mode: WorkflowTableMode;
 }) {
-  return <div className="panel workflow-versions-table">
-    <div className="table-scroll" role="region" aria-label="Published workflow records" tabIndex={0}>
-      <table aria-label="Published versions">
+  const draft = mode.tab === 'drafts';
+  return <div className="panel workflow-table">
+    <div className="table-scroll" role="region" aria-label={draft ? 'Draft workflow records' : 'Published workflow records'} tabIndex={0}>
+      <table aria-label={draft ? 'Draft workflows' : 'Published versions'}>
         <thead>
           <tr>
             <th scope="col">Workflow</th>
-            <th scope="col">Version</th>
+            {!draft && <th scope="col">Version</th>}
             <th scope="col">Nodes</th>
             <th scope="col">Connections</th>
             <th scope="col"><AuditLabel field="created_by" /></th>
@@ -258,23 +220,32 @@ function PublishedVersions({ rows, opening, auditActorName, edit, copy, openRunt
             <th scope="col">Actions</th>
           </tr>
         </thead>
-        <tbody>{rows.map((graph) => <tr key={`${graph.id}:${graph.version}`}>
-          <td>
-            <button type="button" className="table-name" title={graph.name} disabled={opening} onClick={() => edit(graph)}><strong>{graph.name}</strong></button>
-            <WorkflowId id={graph.id} copy={() => copy(graph.id)} />
-          </td>
-          <td><Badge status="published">v{graph.version}</Badge></td>
-          <td>{graph.node_count} {graph.node_count === 1 ? 'node' : 'nodes'}</td>
-          <td>{graph.edges.length} {graph.edges.length === 1 ? 'connection' : 'connections'}</td>
-          <td className="workflow-audit-cell" title={graph.created_by}>{auditActorName(graph.created_by)}</td>
-          <td className="workflow-audit-cell"><AuditTimestamp value={graph.created_at} /></td>
-          <td className="workflow-audit-cell" title={graph.updated_by}>{auditActorName(graph.updated_by)}</td>
-          <td className="workflow-audit-cell"><AuditTimestamp value={graph.updated_at} /></td>
-          <td><div className="actions">
-            <button type="button" className="button small workflow-editor-button" disabled={opening} onClick={() => edit(graph)}><Pencil size={14} />Edit</button>
-            <button type="button" className="button small" disabled={opening} onClick={() => openRuntime(graph.id)}><Activity size={14} />Runtime</button>
-          </div></td>
-        </tr>)}</tbody>
+        <tbody>{rows.map((graph) => {
+          const favorite = draft && mode.favorites.has(graph.id);
+          return <tr key={`${graph.id}:${graph.version}`}>
+            <td><div className="workflow-table-identity">
+              <div>
+                <button type="button" className="table-name" title={graph.name} disabled={opening} onClick={() => edit(graph)}><strong>{graph.name}</strong></button>
+                <WorkflowId id={graph.id} copy={() => copy(graph.id)} />
+              </div>
+              {draft && <button type="button" className="icon-button workflow-favorite" aria-label="Favorite workflow" aria-pressed={favorite}
+                title={favorite ? 'Remove from favorites' : 'Add to favorites'} onClick={() => mode.toggleFavorite(graph.id)}><Star size={16} /></button>}
+            </div></td>
+            {!draft && <td><Badge status="published">v{graph.version}</Badge></td>}
+            <td>{graph.node_count} {graph.node_count === 1 ? 'node' : 'nodes'}</td>
+            <td>{graph.edges.length} {graph.edges.length === 1 ? 'connection' : 'connections'}</td>
+            <AuditActor id={graph.created_by} name={auditActorName(graph.created_by)} />
+            <td className="workflow-audit-cell"><AuditTimestamp value={graph.created_at} /></td>
+            <AuditActor id={graph.updated_by} name={auditActorName(graph.updated_by)} />
+            <td className="workflow-audit-cell"><AuditTimestamp value={graph.updated_at} /></td>
+            <td><div className="actions">
+              <button type="button" className="button small workflow-editor-button" disabled={opening} onClick={() => edit(graph)}><Pencil size={14} />Edit</button>
+              {draft ? <button type="button" className="button small" disabled={opening} onClick={() => mode.showVersions(graph)}>Versions</button>
+                : <button type="button" className="button small" disabled={opening} onClick={() => mode.diff(graph)}><GitCompare size={14} />Diff</button>}
+              <button type="button" className="button small" disabled={opening} onClick={() => openRuntime(graph.id)}><Activity size={14} />Runtime</button>
+            </div></td>
+          </tr>;
+        })}</tbody>
       </table>
     </div>
   </div>;
