@@ -303,8 +303,13 @@ The four sections use the same resource APIs as other clients:
   outputs, save drafts, and publish immutable versions. The Drafts table lists
   editable workflows. In Published versions, choose **Diff** on a target row
   and select a base version to compare workflow fields, nodes, node settings,
-  ports, and connections. **Include other workflows** expands the choice of
-  base versions.
+  ports, and connections. The comparison canvas highlights added, removed,
+  and modified nodes and draws removed connections with dashed lines. Select
+  a node to inspect its changes. **Include other workflows** expands the
+  choice of base versions.
+  In **Node Properties**, **Docker configuration** accepts one command argument
+  per row and environment variables in `NAME=value` form. The JSON editor
+  opens the same configuration.
   The JSON editor supports import through pasted JSON and export. It flags
   cycles and invalid roots and marks unreferenced outputs as informational.
   Publishing also runs the server validator. Node positions are local to the

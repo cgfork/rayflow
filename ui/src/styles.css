@@ -341,6 +341,14 @@ td .actions .button:not(.danger):not(:disabled):active { background: var(--butto
 .graph-diff-results { display: grid; gap: var(--space-4); margin-top: var(--space-4); }
 .graph-diff-results .info-banner { margin: 0; }
 .graph-diff-results h3 { margin-bottom: var(--space-2); }
+.modal.wide:has(.graph-diff-controls) { width: 1040px; }
+.graph-diff-canvas { overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); }
+.graph-diff-canvas .flow-canvas { height: clamp(260px, 43dvh, 420px); min-height: 0; }
+.graph-diff-legend { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: 0; padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border); list-style: none; }
+.graph-diff-legend li { padding: 0 var(--space-2); border: 1px solid var(--diff-color); border-radius: var(--radius-small); background: var(--diff-bg); color: var(--diff-color); font-size: var(--font-small); }
+.graph-diff-legend li[data-change="removed"] { border-style: dashed; }
+.graph-diff-node-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-2); }
+.graph-diff-node-heading h3 { margin: 0; }
 .graph-diff-node h4 { margin: var(--space-3) 0 var(--space-2); font-size: var(--font-table); overflow-wrap: anywhere; }
 .graph-diff-table { table-layout: fixed; white-space: normal; overflow-wrap: anywhere; }
 .graph-diff-table th:first-child { width: 30%; }
@@ -464,6 +472,14 @@ main:has(> .runtime-canvas) > .back-link { align-self: flex-start; }
 .node-succeeded .task-node-footer, .node-running .task-node-footer { background: var(--success-soft); color: var(--success); }
 .node-failed .task-node-footer, .node-terminated .task-node-footer { background: var(--danger-soft); color: var(--danger); }
 .node-pending .task-node-footer { background: var(--accent-soft); color: var(--accent); }
+.graph-diff-canvas [data-change="added"] { --diff-color: var(--success); --diff-bg: var(--success-soft); }
+.graph-diff-canvas [data-change="removed"] { --diff-color: var(--danger); --diff-bg: var(--danger-soft); }
+.graph-diff-canvas [data-change="modified"] { --diff-color: var(--accent); --diff-bg: var(--accent-soft); }
+.graph-diff-canvas .task-node[data-change] { border-color: var(--diff-color); }
+.graph-diff-canvas .task-node[data-change="removed"] { border-style: dashed; }
+.graph-diff-canvas .task-node[data-change] .task-node-footer { border-color: var(--diff-color); background: var(--diff-bg); color: var(--diff-color); }
+.graph-diff-canvas .task-node.selected { outline-offset: 2px; }
+.graph-diff-canvas .graph-diff-handle { visibility: hidden; }
 .canvas-caption { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-top: 1px solid var(--border); color: var(--muted); font-size: var(--font-small); }
 .canvas-caption > span { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
 .canvas-caption code { min-width: 0; overflow-wrap: anywhere; }
@@ -479,6 +495,11 @@ main:has(> .runtime-canvas) > .back-link { align-self: flex-start; }
 .runtime-file-control { display: flex; align-items: center; gap: var(--space-2); }
 .inspector .runtime-node-artifact .details > div { flex-direction: row; align-items: baseline; }
 .inspector .runtime-node-artifact .details dd { text-align: right; }
+.docker-config-list + .docker-config-list { margin-top: var(--space-3); }
+.docker-config-list-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-2); }
+.docker-config-list-heading h4 { margin: 0; color: var(--muted); font-size: var(--font-table); font-weight: 500; }
+.docker-config-row { margin-top: var(--space-2); }
+.docker-config-row textarea { resize: vertical; font-family: var(--font-mono); font-size: var(--font-small); }
 .settings-resources { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-2); }
 .node-override { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); padding: var(--space-1) var(--space-2); border-radius: var(--radius); background: var(--canvas); font-size: var(--font-small); }
 .node-override > :first-child { min-width: 0; overflow-wrap: anywhere; }

@@ -3,7 +3,7 @@ import { Activity, ArrowLeft, Box, CalendarClock, CalendarPlus, Check, Code2, Co
 import { api, dateTime, send, usePaged } from './api';
 import { useAuditActorName } from './audit';
 import { Badge, Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination, Refresh, SearchBox, UuidText } from './components';
-import { DockerConfigInput, parseDockerConfig } from './DockerConfigInput';
+import { DockerConfigFields, DockerConfigInput, parseDockerConfig } from './DockerConfigInput';
 import FlowCanvas from './FlowCanvas';
 import GraphDiffDialog from './GraphDiffDialog';
 import NodeOverrides from './NodeOverrides';
@@ -40,7 +40,7 @@ export default function Orchestration({ actor, user, notify, dirtyChanged, openR
   const [favorites, setFavorites] = useState(loadFavorites);
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [versions, setVersions] = useState<Pick<Graph, 'id' | 'name'> | null>(null);
-  const [diffTarget, setDiffTarget] = useState<Pick<Graph, 'id' | 'name' | 'version'> | null>(null);
+  const [diffTarget, setDiffTarget] = useState<Graph | null>(null);
   const [manualCopyId, setManualCopyId] = useState<string | null>(null);
   const manualCopyInput = useRef<HTMLInputElement>(null);
   const [editor, setEditor] = useState<{ graph: Graph; isNew: boolean } | null>(null);
@@ -310,6 +310,9 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
   const [configuring, setConfiguring] = useState(false);
   const choices = outputChoices(graph, node.id);
   const upstream = upstreamIds(graph, node.id);
+  function updateConfig(config: GraphNode['settings']['config']) {
+    update({ ...node, settings: { ...node.settings, config } });
+  }
   function selectOutput(index: number, source: string) {
     const choice = choices.find((item) => item.source === source);
     const updated = { ...node, inputs: node.inputs.map((input, offset) => offset === index ? { ...input, source, file_name: input.file_name || choice?.output.file_name || '' } : input) };
@@ -322,9 +325,12 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
       {node.node_type !== 'docker' && <option value="" disabled>Select task type</option>}
       <option value="docker">Docker</option>
     </select></label>
-    <div className="field-section node-settings">
-      <h3>Node settings <button type="button" className="icon-button" title="Edit Docker configuration JSON" aria-label="Edit Docker configuration JSON" onClick={() => setConfiguring(true)}><Code2 size={15} /></button></h3>
-      <label className="field">Docker image<input aria-label="Docker image" placeholder="alpine:3.21" value={typeof node.settings.config?.image === 'string' ? node.settings.config.image : ''} onChange={(event) => update({ ...node, settings: { ...node.settings, config: { ...node.settings.config, image: event.target.value } } })} /></label>
+    <div className="field-section">
+      <h3>Docker configuration <button type="button" className="icon-button" title="Edit Docker configuration JSON" aria-label="Edit Docker configuration JSON" onClick={() => setConfiguring(true)}><Code2 size={15} /></button></h3>
+      <DockerConfigFields config={node.settings.config} change={updateConfig} />
+    </div>
+    <div className="field-section">
+      <h3>Node settings</h3>
       <div className="settings-resources">
         <label className="field">CPU cores<input aria-label="CPU cores" type="number" min="1" max="4294967295" step="1" value={node.settings.resource.cpu_cores} onChange={(event) => update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, cpu_cores: Number(event.target.value) } } })} /></label>
         <label className="field">Memory (MiB)<input aria-label="Memory (MiB)" type="number" min="1" step="1" value={node.settings.resource.memory_bytes / 1048576} onChange={(event) => update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, memory_bytes: Math.round(Number(event.target.value) * 1048576) } } })} /></label>
@@ -336,7 +342,7 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
     <div className="field-section"><h3>Outputs <button type="button" className="icon-button" aria-label="Add output" onClick={() => update({ ...node, outputs: [...node.outputs, { file_name: '', kind: 'File', multiple: false }] })}><Plus size={15} /></button></h3>{node.outputs.length === 0 && <p className="muted small-text">No outputs defined.</p>}{node.outputs.map((output, index) => <div className="port-form" key={index}><div className="actions"><input aria-label={`Output ${index + 1} file name`} placeholder="File name" value={output.file_name} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, file_name: event.target.value } : item) })} /><button type="button" className="icon-button" aria-label={`Remove output ${index + 1}`} onClick={() => update({ ...node, outputs: node.outputs.filter((_, offset) => offset !== index) })}><X size={14} /></button></div><select aria-label={`Output ${index + 1} kind`} value={output.kind} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, kind: event.target.value as 'File' | 'Directory' } : item) })}><option>File</option><option>Directory</option></select><label className="checkbox"><input type="checkbox" checked={output.multiple} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, multiple: event.target.checked } : item) })} />Multiple files</label></div>)}</div>
     <div className="field-section"><h3>Connections <Link2 size={14} /></h3>{graph.edges.filter(([source]) => source === node.id).map(([source, destination]) => <div className="connection" key={destination}><span>→ {graph.nodes.find((item) => item.id === destination)?.name}</span><button type="button" className="icon-button" aria-label="Remove connection" onClick={() => change(disconnectEdges(graph, [[source, destination]]))}><X size={13} /></button></div>)}<div className="actions"><select aria-label="Connect to node" value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Connect to…</option>{graph.nodes.filter((item) => item.id !== node.id && !upstream.has(item.id) && !graph.edges.some(([source, destination]) => source === node.id && destination === item.id)).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button type="button" className="icon-button" disabled={!target} aria-label="Add connection" onClick={() => { change({ ...graph, edges: [...graph.edges, [node.id, target]] }); setTarget(''); }}><Plus size={16} /></button></div></div>
     <button type="button" className="button danger subtle" onClick={remove}><Trash2 size={15} />Delete node</button><UuidText className="mono inspector-id" id={node.id} />
-  </fieldset>{configuring && <DockerConfigEditor config={node.settings.config} close={() => setConfiguring(false)} apply={(config) => { update({ ...node, settings: { ...node.settings, config } }); setConfiguring(false); }} />}</>;
+  </fieldset>{configuring && <DockerConfigEditor config={node.settings.config} close={() => setConfiguring(false)} apply={(config) => { updateConfig(config); setConfiguring(false); }} />}</>;
 }
 
 function DockerConfigEditor({ config, close, apply }: { config: GraphNode['settings']['config']; close: () => void; apply: (config: GraphNode['settings']['config']) => void }) {

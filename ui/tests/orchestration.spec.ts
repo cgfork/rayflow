@@ -229,14 +229,59 @@ test('Docker configuration code editor marks syntax errors and saves a JSON obje
   await apply.click();
   await expect(configDialog.getByRole('alert')).toContainText('Docker configuration must be a JSON object.');
 
-  const config = { image: 'example.invalid/new-worker', env: ['MODE=batch'], labels: { team: 'data' } };
+  const config = { image: 'example.invalid/new-worker', command: ['run', '--batch'], env: ['MODE=batch'], labels: { team: 'data' } };
   await editor.fill(JSON.stringify(config, null, 2));
   await apply.click();
   await expect(configDialog).toBeHidden();
   await expect(page.getByLabel('Docker image', { exact: true })).toHaveValue(config.image);
+  await expect(page.getByRole('textbox', { name: 'Command argument 2' })).toHaveValue('--batch');
+  await expect(page.getByRole('textbox', { name: 'Environment variable 1' })).toHaveValue('MODE=batch');
   await page.getByRole('button', { name: 'Save draft', exact: true }).click();
   await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
   expect(draft.nodes[0].settings.config).toEqual(config);
+});
+
+test('Node Properties saves Docker arguments and environment entries from the form', async ({ page }) => {
+  await mockGraphs(page);
+  const node = report.nodes[0];
+  const config = { ...node.settings.config, env: ['DISABLE_FROM_IMAGE', 'MODE=old'], working_dir: '/app' };
+  let draft: Graph = { ...report, nodes: [{ ...node, settings: { ...node.settings, config } }] };
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+  await page.goto(home);
+  await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+
+  const inspector = page.getByRole('complementary');
+  const command = inspector.getByRole('group', { name: 'Command', exact: true });
+  const args = ['sh', '-c', 'echo "$MODE"\nexit 0', '  with spaces  ', ''];
+  for (const [index, arg] of args.entries()) {
+    await command.getByRole('button', { name: 'Add argument', exact: true }).click();
+    await command.getByRole('textbox', { name: `Command argument ${index + 1}` }).fill(arg);
+  }
+  const env = inspector.getByRole('group', { name: 'Environment variables', exact: true });
+  await expect(env.getByRole('textbox', { name: 'Environment variable 1' })).toHaveValue('DISABLE_FROM_IMAGE');
+  await env.getByRole('button', { name: 'Remove environment variable 2' }).click();
+  await env.getByRole('button', { name: 'Add variable' }).click();
+  await env.getByRole('textbox', { name: 'Environment variable 2' }).fill('MODE=region=eu');
+  await env.getByRole('button', { name: 'Add variable' }).click();
+  await env.getByRole('textbox', { name: 'Environment variable 3' }).fill('EMPTY=');
+
+  await inspector.getByRole('button', { name: 'Edit Docker configuration JSON' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Docker configuration' });
+  const editor = dialog.getByRole('textbox', { name: 'Docker configuration JSON' });
+  await expect(editor).toContainText('"command"');
+  await expect(editor).toContainText('MODE=region=eu');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].settings.config).toEqual({ ...config, command: args, env: ['DISABLE_FROM_IMAGE', 'MODE=region=eu', 'EMPTY='] });
+
+  for (let index = args.length; index > 0; index--) await command.getByRole('button', { name: `Remove command argument ${index}` }).click();
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].settings.config).toEqual({ ...config, env: ['DISABLE_FROM_IMAGE', 'MODE=region=eu', 'EMPTY='] });
 });
 
 test('The draft table shows workflow metadata, row actions, and copyable IDs', async ({ page, context }) => {
@@ -516,27 +561,53 @@ test('Published lists each version and Edit starts a draft from the selected ver
   await expect(olderCleanupRow.getByRole('cell', { name: '2 nodes', exact: true })).toBeVisible();
 });
 
-test('Diff compares an older published version and shows before and after values', async ({ page }) => {
+test('Diff shows node and connection changes on the canvas and their before and after values', async ({ page }) => {
   await mockGraphs(page);
+  const [load, plan, review, obsolete, archive] = graph(cleanup.id, cleanup.name, 0, [
+    'Load inventory', 'List candidates', 'Review candidates', 'Remove expired records', 'Clean archive',
+  ]).nodes;
+  const inventory: GraphNode = { ...load, outputs: [{ file_name: 'inventory.json', kind: 'File', multiple: false }] };
+  const beforePlan: GraphNode = {
+    ...plan,
+    settings: {
+      config: { image: 'alpine' }, resource: { cpu_cores: 1, memory_bytes: 512 }, timeout: '10s',
+      overrides: { fast: { timeout: '5s' } },
+    },
+    inputs: [{ file_name: 'inventory.json', source: 'Load inventory.inventory.json', required: true, format: null }],
+  };
+  const afterPlan: GraphNode = {
+    ...beforePlan,
+    name: 'Plan cleanup',
+    settings: { config: { image: 'alpine', command: ['run'] }, resource: { cpu_cores: 2, memory_bytes: 1024 }, timeout: '20s' },
+    inputs: [{ ...beforePlan.inputs[0], required: false }],
+    outputs: [{ file_name: 'summary.txt', kind: 'File', multiple: false }],
+  };
+  const before: Graph = {
+    ...olderCleanup, node_count: 4, nodes: [inventory, beforePlan, review, obsolete],
+    edges: [[load.id, plan.id], [plan.id, review.id], [plan.id, obsolete.id]],
+  };
+  const after: Graph = {
+    ...cleanup, node_count: 4, nodes: [inventory, afterPlan, review, archive],
+    edges: [[load.id, plan.id], [load.id, review.id], [review.id, plan.id], [plan.id, archive.id]],
+  };
   const versions = `**${api}/graphs?graph_id=${cleanup.id}&limit=50`;
-  await page.route(versions, (route) => route.fulfill({ json: { items: [cleanup], next_cursor: publishedCursor } }));
-  await page.route(`${versions}&before=${publishedCursor}`, (route) => route.fulfill({ json: { items: [olderCleanup], next_cursor: null } }));
-  const [root, removed] = olderCleanup.nodes.map((node) => node.id);
-  const added = 'ab000005-0000-4000-8000-000000000003';
-  const path = `**${api}/graphs/${cleanup.id}/diff?from_version=${olderCleanup.version}&version=${cleanup.version}`;
+  await page.route(`**${api}/graphs?limit=50`, (route) => route.fulfill({ json: { items: [after], next_cursor: null } }));
+  await page.route(versions, (route) => route.fulfill({ json: { items: [after], next_cursor: publishedCursor } }));
+  await page.route(`${versions}&before=${publishedCursor}`, (route) => route.fulfill({ json: { items: [before], next_cursor: null } }));
+  const path = `**${api}/graphs/${after.id}/diff?from_version=${before.version}&version=${after.version}`;
   const requests: string[] = [];
   await page.route(path, (route) => {
     requests.push(route.request().method());
     return route.fulfill({ json: {
-      before_node_names: { [root]: 'List candidates', [removed]: 'Remove expired records' },
-      after_node_names: { [root]: 'Plan cleanup', [added]: 'Clean archive' },
+      before_node_names: Object.fromEntries(before.nodes.map(({ id, name }) => [id, name])),
+      after_node_names: Object.fromEntries(after.nodes.map(({ id, name }) => [id, name])),
       changes: [
         { field: 'version', change: [2, 4] },
         { field: 'structure', change: {
-          node_diffs: [[root, [
-            { field: 'name', change: ['List candidates', 'Plan cleanup'] },
+          node_diffs: [[plan.id, [
+            { field: 'name', change: [beforePlan.name, afterPlan.name] },
             { field: 'settings', change: [
-              { field: 'config', change: [null, { image: 'alpine', command: ['run'] }] },
+              { field: 'config', change: [beforePlan.settings.config, afterPlan.settings.config] },
               { field: 'resource', change: [
                 { field: 'cpu_cores', change: [1, 2] },
                 { field: 'memory_bytes', change: [512, 1024] },
@@ -547,32 +618,62 @@ test('Diff compares an older published version and shows before and after values
               ] },
             ] },
             { field: 'inputs', change: [{ kind: 'changed', index: 0, changes: [{ field: 'required', change: [true, false] }] }] },
-            { field: 'outputs', change: [{ kind: 'added', index: 0, value: { file_name: 'summary.txt', kind: 'File', multiple: false } }] },
+            { field: 'outputs', change: [{ kind: 'added', index: 0, value: afterPlan.outputs[0] }] },
           ]]],
-          node_miss: [added], node_over: [removed], edge_miss: [[root, added]], edge_over: [[root, removed]],
+          node_miss: [archive.id],
+          node_over: [obsolete.id],
+          edge_miss: [[load.id, review.id], [review.id, plan.id], [plan.id, archive.id]],
+          edge_over: [[plan.id, review.id], [plan.id, obsolete.id]],
         } },
       ],
     } });
   });
   await page.goto(home);
   await page.getByRole('button', { name: 'Published versions', exact: true }).click();
-  await publishedRow(page, cleanup).getByRole('button', { name: 'Diff', exact: true }).click();
+  await publishedRow(page, after).getByRole('button', { name: 'Diff', exact: true }).click();
 
   const dialog = page.getByRole('dialog', { name: 'Compare graph versions' });
-  await expect(dialog.getByText(`v${cleanup.version}`, { exact: true })).toBeVisible();
+  await expect(dialog.getByText(`v${after.version}`, { exact: true })).toBeVisible();
   const compare = dialog.getByRole('button', { name: 'Compare', exact: true });
   await expect(compare).toBeDisabled();
   await dialog.getByRole('button', { name: 'Next page' }).click();
-  await dialog.getByRole('combobox', { name: 'Base version' }).selectOption(`${olderCleanup.id}:${olderCleanup.version}`);
+  await dialog.getByRole('combobox', { name: 'Base version' }).selectOption(`${before.id}:${before.version}`);
   expect(requests).toEqual([]);
   await compare.click();
 
+  const canvas = dialog.getByRole('region', { name: 'Graph comparison canvas' });
+  const modifiedNode = canvas.getByRole('group', { name: 'Plan cleanup, Modified', exact: true });
+  const addedNode = canvas.getByRole('group', { name: 'Clean archive, Added', exact: true });
+  const removedNode = canvas.getByRole('group', { name: 'Remove expired records, Removed', exact: true });
+  const unchangedNode = canvas.getByRole('group', { name: 'Load inventory, Unchanged', exact: true });
+  await expect(modifiedNode.getByText('Modified', { exact: true })).toBeVisible();
+  await expect(addedNode.getByText('Added', { exact: true })).toBeVisible();
+  await expect(removedNode.getByText('Removed', { exact: true })).toBeVisible();
+  await expect(removedNode.locator('.task-node')).toHaveCSS('border-top-style', 'dashed');
+  await expect(unchangedNode).toBeVisible();
+
+  const connection = (name: string) => canvas.getByRole('img', { name, exact: true }).locator('.react-flow__edge-path');
+  const removedConnection = connection('Removed connection from Plan cleanup to Remove expired records');
+  const reversedConnection = connection('Removed connection from Plan cleanup to Review candidates');
+  const addedConnection = connection('Added connection from Review candidates to Plan cleanup');
+  await expect(removedConnection).toHaveCSS('stroke-dasharray', '6px, 4px');
+  await expect(reversedConnection).toHaveCSS('stroke-dasharray', '6px, 4px');
+  await expect(addedConnection).toHaveCSS('stroke-dasharray', 'none');
+  const pathTop = (path: Locator) => path.evaluate((element) => (element as SVGPathElement).getBBox().y);
+  expect(await pathTop(reversedConnection)).toBeLessThan(await pathTop(addedConnection));
+
   const nodeChanges = dialog.getByRole('table', { name: 'Changes to Plan cleanup' });
+  const nodes = dialog.getByRole('table', { name: 'Added and removed nodes' });
+  await expect(nodes.getByRole('row', { name: /Added/ })).toContainText('Clean archive');
+  await expect(nodes.getByRole('row', { name: /Removed/ })).toContainText('Remove expired records');
+
+  await modifiedNode.click();
+  await expect(nodes).toHaveCount(0);
   await expect(nodeChanges.getByRole('columnheader')).toHaveText(['Change', 'Before', 'After']);
   await expect(nodeChanges.getByRole('row', { name: 'Name List candidates Plan cleanup' }).getByRole('cell')).toHaveText(['List candidates', 'Plan cleanup']);
   const config = nodeChanges.getByRole('row', { name: /Settings · Configuration/ }).getByRole('cell');
-  await expect(config.first()).toHaveText('null');
-  await expect(config.last()).toContainText('"image": "alpine"');
+  await expect(config.first()).toContainText('"image": "alpine"');
+  await expect(config.last()).toContainText('"command":');
   await expect(nodeChanges.getByRole('row', { name: /Settings · CPU cores/ }).getByRole('cell')).toHaveText(['1', '2']);
   await expect(nodeChanges.getByRole('row', { name: /Settings · Memory/ }).getByRole('cell')).toHaveText(['512', '1024']);
   await expect(nodeChanges.getByRole('row', { name: /Settings · Timeout/ }).getByRole('cell')).toHaveText(['10s', '20s']);
@@ -581,10 +682,25 @@ test('Diff compares an older published version and shows before and after values
   await expect(override.last()).toHaveText('—');
   await expect(nodeChanges.getByRole('row', { name: /Input 1 · Required/ }).getByRole('cell')).toHaveText(['true', 'false']);
   await expect(nodeChanges.getByRole('row', { name: /Output 1 · Added/ })).toContainText('summary.txt');
-  const nodes = dialog.getByRole('table', { name: 'Added and removed nodes' });
+
+  await removedNode.focus();
+  await removedNode.press('Enter');
+  await expect(nodeChanges).toHaveCount(0);
+  await expect(nodes.getByRole('row', { name: /Added/ })).toHaveCount(0);
+  await expect(nodes.getByRole('row', { name: /Removed/ })).toContainText('Remove expired records');
+  await unchangedNode.click();
+  await expect(dialog.getByRole('status')).toHaveText('Load inventory is unchanged.');
+  await dialog.getByRole('button', { name: 'Show all node changes' }).click();
+  await expect(nodeChanges).toBeVisible();
   await expect(nodes.getByRole('row', { name: /Added/ })).toContainText('Clean archive');
   await expect(nodes.getByRole('row', { name: /Removed/ })).toContainText('Remove expired records');
-  await expect(dialog.getByRole('table', { name: 'Connection changes' }).getByRole('cell')).toHaveText(['List candidates → Remove expired records', '—', '—', 'Plan cleanup → Clean archive']);
+  await expect(dialog.getByRole('table', { name: 'Connection changes' }).getByRole('cell')).toHaveText([
+    'List candidates → Review candidates', '—',
+    'List candidates → Remove expired records', '—',
+    '—', 'Load inventory → Review candidates',
+    '—', 'Review candidates → Plan cleanup',
+    '—', 'Plan cleanup → Clean archive',
+  ]);
   await expect(dialog.getByRole('table', { name: 'Workflow field changes' }).getByRole('cell')).toHaveText(['2', '4']);
   expect(requests).toEqual(['GET']);
   await dialog.getByRole('button', { name: 'Close dialog' }).click();
@@ -593,15 +709,18 @@ test('Diff compares an older published version and shows before and after values
 
 test('Diff can compare another workflow and retry a failed comparison', async ({ page }) => {
   await mockGraphs(page);
+  const base = { ...cleanup, id: ingestVersion.id, name: ingestVersion.name };
+  await page.route(`**${api}/graphs?limit=50`, (route) => route.fulfill({ json: { items: [cleanup, base], next_cursor: null } }));
   await page.route(`**${api}/graphs?graph_id=${cleanup.id}&limit=50`, (route) => route.fulfill({ json: { items: [cleanup], next_cursor: null } }));
-  const path = `**${api}/graphs/${cleanup.id}/diff?from_version=${ingestVersion.version}&version=${cleanup.version}&from_graph_id=${ingestVersion.id}`;
+  const path = `**${api}/graphs/${cleanup.id}/diff?from_version=${base.version}&version=${cleanup.version}&from_graph_id=${base.id}`;
+  const names = Object.fromEntries(cleanup.nodes.map(({ id, name }) => [id, name]));
   let requests = 0;
   await page.route(path, (route) => {
     requests += 1;
     if (requests === 1) return route.fulfill({ status: 503, json: { error: 'Comparison unavailable' } });
     return route.fulfill({ json: {
-      changes: [{ field: 'name', change: [ingestVersion.name, cleanup.name] }],
-      before_node_names: {}, after_node_names: {},
+      changes: [{ field: 'id', change: [base.id, cleanup.id] }, { field: 'name', change: [base.name, cleanup.name] }],
+      before_node_names: names, after_node_names: names,
     } });
   });
   await page.goto(home);
@@ -610,11 +729,12 @@ test('Diff can compare another workflow and retry a failed comparison', async ({
 
   const dialog = page.getByRole('dialog', { name: 'Compare graph versions' });
   await dialog.getByRole('checkbox', { name: 'Include other workflows' }).check();
-  await dialog.getByRole('combobox', { name: 'Base version' }).selectOption(`${ingestVersion.id}:${ingestVersion.version}`);
+  await dialog.getByRole('combobox', { name: 'Base version' }).selectOption(`${base.id}:${base.version}`);
   await dialog.getByRole('button', { name: 'Compare', exact: true }).click();
   await expect(dialog.getByRole('alert')).toContainText('Comparison unavailable');
   await dialog.getByRole('button', { name: 'Try again' }).click();
-  await expect(dialog.getByRole('table', { name: 'Workflow field changes' }).getByRole('cell')).toHaveText([ingestVersion.name, cleanup.name]);
+  await expect(dialog.getByRole('table', { name: 'Workflow field changes' }).getByRole('row', { name: /Workflow name/ }).getByRole('cell')).toHaveText([base.name, cleanup.name]);
+  await expect(dialog.getByRole('group', { name: 'Remove expired records, Unchanged' })).toBeVisible();
   await expect(dialog.getByRole('status')).toHaveText('The nodes and connections match.');
   expect(requests).toBe(2);
 });

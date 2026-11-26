@@ -7,6 +7,10 @@ export function isJsonObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+export function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
 export function isOverrideNameValid(name: string): boolean {
   return name !== 'default' && !name.endsWith(' ') && utf8.encode(name).length <= 255;
 }
@@ -74,7 +78,7 @@ function validateNodeSettings(label: string, settings: NodeSettings | undefined,
   if (typeof config?.image !== 'string' || !config.image.trim()) errors.push(`${label}: Docker image is required.`);
   for (const field of ['command', 'env']) {
     const value = config?.[field];
-    if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== 'string'))) errors.push(`${label}: Docker ${field} must be an array of strings.`);
+    if (value !== undefined && !isStringArray(value)) errors.push(`${label}: Docker ${field} must be an array of strings.`);
   }
   if (config?.working_dir !== undefined && typeof config.working_dir !== 'string') errors.push(`${label}: Docker working_dir must be a string.`);
   const cpu = resource?.cpu_cores ?? 0;
