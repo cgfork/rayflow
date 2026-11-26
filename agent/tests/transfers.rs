@@ -76,7 +76,6 @@ impl Fixture {
         let output = |name: &str, kind| Output {
             file_name: name.into(),
             kind,
-            multiple: false,
         };
         let producer = node("producer", vec![], vec![output("original.bin", Kind::File)]);
         let consumer = node(

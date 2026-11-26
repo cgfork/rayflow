@@ -1,5 +1,5 @@
 export interface Input { file_name: string; source: string; required: boolean; format: string | null }
-export interface Output { file_name: string; kind: 'File' | 'Directory'; multiple: boolean }
+export interface Output { file_name: string; kind: 'File' | 'Directory' }
 interface NodeResource { cpu_cores: number; memory_bytes: number }
 export interface NodeSettings {
   config: Record<string, unknown>;

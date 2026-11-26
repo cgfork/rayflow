@@ -28,13 +28,34 @@ impl Diff for Kind {
 
 /// An output produced by a node.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "OutputData")]
 pub struct Output {
     /// File name of the output.
     pub file_name: String,
     /// Whether the output is a file or a directory.
     pub kind: Kind,
-    /// Whether the output may expand to multiple files.
-    pub multiple: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct OutputData {
+    file_name: String,
+    kind: Kind,
+    #[serde(default)]
+    multiple: bool,
+}
+
+impl From<OutputData> for Output {
+    fn from(data: OutputData) -> Self {
+        Self {
+            file_name: data.file_name,
+            // Legacy multi-file outputs used the directory artifact format.
+            kind: if data.multiple {
+                Kind::Directory
+            } else {
+                data.kind
+            },
+        }
+    }
 }
 
 /// A changed output field and its before and after values.
@@ -43,7 +64,6 @@ pub struct Output {
 pub enum OutputDiff {
     FileName((String, String)),
     Kind((Kind, Kind)),
-    Multiple((bool, bool)),
 }
 
 impl Diff for Output {
@@ -55,7 +75,6 @@ impl Diff for Output {
                 .diff(&other.file_name)
                 .map(OutputDiff::FileName),
             self.kind.diff(&other.kind).map(OutputDiff::Kind),
-            value_diff(&self.multiple, &other.multiple).map(OutputDiff::Multiple),
         ])
     }
 }
@@ -399,6 +418,32 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn output_reads_legacy_flags_and_serializes_only_the_kind() {
+        for (input, expected_kind) in [
+            (json!({"file_name": "result", "kind": "File"}), Kind::File),
+            (
+                json!({"file_name": "result", "kind": "File", "multiple": false}),
+                Kind::File,
+            ),
+            (
+                json!({"file_name": "result", "kind": "File", "multiple": true}),
+                Kind::Directory,
+            ),
+            (
+                json!({"file_name": "result", "kind": "Directory", "multiple": false}),
+                Kind::Directory,
+            ),
+        ] {
+            let output: Output = serde_json::from_value(input).unwrap();
+            assert_eq!(output.kind, expected_kind);
+            assert_eq!(
+                serde_json::to_value(output).unwrap(),
+                json!({"file_name": "result", "kind": expected_kind}),
+            );
+        }
+    }
+
+    #[test]
     fn settings_only_changes_appear_in_diffs_and_keep_nodes_shared() {
         let timeout_override = |seconds| AnnotationMatchNodeSettings {
             timeout: Some(Duration::from_secs(seconds)),
@@ -425,7 +470,6 @@ mod tests {
             outputs: vec![Output {
                 file_name: "result.txt".into(),
                 kind: Kind::File,
-                multiple: false,
             }],
         };
         let previous = DAG {
@@ -488,7 +532,7 @@ mod tests {
             [node.id]
         );
 
-        current.nodes[0].outputs[0].multiple = true;
+        current.nodes[0].outputs[0].kind = Kind::Directory;
         assert!(current.diff(&previous).is_some());
         assert_eq!(current.fork_point(&previous), Some(node.id));
     }
@@ -508,7 +552,6 @@ mod tests {
         let output = Output {
             file_name: "result.txt".into(),
             kind: Kind::File,
-            multiple: false,
         };
         let removed_output = Output {
             file_name: "unused.txt".into(),
@@ -543,7 +586,6 @@ mod tests {
         after.outputs[0] = Output {
             file_name: "results".into(),
             kind: Kind::Directory,
-            multiple: true,
         };
         after.outputs.pop();
 
@@ -581,7 +623,6 @@ mod tests {
                         changes: vec![
                             OutputDiff::FileName(("result.txt".into(), "results".into())),
                             OutputDiff::Kind((Kind::File, Kind::Directory)),
-                            OutputDiff::Multiple((false, true)),
                         ],
                     },
                     VecDiff::Removed {

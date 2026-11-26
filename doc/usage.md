@@ -791,13 +791,15 @@ markers under `.rayflow/<job_uuid>/`. Each job therefore has an isolated local
 artifact directory, including resumed jobs that share a run or node-run.
 Artifact data stays available for upload retries until the cleanup sweep.
 
-Declare outputs on the producer node and bind downstream inputs with
-`source: "producer.output_name"`. In containers, read from
+Declare each output as `File` or `Directory` on the producer node and bind
+downstream inputs with `source: "producer.output_name"`. In containers, read from
 `$RAYFLOW_INPUT_DIR/<input.file_name>` and write to
 `$RAYFLOW_OUTPUT_DIR/<output.file_name>` (respectively `/data/inputs` and
-`/data/outputs`). Directory outputs include an internal `.rayflow-directory.json`
-manifest. The agent downloads inputs before execution and uploads outputs before
-reporting success, with durable checkpoints for retries.
+`/data/outputs`). Directory outputs contain any number of files and include an
+internal `.rayflow-directory.json` manifest. Legacy graph definitions with
+`multiple: true` load as `Directory` outputs. The agent downloads inputs before
+execution and uploads outputs before reporting success, with durable
+checkpoints for retries.
 
 Docker jobs receive the job directory as a read-only `/rayflow` mount. The
 container can read `/rayflow/job.json` and the pinned `/rayflow/graph.json`;

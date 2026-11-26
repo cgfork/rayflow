@@ -37,7 +37,7 @@ Generate node `settings.config` (12 MiB per file to exercise large artifact tran
 }
 ```
 
-Declare `original.bin` as a File output with `multiple: false`. The default
+Declare `original.bin` as a File output. The default
 size is 1 MiB per file. All generated files of equal size have identical content.
 Nested output paths are supported.
 

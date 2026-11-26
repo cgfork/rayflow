@@ -118,7 +118,6 @@ impl Workflow {
                         .then(|| Output {
                             file_name: "result.txt".into(),
                             kind: Kind::File,
-                            multiple: false,
                         })
                         .into_iter()
                         .collect(),
