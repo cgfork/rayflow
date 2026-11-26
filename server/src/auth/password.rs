@@ -131,10 +131,9 @@ impl LdapProvider {
         password: &str,
     ) -> Result<Option<User>, AuthError> {
         let config = &self.0;
-        // ldap:// always upgrades to TLS before any credentials are sent.
         let settings = LdapConnSettings::new()
             .set_conn_timeout(Duration::from_secs(5))
-            .set_starttls(config.url.starts_with("ldap://"));
+            .set_starttls(config.start_tls);
         let (connection, mut ldap) = LdapConnAsync::with_settings(settings, &config.url)
             .await
             .map_err(|_| AuthError::Unavailable)?;

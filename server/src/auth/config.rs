@@ -104,6 +104,9 @@ pub struct OidcConfig {
 #[serde(deny_unknown_fields)]
 pub struct LdapConfig {
     pub url: String,
+    /// Upgrade ldap:// connections to TLS before binding.
+    #[serde(default = "default_start_tls")]
+    pub start_tls: bool,
     pub bind_dn: String,
     pub bind_password: String,
     pub base_dn: String,
@@ -113,6 +116,10 @@ pub struct LdapConfig {
     pub name_attribute: String,
     #[serde(default = "default_email_attribute")]
     pub email_attribute: String,
+}
+
+fn default_start_tls() -> bool {
+    true
 }
 
 fn default_name_attribute() -> String {
@@ -218,5 +225,30 @@ impl AuthConfig {
             return Err(AuthConfigError::InvalidAgentToken);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LdapConfig;
+    use serde_json::{from_value, json};
+
+    #[test]
+    fn ldap_start_tls_defaults_to_enabled_and_can_be_disabled() {
+        let mut settings = json!({
+            "url": "ldap://directory.example.com",
+            "bind_dn": "cn=reader,dc=example,dc=com",
+            "bind_password": "test-password",
+            "base_dn": "dc=example,dc=com",
+            "user_filter": "(uid={username})",
+        });
+        assert!(
+            from_value::<LdapConfig>(settings.clone())
+                .unwrap()
+                .start_tls
+        );
+
+        settings["start_tls"] = json!(false);
+        assert!(!from_value::<LdapConfig>(settings).unwrap().start_tls);
     }
 }
