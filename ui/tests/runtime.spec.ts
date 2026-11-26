@@ -154,7 +154,8 @@ test('Node State loads result and usage on selection, manual refresh, and retry'
   await expect(usagePanel).not.toContainText('512 MiB');
 });
 
-test('Node State matches the Execution Graph height on desktop and the panel meets the footer', async ({ page }) => {
+test('Node State matches the Execution Graph height on desktop and the panel leaves space above the footer', async ({ page }) => {
+  const margin = 8;
   await page.setViewportSize({ width: 1440, height: 1400 });
   await mockRuntime(page);
   await page.route(`**${detailPath}`, (route) => route.fulfill({ json: view }));
@@ -172,7 +173,7 @@ test('Node State matches the Execution Graph height on desktop and the panel mee
   expect(inspector.height).toBeCloseTo(graph.height, 1);
   const desktopPanel = (await panel.boundingBox())!;
   const desktopFooter = (await footer.boundingBox())!;
-  expect(desktopPanel.y + desktopPanel.height).toBeCloseTo(desktopFooter.y, 1);
+  expect(desktopFooter.y - (desktopPanel.y + desktopPanel.height)).toBeCloseTo(margin, 1);
   expect(desktopFooter.y + desktopFooter.height).toBeCloseTo(1400, 1);
 
   await page.setViewportSize({ width: 320, height: 844 });
@@ -182,7 +183,7 @@ test('Node State matches the Execution Graph height on desktop and the panel mee
   expect(mobileInspector.width).toBeCloseTo(mobileGraph.width, 1);
   const mobilePanel = (await panel.boundingBox())!;
   const mobileFooter = (await footer.boundingBox())!;
-  expect(mobilePanel.y + mobilePanel.height).toBeCloseTo(mobileFooter.y, 1);
+  expect(mobileFooter.y - (mobilePanel.y + mobilePanel.height)).toBeCloseTo(margin, 1);
 });
 
 declare global {

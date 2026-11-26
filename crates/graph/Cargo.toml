@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cel-core = { workspace = true }
 jiff = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }

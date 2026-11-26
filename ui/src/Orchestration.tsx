@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowLeft, Box, CalendarClock, CalendarPlus, Check, Code2, Copy, Download, GitBranch, LayoutGrid, Link2, Pencil, Plus, Rocket, Save, Star, Trash2, UserPen, UserPlus, Workflow, X } from 'lucide-react';
+import { Activity, ArrowLeft, Box, CalendarClock, CalendarPlus, Check, Code2, Copy, Download, GitBranch, GitCompare, LayoutGrid, Link2, Pencil, Plus, Rocket, Save, Star, Trash2, UserPen, UserPlus, Workflow, X } from 'lucide-react';
 import { api, dateTime, send, usePaged } from './api';
 import { useAuditActorName } from './audit';
 import { Badge, Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination, Refresh, SearchBox, UuidText } from './components';
+import { DockerConfigFields, DockerConfigInput, parseDockerConfig } from './DockerConfigInput';
 import FlowCanvas from './FlowCanvas';
-import { createGraph, createNode, disconnectEdges, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
+import GraphDiffDialog from './GraphDiffDialog';
+import NodeOverrides from './NodeOverrides';
+import { createGraph, createNode, disconnectEdges, isJsonObject, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
 import { copyUuid } from './uuid';
 import type { User } from './Auth';
 import type { Graph, GraphNode } from './types';
@@ -37,6 +40,7 @@ export default function Orchestration({ actor, user, notify, dirtyChanged, openR
   const [favorites, setFavorites] = useState(loadFavorites);
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [versions, setVersions] = useState<Pick<Graph, 'id' | 'name'> | null>(null);
+  const [diffTarget, setDiffTarget] = useState<Graph | null>(null);
   const [manualCopyId, setManualCopyId] = useState<string | null>(null);
   const manualCopyInput = useRef<HTMLInputElement>(null);
   const [editor, setEditor] = useState<{ graph: Graph; isNew: boolean } | null>(null);
@@ -138,14 +142,8 @@ export default function Orchestration({ actor, user, notify, dirtyChanged, openR
         <button type="button" className="button" disabled={opening} aria-label="Clear workflow filter" onClick={() => setVersions(null)}><X size={14} />All workflows</button>
       </div>}
       {!result.data ? (!result.error && <Loading />) : rows.length > 0 ? (
-        tab === 'drafts' ? (
-          <ul className="workflow-grid" aria-label="Workflows" role="list">
-            {rows.map((row) => <WorkflowCard key={row.id} graph={row} favorite={favorites.has(row.id)} opening={opening} auditActorName={auditActorName}
-              open={() => void open(row)} copy={() => void copy(row.id)} toggleFavorite={() => toggleFavorite(row.id)} showVersions={() => showVersions(row)} openRuntime={() => openRuntime(row.id)} />)}
-          </ul>
-        ) : (
-          <PublishedVersions rows={rows} opening={opening} auditActorName={auditActorName} edit={(row) => void open(row)} copy={(id) => void copy(id)} openRuntime={openRuntime} />
-        )
+        <WorkflowTable rows={rows} opening={opening} auditActorName={auditActorName} edit={(row) => void open(row)} copy={(id) => void copy(id)} openRuntime={openRuntime}
+          mode={tab === 'drafts' ? { tab, favorites, toggleFavorite, showVersions } : { tab, diff: setDiffTarget }} />
       ) : query ? (
         <Empty title="No matching workflows">Try a different name or workflow ID, or move to another page.</Empty>
       ) : filterFavorites ? (
@@ -157,6 +155,7 @@ export default function Orchestration({ actor, user, notify, dirtyChanged, openR
       )}
       <Pagination page={result.page} count={rows.length} more={result.data?.next_cursor != null} previous={result.previous} next={result.next} />
     </section>
+    {diffTarget && <GraphDiffDialog target={diffTarget} close={() => setDiffTarget(null)} />}
     {creating && <Modal title="Create a workflow" close={() => setCreating(false)}><form onSubmit={(event) => { event.preventDefault(); if (!name.trim()) return; setEditor({ graph: createGraph(name.trim()), isNew: true }); setCreating(false); }}><p className="muted">Start with a root node and build out your workflow on the canvas.</p><label className="field">Workflow name<input autoFocus required maxLength={255} value={name} placeholder="e.g. daily-data-pipeline" onChange={(event) => setName(event.target.value)} /></label><div className="modal-actions"><button type="button" className="button" onClick={() => setCreating(false)}>Cancel</button><button className="button primary" type="submit"><Plus size={16} />Create workflow</button></div></form></Modal>}
     {manualCopyId && <Modal title="Copy workflow ID" close={() => setManualCopyId(null)}>
       <p>Clipboard access is unavailable. Copy the selected workflow ID manually.</p>
@@ -188,65 +187,30 @@ function AuditTimestamp({ value }: { value?: string }) {
 
 function AuditActor({ id, name }: { id?: string; name: string }) {
   const tooltip = id && id !== name ? `${name} (${id})` : name;
-  return <dd className="workflow-audit-actor" title={tooltip}>{name}</dd>;
+  return <td className="workflow-audit-cell" title={tooltip}>{name}</td>;
 }
 
-function WorkflowCard({ graph, favorite, opening, auditActorName, open, copy, toggleFavorite, showVersions, openRuntime }: {
-  graph: Graph;
-  favorite: boolean;
-  opening: boolean;
-  auditActorName: (actor?: string) => string;
-  open: () => void;
-  copy: () => void;
-  toggleFavorite: () => void;
-  showVersions: () => void;
-  openRuntime: () => void;
-}) {
-  const connectionCount = graph.edges.length;
-  return <li className="workflow-card">
-    <div className="workflow-card-header">
-      <span className="workflow-card-icon"><Workflow size={23} /></span>
-      <div className="workflow-card-identity">
-        <h2><button type="button" className="workflow-card-title" title={graph.name} disabled={opening} onClick={open}>{graph.name}</button></h2>
-        <WorkflowId id={graph.id} copy={copy} />
-      </div>
-      <button type="button" className="icon-button workflow-card-favorite" aria-label="Favorite workflow" aria-pressed={favorite} title={favorite ? 'Remove from favorites' : 'Add to favorites'} onClick={toggleFavorite}><Star size={18} /></button>
-    </div>
-    <div className="workflow-card-body">
-      <div className="workflow-card-meta">
-        <span><Box size={15} />{graph.node_count} {graph.node_count === 1 ? 'node' : 'nodes'}</span>
-        <span><Link2 size={15} />{connectionCount} {connectionCount === 1 ? 'connection' : 'connections'}</span>
-      </div>
-      <dl className="workflow-audit">
-        <div><dt><AuditLabel field="created_by" /></dt><AuditActor id={graph.created_by} name={auditActorName(graph.created_by)} /></div>
-        <div><dt><AuditLabel field="created_at" /></dt><dd><AuditTimestamp value={graph.created_at} /></dd></div>
-        <div><dt><AuditLabel field="updated_by" /></dt><AuditActor id={graph.updated_by} name={auditActorName(graph.updated_by)} /></div>
-        <div><dt><AuditLabel field="updated_at" /></dt><dd><AuditTimestamp value={graph.updated_at} /></dd></div>
-      </dl>
-    </div>
-    <div className="workflow-card-footer">
-      <button type="button" className="button workflow-editor-button" disabled={opening} onClick={open}><Pencil size={14} />Edit</button>
-      <button type="button" className="button" disabled={opening} onClick={showVersions}>Versions</button>
-      <button type="button" className="button" disabled={opening} onClick={openRuntime}><Activity size={14} />Runtime</button>
-    </div>
-  </li>;
-}
+type WorkflowTableMode =
+  | { tab: 'drafts'; favorites: ReadonlySet<string>; toggleFavorite: (id: string) => void; showVersions: (graph: Graph) => void }
+  | { tab: 'published'; diff: (graph: Graph) => void };
 
-function PublishedVersions({ rows, opening, auditActorName, edit, copy, openRuntime }: {
+function WorkflowTable({ rows, opening, auditActorName, edit, copy, openRuntime, mode }: {
   rows: Graph[];
   opening: boolean;
   auditActorName: (actor?: string) => string;
   edit: (graph: Graph) => void;
   copy: (id: string) => void;
   openRuntime: (graphId: string) => void;
+  mode: WorkflowTableMode;
 }) {
-  return <div className="panel workflow-versions-table">
-    <div className="table-scroll" role="region" aria-label="Published workflow records" tabIndex={0}>
-      <table aria-label="Published versions">
+  const draft = mode.tab === 'drafts';
+  return <div className="panel workflow-table">
+    <div className="table-scroll" role="region" aria-label={draft ? 'Draft workflow records' : 'Published workflow records'} tabIndex={0}>
+      <table aria-label={draft ? 'Draft workflows' : 'Published versions'}>
         <thead>
           <tr>
             <th scope="col">Workflow</th>
-            <th scope="col">Version</th>
+            {!draft && <th scope="col">Version</th>}
             <th scope="col">Nodes</th>
             <th scope="col">Connections</th>
             <th scope="col"><AuditLabel field="created_by" /></th>
@@ -256,23 +220,32 @@ function PublishedVersions({ rows, opening, auditActorName, edit, copy, openRunt
             <th scope="col">Actions</th>
           </tr>
         </thead>
-        <tbody>{rows.map((graph) => <tr key={`${graph.id}:${graph.version}`}>
-          <td>
-            <button type="button" className="table-name" title={graph.name} disabled={opening} onClick={() => edit(graph)}><strong>{graph.name}</strong></button>
-            <WorkflowId id={graph.id} copy={() => copy(graph.id)} />
-          </td>
-          <td><Badge status="published">v{graph.version}</Badge></td>
-          <td>{graph.node_count} {graph.node_count === 1 ? 'node' : 'nodes'}</td>
-          <td>{graph.edges.length} {graph.edges.length === 1 ? 'connection' : 'connections'}</td>
-          <td className="workflow-audit-cell" title={graph.created_by}>{auditActorName(graph.created_by)}</td>
-          <td className="workflow-audit-cell"><AuditTimestamp value={graph.created_at} /></td>
-          <td className="workflow-audit-cell" title={graph.updated_by}>{auditActorName(graph.updated_by)}</td>
-          <td className="workflow-audit-cell"><AuditTimestamp value={graph.updated_at} /></td>
-          <td><div className="actions">
-            <button type="button" className="button small workflow-editor-button" disabled={opening} onClick={() => edit(graph)}><Pencil size={14} />Edit</button>
-            <button type="button" className="button small" disabled={opening} onClick={() => openRuntime(graph.id)}><Activity size={14} />Runtime</button>
-          </div></td>
-        </tr>)}</tbody>
+        <tbody>{rows.map((graph) => {
+          const favorite = draft && mode.favorites.has(graph.id);
+          return <tr key={`${graph.id}:${graph.version}`}>
+            <td><div className="workflow-table-identity">
+              <div>
+                <button type="button" className="table-name" title={graph.name} disabled={opening} onClick={() => edit(graph)}><strong>{graph.name}</strong></button>
+                <WorkflowId id={graph.id} copy={() => copy(graph.id)} />
+              </div>
+              {draft && <button type="button" className="icon-button workflow-favorite" aria-label="Favorite workflow" aria-pressed={favorite}
+                title={favorite ? 'Remove from favorites' : 'Add to favorites'} onClick={() => mode.toggleFavorite(graph.id)}><Star size={16} /></button>}
+            </div></td>
+            {!draft && <td><Badge status="published">v{graph.version}</Badge></td>}
+            <td>{graph.node_count} {graph.node_count === 1 ? 'node' : 'nodes'}</td>
+            <td>{graph.edges.length} {graph.edges.length === 1 ? 'connection' : 'connections'}</td>
+            <AuditActor id={graph.created_by} name={auditActorName(graph.created_by)} />
+            <td className="workflow-audit-cell"><AuditTimestamp value={graph.created_at} /></td>
+            <AuditActor id={graph.updated_by} name={auditActorName(graph.updated_by)} />
+            <td className="workflow-audit-cell"><AuditTimestamp value={graph.updated_at} /></td>
+            <td><div className="actions">
+              <button type="button" className="button small workflow-editor-button" disabled={opening} onClick={() => edit(graph)}><Pencil size={14} />Edit</button>
+              {draft ? <button type="button" className="button small" disabled={opening} onClick={() => mode.showVersions(graph)}>Versions</button>
+                : <button type="button" className="button small" disabled={opening} onClick={() => mode.diff(graph)}><GitCompare size={14} />Diff</button>}
+              <button type="button" className="button small" disabled={opening} onClick={() => openRuntime(graph.id)}><Activity size={14} />Runtime</button>
+            </div></td>
+          </tr>;
+        })}</tbody>
       </table>
     </div>
   </div>;
@@ -337,6 +310,9 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
   const [configuring, setConfiguring] = useState(false);
   const choices = outputChoices(graph, node.id);
   const upstream = upstreamIds(graph, node.id);
+  function updateConfig(config: GraphNode['settings']['config']) {
+    update({ ...node, settings: { ...node.settings, config } });
+  }
   function selectOutput(index: number, source: string) {
     const choice = choices.find((item) => item.source === source);
     const updated = { ...node, inputs: node.inputs.map((input, offset) => offset === index ? { ...input, source, file_name: input.file_name || choice?.output.file_name || '' } : input) };
@@ -349,33 +325,55 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
       {node.node_type !== 'docker' && <option value="" disabled>Select task type</option>}
       <option value="docker">Docker</option>
     </select></label>
-    <div className="field-section node-settings">
-      <h3>Node settings <button type="button" className="icon-button" title="Edit Docker configuration JSON" aria-label="Edit Docker configuration JSON" onClick={() => setConfiguring(true)}><Code2 size={15} /></button></h3>
-      <label className="field">Docker image<input aria-label="Docker image" placeholder="alpine:3.21" value={typeof node.settings.config?.image === 'string' ? node.settings.config.image : ''} onChange={(event) => update({ ...node, settings: { ...node.settings, config: { ...node.settings.config, image: event.target.value } } })} /></label>
+    <div className="field-section">
+      <h3>Docker configuration <button type="button" className="icon-button" title="Edit Docker configuration JSON" aria-label="Edit Docker configuration JSON" onClick={() => setConfiguring(true)}><Code2 size={15} /></button></h3>
+      <DockerConfigFields config={node.settings.config} change={updateConfig} />
+    </div>
+    <div className="field-section">
+      <h3>Node settings</h3>
       <div className="settings-resources">
         <label className="field">CPU cores<input aria-label="CPU cores" type="number" min="1" max="4294967295" step="1" value={node.settings.resource.cpu_cores} onChange={(event) => update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, cpu_cores: Number(event.target.value) } } })} /></label>
         <label className="field">Memory (MiB)<input aria-label="Memory (MiB)" type="number" min="1" step="1" value={node.settings.resource.memory_bytes / 1048576} onChange={(event) => update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, memory_bytes: Math.round(Number(event.target.value) * 1048576) } } })} /></label>
       </div>
       <label className="field">Timeout<input aria-label="Timeout" placeholder="10s" value={node.settings.timeout} onChange={(event) => update({ ...node, settings: { ...node.settings, timeout: event.target.value } })} /></label>
     </div>
+    <NodeOverrides settings={node.settings} update={(overrides) => update({ ...node, settings: { ...node.settings, overrides: Object.keys(overrides).length ? overrides : undefined } })} />
     <div className="field-section"><h3>Inputs <button type="button" className="icon-button" aria-label="Add input" onClick={() => update({ ...node, inputs: [...node.inputs, { file_name: '', source: '', required: true, format: null }] })}><Plus size={15} /></button></h3>{node.inputs.length === 0 && <p className="muted small-text">No inputs.</p>}{node.inputs.map((input, index) => <div className="port-form" key={index}><div className="actions"><input aria-label={`Input ${index + 1} file name`} placeholder="File name" value={input.file_name} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, file_name: event.target.value } : item) })} /><button type="button" className="icon-button" aria-label={`Remove input ${index + 1}`} onClick={() => update({ ...node, inputs: node.inputs.filter((_, offset) => offset !== index) })}><X size={14} /></button></div><select aria-label={`Input ${index + 1} source`} value={input.source} onChange={(event) => selectOutput(index, event.target.value)}><option value="">Select output</option>{input.source && !choices.some((choice) => choice.source === input.source) && <option value={input.source} disabled>{input.source} (unavailable)</option>}{choices.map((choice) => <option key={choice.source} value={choice.source}>{choice.source}</option>)}</select><input aria-label={`Input ${index + 1} format`} placeholder="Format (optional)" value={input.format ?? ''} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, format: event.target.value || null } : item) })} /><label className="checkbox"><input type="checkbox" checked={input.required} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, required: event.target.checked } : item) })} />Required</label></div>)}</div>
     <div className="field-section"><h3>Outputs <button type="button" className="icon-button" aria-label="Add output" onClick={() => update({ ...node, outputs: [...node.outputs, { file_name: '', kind: 'File', multiple: false }] })}><Plus size={15} /></button></h3>{node.outputs.length === 0 && <p className="muted small-text">No outputs defined.</p>}{node.outputs.map((output, index) => <div className="port-form" key={index}><div className="actions"><input aria-label={`Output ${index + 1} file name`} placeholder="File name" value={output.file_name} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, file_name: event.target.value } : item) })} /><button type="button" className="icon-button" aria-label={`Remove output ${index + 1}`} onClick={() => update({ ...node, outputs: node.outputs.filter((_, offset) => offset !== index) })}><X size={14} /></button></div><select aria-label={`Output ${index + 1} kind`} value={output.kind} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, kind: event.target.value as 'File' | 'Directory' } : item) })}><option>File</option><option>Directory</option></select><label className="checkbox"><input type="checkbox" checked={output.multiple} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, multiple: event.target.checked } : item) })} />Multiple files</label></div>)}</div>
     <div className="field-section"><h3>Connections <Link2 size={14} /></h3>{graph.edges.filter(([source]) => source === node.id).map(([source, destination]) => <div className="connection" key={destination}><span>→ {graph.nodes.find((item) => item.id === destination)?.name}</span><button type="button" className="icon-button" aria-label="Remove connection" onClick={() => change(disconnectEdges(graph, [[source, destination]]))}><X size={13} /></button></div>)}<div className="actions"><select aria-label="Connect to node" value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Connect to…</option>{graph.nodes.filter((item) => item.id !== node.id && !upstream.has(item.id) && !graph.edges.some(([source, destination]) => source === node.id && destination === item.id)).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button type="button" className="icon-button" disabled={!target} aria-label="Add connection" onClick={() => { change({ ...graph, edges: [...graph.edges, [node.id, target]] }); setTarget(''); }}><Plus size={16} /></button></div></div>
     <button type="button" className="button danger subtle" onClick={remove}><Trash2 size={15} />Delete node</button><UuidText className="mono inspector-id" id={node.id} />
-  </fieldset>{configuring && <DockerConfigEditor config={node.settings.config} close={() => setConfiguring(false)} apply={(config) => { update({ ...node, settings: { ...node.settings, config } }); setConfiguring(false); }} />}</>;
+  </fieldset>{configuring && <DockerConfigEditor config={node.settings.config} close={() => setConfiguring(false)} apply={(config) => { updateConfig(config); setConfiguring(false); }} />}</>;
 }
 
 function DockerConfigEditor({ config, close, apply }: { config: GraphNode['settings']['config']; close: () => void; apply: (config: GraphNode['settings']['config']) => void }) {
-  const [text, setText] = useState(JSON.stringify(config ?? {}, null, 2));
+  const initialValue = JSON.stringify(config ?? {}, null, 2);
+  const [text, setText] = useState(initialValue);
   const [error, setError] = useState<string>();
   function submit() {
     try {
-      const value: unknown = JSON.parse(text);
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Docker configuration must be a JSON object.');
-      apply(value as GraphNode['settings']['config']);
+      apply(parseDockerConfig(text));
     } catch (failure) { setError((failure as Error).message); }
   }
-  return <Modal title="Docker configuration" close={close} wide><ErrorBanner error={error} /><textarea className="json-editor" spellCheck={false} aria-label="Docker configuration JSON" value={text} onChange={(event) => setText(event.target.value)} /><div className="modal-actions"><button className="button" onClick={close}>Cancel</button><button className="button primary" onClick={submit}><Check size={15} />Apply configuration</button></div></Modal>;
+  return <Modal title="Docker configuration" close={close} wide>
+    <ErrorBanner error={error} />
+    <DockerConfigInput initialValue={initialValue} onChange={setText} />
+    <div className="modal-actions"><button className="button" onClick={close}>Cancel</button><button className="button primary" onClick={submit}><Check size={15} />Apply configuration</button></div>
+  </Modal>;
+}
+
+function isDraftResource(value: unknown): boolean {
+  if (!isJsonObject(value)) return false;
+  const { cpu_cores, memory_bytes } = value;
+  return typeof cpu_cores === 'number' && Number.isInteger(cpu_cores) && cpu_cores >= 0 && cpu_cores <= 4294967295
+    && typeof memory_bytes === 'number' && Number.isSafeInteger(memory_bytes) && memory_bytes >= 0;
+}
+
+function isDraftOverride(value: unknown): boolean {
+  return isJsonObject(value)
+    && (value.annotation_match == null || typeof value.annotation_match === 'string')
+    && (value.config == null || isJsonObject(value.config))
+    && (value.resource == null || isDraftResource(value.resource))
+    && (value.timeout == null || typeof value.timeout === 'string');
 }
 
 function JsonEditor({ value, close, apply, graphId }: { value: string; close: () => void; apply: (graph: Graph) => void; graphId: string }) {
@@ -390,7 +388,8 @@ function JsonEditor({ value, close, apply, graphId }: { value: string; close: ()
         if (!uuid.test(node.id) || typeof node.name !== 'string' || typeof node.node_type !== 'string' || !Array.isArray(node.inputs) || !Array.isArray(node.outputs)) throw new Error('Each node needs a UUID, name, node_type, inputs, and outputs.');
         if (node.settings !== undefined) {
           const settings = node.settings;
-          if (!settings || !settings.config || typeof settings.config !== 'object' || Array.isArray(settings.config) || !settings.resource || !Number.isInteger(settings.resource.cpu_cores) || settings.resource.cpu_cores < 0 || settings.resource.cpu_cores > 4294967295 || !Number.isSafeInteger(settings.resource.memory_bytes) || settings.resource.memory_bytes < 0 || typeof settings.timeout !== 'string') throw new Error('Node settings need a JSON config object, resource.cpu_cores, resource.memory_bytes, and a duration-string timeout.');
+          if (!settings || !isJsonObject(settings.config) || !isDraftResource(settings.resource) || typeof settings.timeout !== 'string') throw new Error('Node settings need a JSON config object, resource.cpu_cores, resource.memory_bytes, and a duration-string timeout.');
+          if (settings.overrides !== undefined && (!isJsonObject(settings.overrides) || !Object.values(settings.overrides).every(isDraftOverride))) throw new Error('Node overrides must be an object keyed by override name. Each override can specify annotation_match, config, resource, and timeout.');
         }
         if (node.inputs.some((input) => !input || typeof input.file_name !== 'string' || typeof input.source !== 'string' || typeof input.required !== 'boolean' || !(input.format === null || typeof input.format === 'string'))) throw new Error('Inputs need file_name, source, required, and format (string or null).');
         if (node.outputs.some((output) => !output || typeof output.file_name !== 'string' || !['File', 'Directory'].includes(output.kind) || typeof output.multiple !== 'boolean')) throw new Error('Outputs need file_name, kind (File or Directory), and multiple.');

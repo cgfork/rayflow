@@ -1,10 +1,12 @@
 //! Run commands and state endpoints.
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use catalog::{PresignedUrl, model::Catalog};
 use graph::GraphStore;
 use graph::types::DAG;
@@ -13,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::app::{App, AppError, Page, PageQuery, RunView};
+use crate::auth::User;
 
 /// Builds the run routes.
 pub(super) fn routes<S>() -> Router<App<S>>
@@ -88,6 +91,8 @@ pub struct StartRunRequest {
     /// Nodes to start; empty means the graph's roots.
     #[serde(default)]
     pub nodes: Vec<Uuid>,
+    /// Optional annotation key/value pairs to pin to the run.
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 /// Response returned by `POST /runs/start`.
@@ -102,10 +107,21 @@ pub type StartRunResponse = CommandResponse;
 /// Emits `Command::Start`, beginning a run.
 async fn start_run<S: Clone>(
     State(state): State<App<S>>,
+    user: Option<Extension<User>>,
     Json(request): Json<StartRunRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut run = state.run_with(request.data_id, request.graph_id);
-    let entry = run.start(request.nodes).await?;
+    let entry = match request.annotations {
+        Some(annotations) => {
+            let actor = user
+                .as_ref()
+                .map(|user| user.id.as_str())
+                .unwrap_or_default();
+            run.start_with_annotations(request.nodes, annotations, actor)
+                .await?
+        }
+        None => run.start(request.nodes).await?,
+    };
     Ok((
         StatusCode::ACCEPTED,
         Json(StartRunResponse { id: entry.id }),

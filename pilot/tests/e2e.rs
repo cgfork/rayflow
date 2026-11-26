@@ -246,6 +246,7 @@ fn workflow(image: &str) -> DAG {
                     memory_bytes: MEMORY,
                 },
                 timeout: Duration::from_secs(120),
+                overrides: Default::default(),
             },
             inputs: vec![],
             outputs: vec![],

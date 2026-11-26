@@ -74,6 +74,9 @@ Migration 23 adds durable ownership and catalog associations for job result
 uploads. Apply it before starting servers that expose `/job/result/prepare`
 and `/job/result/commit`.
 
+Migration 26 names existing node configs `default` and allows additional
+named configs for each node version while preserving job references.
+
 Do not commit credentials in `rayflow.yaml`. Use an environment variable or a
 local, untracked configuration file for `database_url`.
 
@@ -296,11 +299,21 @@ RAYFLOW_API_URL=http://127.0.0.1:8081 npm run dev --prefix ui
 
 The four sections use the same resource APIs as other clients:
 
-- **Orchestration:** create graphs, connect nodes, edit inputs and outputs,
-  save drafts, and publish immutable versions. The JSON editor supports import
-  through pasted JSON and export. The editor flags cycles and invalid roots;
-  unreferenced outputs are informational. Publishing also runs the existing
-  server validator. Node positions are local to the open editor.
+- **Orchestration** lets you create graphs, connect nodes, edit inputs and
+  outputs, save drafts, and publish immutable versions. The Drafts table lists
+  editable workflows. In Published versions, choose **Diff** on a target row
+  and select a base version to compare workflow fields, nodes, node settings,
+  ports, and connections. The comparison canvas highlights added, removed,
+  and modified nodes and draws removed connections with dashed lines. Select
+  a node to inspect its changes. **Include other workflows** expands the
+  choice of base versions.
+  In **Node Properties**, **Docker configuration** accepts one command argument
+  per row and environment variables in `NAME=value` form. The JSON editor
+  opens the same configuration.
+  The JSON editor supports import through pasted JSON and export. It flags
+  cycles and invalid roots and marks unreferenced outputs as informational.
+  Publishing also runs the server validator. Node positions are local to the
+  open editor.
 - **Runtime:** start runs and inspect every node in a run's pinned graph version.
   Use **Rerun** in the run list or detail header to choose a starting node, or
   select a node on the graph and use **Rerun node**. Ready, succeeded, failed,
@@ -343,19 +356,40 @@ Node execution settings are stored together under `settings`:
       "working_dir": "/tmp"
     },
     "resource": { "cpu_cores": 1, "memory_bytes": 268435456 },
-    "timeout": "10s"
+    "timeout": "10s",
+    "overrides": {
+      "long": {
+        "annotation_match": "has(annotations.priority) && annotations.priority == 'high'",
+        "timeout": "2m"
+      }
+    }
   }
 }
 ```
 
-Docker requires `image`; `command`, `env`, and `working_dir` are optional.
-The JSON editor preserves additional configuration keys. The Docker provider
-currently uses these four fields and applies CPU/memory limits from `resource`.
+Docker requires `image`. `command`, `env`, and `working_dir` are optional.
+The JSON editor for base and override settings preserves additional keys. The
+Docker provider uses these four fields and applies CPU/memory limits from `resource`.
 The UI displays memory in MiB; JSON stores bytes. Timeouts accept duration
 strings such as `10s`, `250ms`, and `2m`, with positive whole-millisecond precision.
 Timeouts use the existing job lease: delivery starts the expiry clock, and
 active polls do not extend it. Older graph JSON without settings remains
 readable but needs valid settings before republishing.
+
+Publishing creates a `default` config and one config for each key in
+`settings.overrides`. Each override can supply `annotation_match`, `config`,
+`resource`, or `timeout`. Omitted settings inherit the base values. A supplied
+`config` replaces the base JSON object as a whole. A nonempty `annotation_match`
+must be a Google CEL expression of at most 255 bytes with a boolean result.
+It matches when it evaluates to `true` over the run's `annotations` map of
+string keys to string values. The example matches `{"priority": "high"}`.
+Use `has(annotations.priority)` to check for a key, or `'dataset-id' in annotations`
+when the key contains a hyphen. If multiple overrides match, the one whose
+name sorts first wins. When no annotation snapshot exists or no predicate
+matches, the job uses `default` from the node run's graph version.
+
+Rewrite existing JSONPath expressions in the draft and publish a new version
+to use CEL. Job creation skips older stored JSONPath predicates.
 
 Choose an input's source from another node's declared outputs. Selection creates
 the dependency when needed and excludes sources that would create a cycle.
@@ -436,11 +470,12 @@ The service endpoints are:
 | `GET` | `/metrics` | Prometheus text metrics for the server process. |
 | `GET` | `/api/v1/graphs` | List published graph versions; optional `graph_id` filter. |
 | `GET` | `/api/v1/graphs/{graph_id}` | Read a published graph; optional exact `version`, otherwise latest. |
+| `GET` | `/api/v1/graphs/{graph_id}/diff` | Compare exact published `from_version` and `version` values. Set `from_graph_id` to use a base version from another workflow. |
 | `GET` | `/api/v1/graphs/{graph_id}/shared-nodes` | List shared restart node UUIDs between exact published `from_version` and newer `version`. |
 | `GET` | `/api/v1/graph_drafts` | List editable DAGs. |
 | `GET` | `/api/v1/runs` | List runs; optional `graph_id` filter. |
 | `GET` | `/api/v1/runs/{run_id}` | Inspect the exact run UUID, its state, and its pinned graph. |
-| `POST` | `/api/v1/runs/start` | Start a run; body has `data_id`, `graph_id`, and optional `nodes`. |
+| `POST` | `/api/v1/runs/start` | Start a run with `data_id`, `graph_id`, optional `nodes`, and optional `annotations`. |
 | `POST` | `/api/v1/runs/rerun` | Rerun one node; body has `data_id`, `graph_id`, and `node`. |
 | `POST` | `/api/v1/runs/upgrade` | Upgrade an existing run; body has `data_id`, `graph_id`, the newer published `version`, and a `node` selected from the shared nodes. |
 | `POST` | `/api/v1/runs/resume` | Resume one pending node; body has `data_id`, `graph_id`, and `node`. |
@@ -483,7 +518,8 @@ Run commands and task events return `202 Accepted` with the appended entry ID.
 In Runtime, click **Upgrade** on a run or its detail page. Select a newer
 published version and an eligible shared restart node, then confirm. The UI
 uses the graph's shared-node calculation and the same node-state rules as rerun.
-Shared nodes include all upstream ancestors of the fork point, including the root.
+Every node is shared when both versions have the same graph structure. If there
+is a unique fork point, its upstream ancestors are shared.
 To upgrade a run, send `POST /api/v1/runs/upgrade` with a body such as:
 
 ```json
@@ -540,7 +576,7 @@ must be reachable from the browser. For cross-origin downloads, configure the
 storage bucket's CORS rules to allow `GET` from the console's origin, including
 its scheme, host, and port.
 
-Example start request:
+To start a run with annotations, pass a map of string keys to string values.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/api/v1/runs/start \
@@ -548,12 +584,15 @@ curl -X POST http://127.0.0.1:8080/api/v1/runs/start \
   -d '{
     "data_id": "00000000-0000-0000-0000-000000000001",
     "graph_id": "00000001-0000-0000-0000-000000000000",
-    "nodes": []
+    "nodes": [],
+    "annotations": {"dataset": "filetest"}
   }'
 ```
 
-An empty `nodes` array starts graph roots. `graph_state` returns the run
-revision, graph edges, and each node's current state.
+An empty `nodes` array starts graph roots. When `annotations` is supplied, the
+server saves a config and queues `Start` with its UUID. All jobs for that run
+reference the attached config. `graph_state` returns the run revision, graph
+edges, and each node's current state.
 
 ### Graph drafts
 
@@ -785,9 +824,7 @@ that an old table name or status value is compatible with the current models.
 
 Migration 9 removes `version` and `revision` from `run_config`, including its
 revision uniqueness index. Run annotation rows and job references are preserved.
-Apply it with `./init-db.sh` before using the updated binaries. New jobs use the
-newest annotation snapshot for their run; execution version and revision remain
-on `run`.
+Execution version and revision live on `run`.
 
 Migration 10 adds the catalog `uploaded` acknowledgement, initially false for
 both new and existing records. Job upload commit sets it true; job downloads
@@ -813,3 +850,10 @@ add auto-incrementing numeric primary IDs. The former `auth_user.id` becomes
 unique `user_id`, preserving existing sessions and audit identities. Token and
 state hashes retain unique keys. Apply migrations before deploying matching
 server binaries.
+
+Migration 25 makes `run_config.run_id` nullable and unique. A config starts
+unattached and gains its run UUID when `Start` applies. For runs with several
+legacy snapshots, the row with the highest numeric ID stays attached. Older
+rows keep their UUIDs and annotations so jobs can still read their pinned
+snapshots. Apply the migration with `./init-db.sh` before starting the updated
+server and pilot.

@@ -19,6 +19,12 @@ pub enum Error {
     /// The run has already been started; it must be rerun instead.
     #[error("run already started; rerun instead")]
     AlreadyStarted,
+    /// The Start command references an unknown config UUID.
+    #[error("run config not found: {0}")]
+    RunConfigNotFound(Uuid),
+    /// The Start command references a config already attached to a run.
+    #[error("run config is already attached to a run: {0}")]
+    RunConfigInUse(Uuid),
     #[error("upgrade version {requested} must be newer than current version {current}")]
     InvalidUpgradeVersion { current: u64, requested: u64 },
     #[error("upgrade node must be shared between the current and target graph versions: {0}")]
@@ -54,6 +60,8 @@ impl Error {
             Self::Toasty(_) => "RAYFLOW_DATABASE_ERROR",
             Self::Graph(_) => "RAYFLOW_GRAPH_ERROR",
             Self::AlreadyStarted => "RAYFLOW_RUN_ALREADY_STARTED",
+            Self::RunConfigNotFound(_) => "RAYFLOW_RUN_CONFIG_NOT_FOUND",
+            Self::RunConfigInUse(_) => "RAYFLOW_RUN_CONFIG_IN_USE",
             Self::InvalidUpgradeVersion { .. } => "RAYFLOW_INVALID_UPGRADE_VERSION",
             Self::InvalidUpgradeNode(_) => "RAYFLOW_INVALID_UPGRADE_NODE",
             Self::NodeNotFound(_) => "RAYFLOW_NODE_NOT_FOUND",

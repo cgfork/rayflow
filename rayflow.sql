@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS run (
 CREATE TABLE IF NOT EXISTS run_config (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',
     uuid       CHAR(36)        NOT NULL COMMENT 'stable run config identity',
-    run_id     CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning run uuid',
+    run_id     CHAR(36)        NULL DEFAULT NULL COMMENT 'owning run uuid',
     annotation JSON            NOT NULL COMMENT 'run annotation key/value map',
     created_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT 'creation timestamp',
     updated_at DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT 'last update timestamp',
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS run_config (
     updated_by VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'last updater of the record',
     PRIMARY KEY (id),
     UNIQUE KEY uk_run_config_uuid (uuid),
-    KEY idx_run_config_run_id (run_id)
+    UNIQUE KEY uk_run_config_run_id (run_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'run annotation snapshots referenced by jobs';
 
 CREATE TABLE IF NOT EXISTS node_config (
@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS node_config (
     uuid             CHAR(36)        NOT NULL COMMENT 'stable node config identity',
     node_id          CHAR(36)        NOT NULL DEFAULT '' COMMENT 'owning node identifier',
     version          BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'config version',
+    name             VARCHAR(255) COLLATE utf8mb4_bin NOT NULL DEFAULT 'default' COMMENT 'configuration name',
     annotation_match VARCHAR(255)    NOT NULL DEFAULT '' COMMENT 'run annotation match expression',
     config           JSON            NOT NULL COMMENT 'node configuration payload',
     lease            BIGINT UNSIGNED NULL COMMENT 'required job lifetime in milliseconds; NULL returns a missing lease error',
@@ -85,9 +86,9 @@ CREATE TABLE IF NOT EXISTS node_config (
     updated_by       VARCHAR(64)     NOT NULL DEFAULT '' COMMENT 'last updater of the record',
     PRIMARY KEY (id),
     UNIQUE KEY uk_node_config_uuid (uuid),
-    UNIQUE KEY uk_node_config_node_version (node_id, version),
+    UNIQUE KEY uk_node_config_node_version_name (node_id, version, name),
     KEY idx_node_config_node_id (node_id)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'node configuration, one row per node version';
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = 'named node configurations by version';
 
 CREATE TABLE IF NOT EXISTS node_run (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment primary key',

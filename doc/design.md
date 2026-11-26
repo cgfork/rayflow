@@ -71,10 +71,13 @@ while traversing pages. Database cursors remain stable when newer rows arrive.
 
 ## Diffing
 
-`Diff` returns `None` for equal values and `Some(Item)` for changes. `Kind`,
-`Input`, `Output`, and `Node` return before/after pairs. Graph diffing matches
-nodes by ID, reports changed payloads, and separately reports missing/extra nodes
-and edges. Graph metadata and iteration order do not affect structural diffs.
+`Diff` returns `None` when there are no reported changes. Scalar changes include
+the before and after values. `Input`, `Output`, `Resource`, and `Node` report
+each changed field. Node input and output changes include the index of each
+modified, added, or removed item. `NodeSettings::diff` always returns `None`.
+`DAG::diff` reports metadata and structural changes. Structural comparison
+matches nodes by ID and edges by endpoints, independently of graph metadata
+and iteration order.
 
 `DAG` implements `ForkPoint` using structural diffing. Calling
 `current.fork_point(&previous)` returns the unique earliest node to execute in
@@ -83,9 +86,10 @@ changed incoming edge. Changes downstream of another changed node do not create
 additional fork points. The result is `None` when no current node needs execution
 or independent branches have multiple first changes. Removing only a terminal
 node therefore produces no fork point in the remaining graph. `shared_nodes`
-returns all ancestors of the fork point from the current graph, each once in
-node order. It excludes the fork point, downstream nodes, and unrelated branches,
-and returns an empty iterator when there is no unique fork point.
+returns every node in the current graph when the versions have the same
+structure. With a unique fork point it returns all of its ancestors, each once
+in node order. Structural changes without a unique fork point yield an empty
+iterator.
 
 ## Commands
 
@@ -166,14 +170,21 @@ whose expiry is beyond the configured grace period. External implementations may
 submit jobs to systems such as Kubernetes or Volcano, but must use durable request
 records and reconcile retries after rollback.
 
-`Run` stores the execution graph version and revision. `RunConfig` stores
-annotation snapshots without duplicating those fields. New jobs select the
-newest snapshot ID for their run; existing jobs retain their configuration ID.
-Each graph
-node carries JSON task configuration, resource requirements, and a duration
-timeout. Publishing snapshots these settings to `NodeConfig`, keyed by graph
-version; job creation selects the latest node configuration no newer than the
-run's pinned version. This keeps historical executions reproducible.
+`Run` stores the execution graph version and revision. `RunConfig` stores a
+run's optional annotation snapshot. The start API saves supplied annotations
+under a config UUID and queues `Start` with that UUID in the same transaction.
+Applying `Start` attaches the config before creating tasks. Jobs pin the UUID
+of their run's single config when one is present.
+
+Each graph node carries JSON task configuration, resource requirements, and a
+duration timeout. Publishing snapshots the base settings as `default` and
+each named override as a separate `NodeConfig`, keyed by node ID, graph version,
+and name. Job creation loads the configs for the node run's exact graph
+version. Publishing type-checks each nonempty `annotation_match` as a Google
+CEL boolean expression over `annotations`, the run's string-to-string
+annotation map. The first predicate that evaluates to `true` in ascending
+name order wins. Without a snapshot or a match, job creation uses `default`
+from the same version.
 
 ## Agent Claims
 

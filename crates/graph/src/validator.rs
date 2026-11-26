@@ -3,7 +3,8 @@ use std::fmt;
 
 use uuid::Uuid;
 
-use crate::types::{DAG, Output};
+use crate::annotation_match::AnnotationMatch;
+use crate::types::{DAG, DEFAULT_NODE_CONFIG_NAME, NamedNodeSettings, Node, Output};
 use crate::{Graph, Id};
 
 /// A structural error in a graph.
@@ -95,6 +96,12 @@ pub enum WorkflowValidationError {
     EmptyGraphName,
     #[error("node IDs and names must be unique and names must not be empty")]
     InvalidNodeIdentity,
+    #[error(
+        "{node}: invalid settings override name {name:?} (reserve 'default' for base settings and use up to 255 bytes without trailing spaces)"
+    )]
+    InvalidOverrideName { node: String, name: String },
+    #[error("{node} has an invalid CEL annotation_match expression ({reason})")]
+    InvalidAnnotationMatch { node: String, reason: String },
     #[error("{node}: task type and a JSON configuration object are required")]
     InvalidTaskConfig { node: String },
     #[error("{node}: CPU cores and memory must be positive")]
@@ -127,59 +134,16 @@ pub fn validate_workflow(graph: &DAG) -> Result<(), WorkflowValidationError> {
         if !ids.insert(node.id) || node.name.trim().is_empty() || !names.insert(&node.name) {
             return Err(WorkflowValidationError::InvalidNodeIdentity);
         }
-        let settings = &node.settings;
-        if node.node_type.trim().is_empty() || !settings.config.is_object() {
-            return Err(WorkflowValidationError::InvalidTaskConfig {
-                node: node.name.clone(),
-            });
-        }
-        if settings.resource.cpu_cores == 0 || settings.resource.memory_bytes == 0 {
-            return Err(WorkflowValidationError::InvalidResources {
-                node: node.name.clone(),
-            });
-        }
-        if settings.resource.memory_bytes > i64::MAX as u64 {
-            return Err(WorkflowValidationError::MemoryLimit {
-                node: node.name.clone(),
-            });
-        }
-        if settings.timeout_ms().is_none() {
-            return Err(WorkflowValidationError::InvalidTimeout {
-                node: node.name.clone(),
-            });
-        }
-        if node.node_type == "docker" {
-            if !settings
-                .config
-                .get("image")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|image| !image.trim().is_empty())
-            {
-                return Err(WorkflowValidationError::MissingDockerImage {
+        for name in node.settings.overrides.keys() {
+            if name == DEFAULT_NODE_CONFIG_NAME || name.len() > 255 || name.ends_with(' ') {
+                return Err(WorkflowValidationError::InvalidOverrideName {
                     node: node.name.clone(),
+                    name: name.clone(),
                 });
             }
-            for field in ["command", "env"] {
-                if settings.config.get(field).is_some_and(|value| {
-                    !value
-                        .as_array()
-                        .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
-                }) {
-                    return Err(WorkflowValidationError::InvalidDockerArray {
-                        node: node.name.clone(),
-                        field,
-                    });
-                }
-            }
-            if settings
-                .config
-                .get("working_dir")
-                .is_some_and(|value| !value.is_string())
-            {
-                return Err(WorkflowValidationError::InvalidDockerWorkingDir {
-                    node: node.name.clone(),
-                });
-            }
+        }
+        for settings in node.settings.named_settings() {
+            validate_node_settings(node, &settings)?;
         }
         for (label, ports) in [
             (
@@ -233,6 +197,67 @@ pub fn validate_workflow(graph: &DAG) -> Result<(), WorkflowValidationError> {
                     input: input.file_name.clone(),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_node_settings(
+    node: &Node,
+    settings: &NamedNodeSettings<'_>,
+) -> Result<(), WorkflowValidationError> {
+    let label = || {
+        if settings.name == DEFAULT_NODE_CONFIG_NAME {
+            node.name.clone()
+        } else {
+            format!("{} override {:?}", node.name, settings.name)
+        }
+    };
+    AnnotationMatch::compile(settings.annotation_match).map_err(|error| {
+        WorkflowValidationError::InvalidAnnotationMatch {
+            node: label(),
+            reason: error.to_string(),
+        }
+    })?;
+    if node.node_type.trim().is_empty() || !settings.config.is_object() {
+        return Err(WorkflowValidationError::InvalidTaskConfig { node: label() });
+    }
+    if settings.resource.cpu_cores == 0 || settings.resource.memory_bytes == 0 {
+        return Err(WorkflowValidationError::InvalidResources { node: label() });
+    }
+    if settings.resource.memory_bytes > i64::MAX as u64 {
+        return Err(WorkflowValidationError::MemoryLimit { node: label() });
+    }
+    if settings.timeout_ms().is_none() {
+        return Err(WorkflowValidationError::InvalidTimeout { node: label() });
+    }
+    if node.node_type == "docker" {
+        if !settings
+            .config
+            .get("image")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|image| !image.trim().is_empty())
+        {
+            return Err(WorkflowValidationError::MissingDockerImage { node: label() });
+        }
+        for field in ["command", "env"] {
+            if settings.config.get(field).is_some_and(|value| {
+                !value
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+            }) {
+                return Err(WorkflowValidationError::InvalidDockerArray {
+                    node: label(),
+                    field,
+                });
+            }
+        }
+        if settings
+            .config
+            .get("working_dir")
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err(WorkflowValidationError::InvalidDockerWorkingDir { node: label() });
         }
     }
     Ok(())

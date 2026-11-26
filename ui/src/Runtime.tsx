@@ -1,6 +1,6 @@
 import { randomUUID } from './uuid';
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { Activity, ArrowRight, ArrowUpCircle, ArrowUpRight, Box, CircleCheck, Clock3, Download, GitBranch, Play, RotateCcw, Workflow } from 'lucide-react';
+import { Activity, ArrowRight, ArrowUpCircle, ArrowUpRight, Box, CircleCheck, Clock3, Download, GitBranch, Play, Plus, RotateCcw, Workflow, X } from 'lucide-react';
 import { api, dateTime, isHttpDownloadUrl, relativeTime, send, shortId, usePaged, useRemote } from './api';
 import { Back, Badge, Details, Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination, Refresh, SearchBox, UuidCopy, UuidText } from './components';
 import FlowCanvas from './FlowCanvas';
@@ -9,6 +9,7 @@ import WorkflowPicker from './WorkflowPicker';
 import type { Graph, GraphNode, NodeRun, Run, RunFileTransfer, RunView } from './types';
 
 type RunAction = 'rerun' | 'resume';
+type AnnotationRow = { id: number; key: string; value: string };
 
 function findNodeRun(view: RunView | undefined, nodeId: string | null) {
   return view?.node_runs.find(([nodeRun]) => nodeRun.node_id === nodeId);
@@ -77,13 +78,34 @@ function RunIdentifier({ run, open, notify }: { run: Run; open: () => void; noti
 function StartRun({ close, completed, workflow }: { close: () => void; completed: () => void; workflow: Pick<Graph, 'id' | 'name'> }) {
   const graphId = workflow.id;
   const [dataId, setDataId] = useState<string>(() => randomUUID());
+  const [annotationRows, setAnnotationRows] = useState<AnnotationRow[]>([{ id: 0, key: '', value: '' }]);
+  const nextAnnotationId = useRef(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  function addAnnotation() {
+    const id = nextAnnotationId.current++;
+    setAnnotationRows((rows) => [...rows, { id, key: '', value: '' }]);
+  }
+  function updateAnnotation(id: number, field: 'key' | 'value', value: string) {
+    setAnnotationRows((rows) => rows.map((row) => row.id === id ? { ...row, [field]: value } : row));
+  }
   async function start(event: React.FormEvent) {
     event.preventDefault(); setBusy(true); setError(undefined);
     try {
+      const annotations = new Map<string, string>();
+      for (const { key, value } of annotationRows) {
+        if (key === '' && value === '') continue;
+        if (!key.trim()) throw new Error('Enter a key for each annotation.');
+        if (annotations.has(key)) throw new Error(`Annotation key "${key}" is already used.`);
+        annotations.set(key, value);
+      }
       await api<Graph>(`/graphs/${graphId}`);
-      await send('/runs/start', { graph_id: graphId, data_id: dataId, nodes: [] });
+      await send('/runs/start', {
+        graph_id: graphId,
+        data_id: dataId,
+        nodes: [],
+        annotations: annotations.size > 0 ? Object.fromEntries(annotations) : undefined,
+      });
       completed();
     } catch (failure) { setError((failure as Error).message); }
     finally { setBusy(false); }
@@ -95,6 +117,19 @@ function StartRun({ close, completed, workflow }: { close: () => void; completed
       <label className="field">Workflow<input value={workflow.name} readOnly /></label>
       <label className="field">Data ID<input value={dataId} required pattern="[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}" onChange={(event) => setDataId(event.target.value)} disabled={busy} /></label>
       <p className="field-hint">Use a new data ID for an independent execution.</p>
+      <fieldset className="run-annotations" disabled={busy}>
+        <legend>Annotations (optional)</legend>
+        {annotationRows.map(({ id, key, value }, index) => <div key={id} className="run-annotation-row" role="group" aria-label={`Annotation ${index + 1}`}>
+          <label className="field">Key
+            <input autoFocus={id !== 0} spellCheck={false} value={key} onChange={(event) => updateAnnotation(id, 'key', event.target.value)} />
+          </label>
+          <label className="field">Value
+            <textarea rows={1} spellCheck={false} value={value} onChange={(event) => updateAnnotation(id, 'value', event.target.value)} />
+          </label>
+          <button className="icon-button" type="button" title="Remove annotation" aria-label={`Remove annotation ${index + 1}`} onClick={() => setAnnotationRows((rows) => rows.filter((row) => row.id !== id))}><X size={15} /></button>
+        </div>)}
+        <button className="button small" type="button" onClick={addAnnotation}><Plus size={15} />Add annotation</button>
+      </fieldset>
       <div className="modal-actions"><button className="button" type="button" onClick={close} disabled={busy}>Cancel</button><button className="button primary" type="submit" disabled={busy || !graphId}><Play size={15} />{busy ? 'Submitting…' : 'Start run'}</button></div>
     </form>
   </Modal>;

@@ -1,6 +1,18 @@
 export interface Input { file_name: string; source: string; required: boolean; format: string | null }
 export interface Output { file_name: string; kind: 'File' | 'Directory'; multiple: boolean }
-export interface NodeSettings { config: Record<string, unknown>; resource: { cpu_cores: number; memory_bytes: number }; timeout: string }
+interface NodeResource { cpu_cores: number; memory_bytes: number }
+export interface NodeSettings {
+  config: Record<string, unknown>;
+  resource: NodeResource;
+  timeout: string;
+  overrides?: Record<string, AnnotationMatchNodeSettings>;
+}
+export interface AnnotationMatchNodeSettings {
+  annotation_match?: string | null;
+  config?: Record<string, unknown> | null;
+  resource?: NodeResource | null;
+  timeout?: string | null;
+}
 export interface GraphNode { id: string; name: string; node_type: string; settings: NodeSettings; inputs: Input[]; outputs: Output[] }
 export interface Graph {
   id: string;

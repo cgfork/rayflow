@@ -27,7 +27,7 @@ const ingest = {
   updated_at: '2026-11-17T08:45:00Z',
 };
 const report = graph('ab000002-0000-4000-8000-000000000000', 'Alpha reporting', 0, ['Summarize']);
-const longName = 'ContinuousTelemetryAggregationWithAnIntentionallyUnbrokenWorkflowTitleForTheResponsiveCardGrid';
+const longName = 'ContinuousTelemetryAggregationWithAnIntentionallyUnbrokenWorkflowTitleForTheResponsiveTable';
 const telemetry = graph('ab000003-0000-4000-8000-000000000000', longName, 0, ['Aggregate']);
 const history = graph('ab000004-0000-4000-8000-000000000000', 'Beta history import', 0, ['Import']);
 const ingestVersion = {
@@ -52,27 +52,12 @@ async function mockGraphs(page: Page) {
   await page.route(`**${api}/graphs?limit=50&before=${publishedCursor}`, (route) => route.fulfill({ json: { items: [firstCleanup], next_cursor: null } }));
 }
 
-function workflows(page: Page) {
-  return page.getByRole('list', { name: 'Workflows', exact: true });
+function draftTable(page: Page) {
+  return page.getByRole('table', { name: 'Draft workflows', exact: true });
 }
 
-function card(page: Page, name: string) {
-  return workflows(page).getByRole('listitem').filter({ has: page.getByRole('heading', { name, exact: true }) });
-}
-
-async function expectIdentityBesideIcon(workflowCard: Locator, graph: Graph) {
-  const [icon, title, id] = await Promise.all([
-    workflowCard.locator('.workflow-card-icon').boundingBox(),
-    workflowCard.getByRole('heading', { name: graph.name, exact: true }).boundingBox(),
-    workflowCard.getByTitle(graph.id, { exact: true }).boundingBox(),
-  ]);
-  expect(icon).not.toBeNull();
-  expect(title).not.toBeNull();
-  expect(id).not.toBeNull();
-  const iconRight = icon!.x + icon!.width;
-  expect(title!.x).toBeGreaterThanOrEqual(iconRight);
-  expect(id!.x).toBeGreaterThanOrEqual(iconRight);
-  expect(title!.y).toBeLessThan(icon!.y + icon!.height);
+function draftRow(page: Page, name: string) {
+  return draftTable(page).getByRole('row').filter({ has: page.getByRole('button', { name, exact: true }) });
 }
 
 async function expectAuditIcons(container: Locator) {
@@ -94,20 +79,6 @@ async function expectAuditTimesOnOneLine(container: Locator) {
     return range.getClientRects().length;
   }));
   expect(lineCounts).toEqual([1, 1]);
-}
-
-async function expectPairedAuditRows(workflowCard: Locator) {
-  const values = workflowCard.locator('.workflow-audit dd');
-  await expect(values).toHaveCount(4);
-  const [creator, createdAt, updater, updatedAt] = await values.evaluateAll((elements) => elements.map((element) => {
-    const { x, y, height } = element.getBoundingClientRect();
-    return { x, centerY: y + height / 2 };
-  }));
-  expect(creator.x).toBeLessThan(createdAt.x);
-  expect(updater.x).toBeLessThan(updatedAt.x);
-  expect(Math.abs(creator.centerY - createdAt.centerY)).toBeLessThanOrEqual(2);
-  expect(Math.abs(updater.centerY - updatedAt.centerY)).toBeLessThanOrEqual(2);
-  expect(updater.centerY).toBeGreaterThan(creator.centerY);
 }
 
 async function expectModalInputUncovered(input: Locator) {
@@ -136,46 +107,209 @@ function publishedRow(page: Page, graph: Graph) {
     .filter({ has: page.getByRole('cell', { name: `v${graph.version}`, exact: true }) });
 }
 
-test('Draft cards show graph metadata and let users copy the full workflow ID', async ({ page, context }) => {
+test('Ready to publish has equal spacing above and below on desktop and mobile', async ({ page }) => {
+  const margin = 8;
+  const desktop = { width: 1440, height: 1400 };
+  await page.setViewportSize(desktop);
+  await mockGraphs(page);
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => route.fulfill({ json: report }));
+  await page.goto(home);
+  await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+
+  const studio = page.locator('.studio');
+  const panels = studio.locator('.studio-body');
+  const canvas = studio.locator('.canvas-panel');
+  const inspector = studio.getByRole('complementary');
+  const validation = studio.locator('.validation-panel').filter({ hasText: 'Ready to publish' });
+  const footer = page.getByRole('contentinfo').filter({ hasText: 'Workflow console' });
+  await expect(validation).toBeVisible();
+
+  const desktopCanvas = (await canvas.boundingBox())!;
+  const desktopInspector = (await inspector.boundingBox())!;
+  const desktopPanels = (await panels.boundingBox())!;
+  const desktopValidation = (await validation.boundingBox())!;
+  const desktopFooter = (await footer.boundingBox())!;
+  expect(desktopInspector.y).toBeCloseTo(desktopCanvas.y, 1);
+  expect(desktopInspector.height).toBeCloseTo(desktopCanvas.height, 1);
+  expect(desktopValidation.y - (desktopPanels.y + desktopPanels.height)).toBeCloseTo(margin, 1);
+  expect(desktopFooter.y - (desktopValidation.y + desktopValidation.height)).toBeCloseTo(margin, 1);
+  expect(desktopFooter.y + desktopFooter.height).toBeCloseTo(desktop.height, 1);
+
+  await page.setViewportSize({ width: 320, height: 844 });
+  const mobileCanvas = (await canvas.boundingBox())!;
+  const mobileInspector = (await inspector.boundingBox())!;
+  const mobilePanels = (await panels.boundingBox())!;
+  const mobileValidation = (await validation.boundingBox())!;
+  const mobileFooter = (await footer.boundingBox())!;
+  expect(mobileInspector.width).toBeCloseTo(mobileCanvas.width, 1);
+  expect(mobileInspector.y).toBeCloseTo(mobileCanvas.y + mobileCanvas.height, 1);
+  expect(mobileValidation.y - (mobilePanels.y + mobilePanels.height)).toBeCloseTo(margin, 1);
+  expect(mobileFooter.y - (mobileValidation.y + mobileValidation.height)).toBeCloseTo(margin, 1);
+});
+
+test('CEL annotation overrides can be added, edited, saved, and removed before publish', async ({ page }) => {
+  await mockGraphs(page);
+  const node = report.nodes[0];
+  const existing = { annotation_match: 'has(annotations.dataset)', config: null, resource: null, timeout: '2m' };
+  let draft: Graph = { ...report, nodes: [{ ...node, settings: { ...node.settings, overrides: { legacy: existing } } }] };
+  let published: Graph | undefined;
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+  await page.route(`**${api}/graphs/${report.id}/publish`, (route) => {
+    published = { ...draft, version: 1 };
+    return route.fulfill({ status: 201, json: published });
+  });
+
+  await page.goto(home);
+  await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByRole('button', { name: 'Edit override legacy' }).click();
+  const edit = page.getByRole('dialog', { name: 'Edit annotation override' });
+  await expect(edit.getByLabel('Annotation match (CEL)')).toHaveValue(existing.annotation_match);
+  await expect(edit.getByRole('textbox', { name: 'Docker configuration JSON' })).toHaveText('');
+  await expect(edit.getByLabel('Override CPU and memory')).not.toBeChecked();
+  await expect(edit.getByLabel('Timeout')).toHaveValue(existing.timeout);
+  await edit.getByLabel('Override name').fill('dataset');
+  await edit.getByLabel('Timeout').clear();
+  await edit.getByRole('button', { name: 'Apply override' }).click();
+  await expect(page.getByRole('button', { name: 'Edit override legacy' })).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Add override' }).click();
+  const add = page.getByRole('dialog', { name: 'Add annotation override' });
+  const apply = add.getByRole('button', { name: 'Apply override' });
+  await add.getByLabel('Override name').fill('dataset');
+  await apply.click();
+  await expect(add.getByRole('alert')).toContainText('An override with this name already exists.');
+
+  const annotationMatch = 'has(annotations.priority) &&\nannotations.priority == "high"';
+  const config = { image: 'example.invalid/priority-worker', env: ['MODE=fast'] };
+  await add.getByLabel('Override name').fill('priority');
+  await add.getByLabel('Annotation match (CEL)').fill(annotationMatch);
+  await add.getByLabel('Timeout').fill('45s');
+  await add.getByLabel('Override CPU and memory').check();
+  await add.getByLabel('CPU cores').fill('2');
+  await add.getByLabel('Memory (MiB)').fill('64');
+  await add.getByRole('textbox', { name: 'Docker configuration JSON' }).fill(JSON.stringify(config, null, 2));
+  await apply.click();
+  await expect(add).toBeHidden();
+
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  const priority = { annotation_match: annotationMatch, config, resource: { cpu_cores: 2, memory_bytes: 64 * 1048576 }, timeout: '45s' };
+  expect(draft.nodes[0].settings).toEqual({ ...node.settings, overrides: { dataset: { annotation_match: existing.annotation_match }, priority } });
+
+  await page.getByRole('button', { name: 'Remove override dataset' }).click();
+  await page.getByRole('button', { name: 'Publish', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Publish workflow' }).getByRole('button', { name: 'Publish version' }).click();
+  await expect(page.getByText(`Published ${report.name} · v1.`, { exact: true })).toBeVisible();
+  expect(published?.nodes[0].settings.overrides).toEqual({ priority });
+});
+
+test('Docker configuration code editor marks syntax errors and saves a JSON object', async ({ page }) => {
+  await mockGraphs(page);
+  let draft = report;
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+  await page.goto(home);
+  await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByRole('button', { name: 'Edit Docker configuration JSON' }).click();
+  const configDialog = page.getByRole('dialog', { name: 'Docker configuration' });
+  const editor = configDialog.getByRole('textbox', { name: 'Docker configuration JSON' });
+  const apply = configDialog.getByRole('button', { name: 'Apply configuration' });
+  await expect(editor).toContainText('example.invalid/worker');
+  await expect(configDialog.locator('.cm-lineNumbers')).toBeVisible();
+  await editor.fill('{\n  "image":\n}');
+  await expect(configDialog.locator('.cm-lint-marker-error')).toBeVisible();
+  await apply.click();
+  await expect(configDialog.getByRole('alert')).toBeVisible();
+  await editor.fill('[]');
+  await apply.click();
+  await expect(configDialog.getByRole('alert')).toContainText('Docker configuration must be a JSON object.');
+
+  const config = { image: 'example.invalid/new-worker', command: ['run', '--batch'], env: ['MODE=batch'], labels: { team: 'data' } };
+  await editor.fill(JSON.stringify(config, null, 2));
+  await apply.click();
+  await expect(configDialog).toBeHidden();
+  await expect(page.getByLabel('Docker image', { exact: true })).toHaveValue(config.image);
+  await expect(page.getByRole('textbox', { name: 'Command argument 2' })).toHaveValue('--batch');
+  await expect(page.getByRole('textbox', { name: 'Environment variable 1' })).toHaveValue('MODE=batch');
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].settings.config).toEqual(config);
+});
+
+test('Node Properties saves Docker arguments and environment entries from the form', async ({ page }) => {
+  await mockGraphs(page);
+  const node = report.nodes[0];
+  const config = { ...node.settings.config, env: ['DISABLE_FROM_IMAGE', 'MODE=old'], working_dir: '/app' };
+  let draft: Graph = { ...report, nodes: [{ ...node, settings: { ...node.settings, config } }] };
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+  await page.goto(home);
+  await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+
+  const inspector = page.getByRole('complementary');
+  const command = inspector.getByRole('group', { name: 'Command', exact: true });
+  const args = ['sh', '-c', 'echo "$MODE"\nexit 0', '  with spaces  ', ''];
+  for (const [index, arg] of args.entries()) {
+    await command.getByRole('button', { name: 'Add argument', exact: true }).click();
+    await command.getByRole('textbox', { name: `Command argument ${index + 1}` }).fill(arg);
+  }
+  const env = inspector.getByRole('group', { name: 'Environment variables', exact: true });
+  await expect(env.getByRole('textbox', { name: 'Environment variable 1' })).toHaveValue('DISABLE_FROM_IMAGE');
+  await env.getByRole('button', { name: 'Remove environment variable 2' }).click();
+  await env.getByRole('button', { name: 'Add variable' }).click();
+  await env.getByRole('textbox', { name: 'Environment variable 2' }).fill('MODE=region=eu');
+  await env.getByRole('button', { name: 'Add variable' }).click();
+  await env.getByRole('textbox', { name: 'Environment variable 3' }).fill('EMPTY=');
+
+  await inspector.getByRole('button', { name: 'Edit Docker configuration JSON' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Docker configuration' });
+  const editor = dialog.getByRole('textbox', { name: 'Docker configuration JSON' });
+  await expect(editor).toContainText('"command"');
+  await expect(editor).toContainText('MODE=region=eu');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].settings.config).toEqual({ ...config, command: args, env: ['DISABLE_FROM_IMAGE', 'MODE=region=eu', 'EMPTY='] });
+
+  for (let index = args.length; index > 0; index--) await command.getByRole('button', { name: `Remove command argument ${index}` }).click();
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('All changes saved', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].settings.config).toEqual({ ...config, env: ['DISABLE_FROM_IMAGE', 'MODE=region=eu', 'EMPTY='] });
+});
+
+test('The draft table shows workflow metadata, row actions, and copyable IDs', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await mockGraphs(page);
   await page.goto(home);
 
-  const ingestCard = card(page, ingest.name);
-  await expect(workflows(page).getByRole('listitem')).toHaveCount(3);
-  await expect(ingestCard.getByText('Draft', { exact: true })).toHaveCount(0);
-  await expect(ingestCard.getByTitle(ingest.id, { exact: true })).toHaveText(ingest.id.slice(0, 6));
-  await expectIdentityBesideIcon(ingestCard, ingest);
-  await expect(ingestCard.getByText('3 nodes', { exact: true })).toBeVisible();
-  await expect(ingestCard.getByText('2 connections', { exact: true })).toBeVisible();
-  await expect(ingestCard.getByText(ingest.created_by, { exact: true })).toBeVisible();
-  await expect(ingestCard.getByText(ingest.updated_by, { exact: true })).toBeVisible();
-  await expect(ingestCard.locator('time').nth(0)).toHaveAttribute('datetime', ingest.created_at);
-  await expect(ingestCard.locator('time').nth(1)).toHaveAttribute('datetime', ingest.updated_at);
-  await expectAuditTimesOnOneLine(ingestCard);
-  await expectPairedAuditRows(ingestCard);
-  await expectAuditIcons(ingestCard);
-  expect(await ingestCard.evaluate((element) => element.getBoundingClientRect().width)).toBeLessThan(320);
-  const footer = ingestCard.locator('.workflow-card-footer');
-  const footerActions = footer.getByRole('button');
-  await expect(footerActions).toHaveText(['Edit', 'Versions', 'Runtime']);
-  const [edit, versions, runtime] = await footerActions.evaluateAll((elements) => elements.map((element) => {
-    const { x, y, right } = element.getBoundingClientRect();
-    return { x, y, right };
-  }));
-  const footerRight = await footer.evaluate((element) => element.getBoundingClientRect().right - parseFloat(getComputedStyle(element).paddingRight));
-  expect(Math.abs(runtime.right - footerRight)).toBeLessThanOrEqual(1);
-  expect(edit.x).toBeLessThan(versions.x);
-  expect(versions.right).toBeLessThanOrEqual(runtime.x);
-  expect(Math.abs(edit.y - runtime.y)).toBeLessThanOrEqual(1);
-  expect(Math.abs(versions.y - runtime.y)).toBeLessThanOrEqual(1);
-  const reportCard = card(page, report.name);
-  await expect(reportCard.getByText('1 node', { exact: true })).toBeVisible();
-  await expect(reportCard.getByText('—', { exact: true })).toHaveCount(4);
-  await expect(card(page, telemetry.name).getByRole('heading', { name: longName, exact: true })).toBeVisible();
-  await expect(workflows(page)).not.toContainText(/last run|run duration|success rate/i);
+  const table = draftTable(page);
+  const ingestRow = draftRow(page, ingest.name);
+  await expect(table.getByRole('columnheader')).toHaveText(['Workflow', 'Nodes', 'Connections', ...auditLabels, 'Actions']);
+  await expect(table.getByRole('row').filter({ has: page.getByRole('cell') })).toHaveCount(3);
+  await expect(ingestRow.getByTitle(ingest.id, { exact: true })).toHaveText(ingest.id.slice(0, 6));
+  await expect(ingestRow.getByRole('cell', { name: '3 nodes', exact: true })).toBeVisible();
+  await expect(ingestRow.getByRole('cell', { name: '2 connections', exact: true })).toBeVisible();
+  await expect(ingestRow.getByText(ingest.created_by, { exact: true })).toBeVisible();
+  await expect(ingestRow.getByText(ingest.updated_by, { exact: true })).toBeVisible();
+  await expect(ingestRow.locator('time').nth(0)).toHaveAttribute('datetime', ingest.created_at);
+  await expect(ingestRow.locator('time').nth(1)).toHaveAttribute('datetime', ingest.updated_at);
+  await expectAuditTimesOnOneLine(ingestRow);
+  await expectAuditIcons(table);
+  await expect(ingestRow.getByRole('cell').last().getByRole('button')).toHaveText(['Edit', 'Versions', 'Runtime']);
+  const reportRow = draftRow(page, report.name);
+  await expect(reportRow.getByText('1 node', { exact: true })).toBeVisible();
+  await expect(reportRow.getByText('—', { exact: true })).toHaveCount(4);
+  await expect(draftRow(page, telemetry.name)).toBeVisible();
+  await expect(table).not.toContainText(/last run|run duration|success rate/i);
 
-  await ingestCard.getByRole('button', { name: 'Copy workflow ID' }).click();
+  await ingestRow.getByRole('button', { name: 'Copy workflow ID' }).click();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(ingest.id);
   await page.getByRole('button', { name: 'Dismiss message' }).click();
 
@@ -183,7 +317,7 @@ test('Draft cards show graph metadata and let users copy the full workflow ID', 
     navigator.clipboard.writeText = async () => { throw new DOMException('Clipboard access denied', 'NotAllowedError'); };
     document.execCommand = () => false;
   });
-  await reportCard.getByRole('button', { name: 'Copy workflow ID' }).click();
+  await reportRow.getByRole('button', { name: 'Copy workflow ID' }).click();
   const manualCopy = page.getByRole('dialog', { name: 'Copy workflow ID' });
   const uuid = manualCopy.getByRole('textbox', { name: 'Workflow ID' });
   await expect(uuid).toHaveValue(report.id);
@@ -216,15 +350,15 @@ test('Audit names resolve historical users while preserving the stored identitie
   });
   await page.goto(home);
 
-  const draftCard = card(page, draft.name);
-  await expect(draftCard.getByText('admin', { exact: true })).toBeVisible();
-  await expect(draftCard.getByText('admin', { exact: true })).toHaveAttribute('title', `admin (${adminId})`);
-  await expect(draftCard.getByText(reviewer.name, { exact: true })).toBeVisible();
-  await expect(card(page, otherDraft.name).getByText('admin', { exact: true })).toBeVisible();
-  await expect(card(page, otherDraft.name).getByText(unknownId, { exact: true })).toBeVisible();
+  const selectedDraft = draftRow(page, draft.name);
+  await expect(selectedDraft.getByText('admin', { exact: true })).toBeVisible();
+  await expect(selectedDraft.getByText('admin', { exact: true })).toHaveAttribute('title', `admin (${adminId})`);
+  await expect(selectedDraft.getByText(reviewer.name, { exact: true })).toBeVisible();
+  await expect(draftRow(page, otherDraft.name).getByText('admin', { exact: true })).toBeVisible();
+  await expect(draftRow(page, otherDraft.name).getByText(unknownId, { exact: true })).toBeVisible();
   expect(batches).toEqual([{ method: 'POST', ids: [adminId, unknownId] }]);
 
-  await draftCard.getByRole('button', { name: 'Edit', exact: true }).click();
+  await selectedDraft.getByRole('button', { name: 'Edit', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'Workflow name' })).toHaveValue(draft.name);
   const [save] = await Promise.all([
     page.waitForRequest(draftPath),
@@ -245,11 +379,11 @@ test('Search, sorting, and favorites apply to the current page', async ({ page }
   await mockGraphs(page);
   await page.goto(home);
 
-  const titles = workflows(page).getByRole('heading');
+  const titles = draftTable(page).locator('.table-name');
   const sort = page.getByRole('combobox', { name: 'Sort workflows on this page' });
   const search = page.getByRole('textbox', { name: 'Search this page…' });
   const favorites = page.getByRole('button', { name: 'My favorites on this page' });
-  const ingestFavorite = card(page, ingest.name).getByRole('button', { name: 'Favorite workflow' });
+  const ingestFavorite = draftRow(page, ingest.name).getByRole('button', { name: 'Favorite workflow' });
 
   await expect(titles).toHaveText([ingest.name, report.name, telemetry.name]);
   await sort.selectOption({ label: 'Name A–Z' });
@@ -285,7 +419,7 @@ test('Search, sorting, and favorites apply to the current page', async ({ page }
   await expect(page.getByRole('heading', { name: 'No favorite workflows on this page' })).toBeVisible();
 });
 
-test('Draft cards open the selected workflow and keep New workflow available', async ({ page }) => {
+test('Draft rows open the selected workflow and keep New workflow available', async ({ page }) => {
   await mockGraphs(page);
   const draftPath = `**${api}/graphs/${report.id}/draft`;
   await page.route(draftPath, (route) => route.fulfill({ json: report }));
@@ -293,7 +427,7 @@ test('Draft cards open the selected workflow and keep New workflow available', a
 
   const [request] = await Promise.all([
     page.waitForRequest(draftPath),
-    card(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click(),
+    draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click(),
   ]);
   expect(request.method()).toBe('GET');
   await expect(page.getByRole('textbox', { name: 'Workflow name' })).toHaveValue(report.name);
@@ -349,9 +483,9 @@ test('Published lists each version and Edit starts a draft from the selected ver
   await page.route(versionPath, (route) => route.fulfill({ json: olderCleanup }));
   await page.goto(home);
 
-  await card(page, ingest.name).getByRole('button', { name: 'Favorite workflow' }).click();
+  await draftRow(page, ingest.name).getByRole('button', { name: 'Favorite workflow' }).click();
   await page.getByRole('button', { name: 'My favorites on this page' }).click();
-  await expect(workflows(page).getByRole('heading')).toHaveText([ingest.name]);
+  await expect(draftTable(page).locator('.table-name')).toHaveText([ingest.name]);
 
   await page.getByRole('button', { name: 'Published versions', exact: true }).click();
   const table = publishedTable(page);
@@ -373,7 +507,7 @@ test('Published lists each version and Edit starts a draft from the selected ver
   await expect(cleanupRow.getByTitle(cleanup.id, { exact: true })).toHaveText(cleanup.id.slice(0, 6));
   await expect(cleanupRow.getByRole('cell', { name: '—', exact: true })).toHaveCount(4);
   await expect(olderCleanupRow.getByTitle(cleanup.id, { exact: true })).toHaveText(cleanup.id.slice(0, 6));
-  await expect(olderCleanupRow.getByRole('cell').last().getByRole('button')).toHaveText(['Edit', 'Runtime']);
+  await expect(olderCleanupRow.getByRole('cell').last().getByRole('button')).toHaveText(['Edit', 'Diff', 'Runtime']);
   await expect(page.getByRole('button', { name: /favorite/i })).toHaveCount(0);
   const search = page.getByRole('textbox', { name: 'Search this page…' });
   await search.fill(cleanup.id);
@@ -393,7 +527,7 @@ test('Published lists each version and Edit starts a draft from the selected ver
   await expect(rows).toHaveCount(3);
 
   await page.getByRole('button', { name: 'Drafts', exact: true }).click();
-  await card(page, ingest.name).getByRole('button', { name: 'Versions', exact: true }).click();
+  await draftRow(page, ingest.name).getByRole('button', { name: 'Versions', exact: true }).click();
   await expect(rows).toHaveCount(1);
   await expect(publishedRow(page, ingestVersion)).toBeVisible();
 
@@ -425,6 +559,184 @@ test('Published lists each version and Edit starts a draft from the selected ver
   await page.getByRole('button', { name: 'Back to workflows' }).click();
   await expect(rows).toHaveCount(3);
   await expect(olderCleanupRow.getByRole('cell', { name: '2 nodes', exact: true })).toBeVisible();
+});
+
+test('Diff shows node and connection changes on the canvas and their before and after values', async ({ page }) => {
+  await mockGraphs(page);
+  const [load, plan, review, obsolete, archive] = graph(cleanup.id, cleanup.name, 0, [
+    'Load inventory', 'List candidates', 'Review candidates', 'Remove expired records', 'Clean archive',
+  ]).nodes;
+  const inventory: GraphNode = { ...load, outputs: [{ file_name: 'inventory.json', kind: 'File', multiple: false }] };
+  const beforePlan: GraphNode = {
+    ...plan,
+    settings: {
+      config: { image: 'alpine' }, resource: { cpu_cores: 1, memory_bytes: 512 }, timeout: '10s',
+      overrides: { fast: { timeout: '5s' } },
+    },
+    inputs: [{ file_name: 'inventory.json', source: 'Load inventory.inventory.json', required: true, format: null }],
+  };
+  const afterPlan: GraphNode = {
+    ...beforePlan,
+    name: 'Plan cleanup',
+    settings: { config: { image: 'alpine', command: ['run'] }, resource: { cpu_cores: 2, memory_bytes: 1024 }, timeout: '20s' },
+    inputs: [{ ...beforePlan.inputs[0], required: false }],
+    outputs: [{ file_name: 'summary.txt', kind: 'File', multiple: false }],
+  };
+  const before: Graph = {
+    ...olderCleanup, node_count: 4, nodes: [inventory, beforePlan, review, obsolete],
+    edges: [[load.id, plan.id], [plan.id, review.id], [plan.id, obsolete.id]],
+  };
+  const after: Graph = {
+    ...cleanup, node_count: 4, nodes: [inventory, afterPlan, review, archive],
+    edges: [[load.id, plan.id], [load.id, review.id], [review.id, plan.id], [plan.id, archive.id]],
+  };
+  const versions = `**${api}/graphs?graph_id=${cleanup.id}&limit=50`;
+  await page.route(`**${api}/graphs?limit=50`, (route) => route.fulfill({ json: { items: [after], next_cursor: null } }));
+  await page.route(versions, (route) => route.fulfill({ json: { items: [after], next_cursor: publishedCursor } }));
+  await page.route(`${versions}&before=${publishedCursor}`, (route) => route.fulfill({ json: { items: [before], next_cursor: null } }));
+  const path = `**${api}/graphs/${after.id}/diff?from_version=${before.version}&version=${after.version}`;
+  const requests: string[] = [];
+  await page.route(path, (route) => {
+    requests.push(route.request().method());
+    return route.fulfill({ json: {
+      before_node_names: Object.fromEntries(before.nodes.map(({ id, name }) => [id, name])),
+      after_node_names: Object.fromEntries(after.nodes.map(({ id, name }) => [id, name])),
+      changes: [
+        { field: 'version', change: [2, 4] },
+        { field: 'structure', change: {
+          node_diffs: [[plan.id, [
+            { field: 'name', change: [beforePlan.name, afterPlan.name] },
+            { field: 'settings', change: [
+              { field: 'config', change: [beforePlan.settings.config, afterPlan.settings.config] },
+              { field: 'resource', change: [
+                { field: 'cpu_cores', change: [1, 2] },
+                { field: 'memory_bytes', change: [512, 1024] },
+              ] },
+              { field: 'timeout', change: ['10s', '20s'] },
+              { field: 'overrides', change: [
+                { name: 'fast', before: { timeout: '5s' }, after: null },
+              ] },
+            ] },
+            { field: 'inputs', change: [{ kind: 'changed', index: 0, changes: [{ field: 'required', change: [true, false] }] }] },
+            { field: 'outputs', change: [{ kind: 'added', index: 0, value: afterPlan.outputs[0] }] },
+          ]]],
+          node_miss: [archive.id],
+          node_over: [obsolete.id],
+          edge_miss: [[load.id, review.id], [review.id, plan.id], [plan.id, archive.id]],
+          edge_over: [[plan.id, review.id], [plan.id, obsolete.id]],
+        } },
+      ],
+    } });
+  });
+  await page.goto(home);
+  await page.getByRole('button', { name: 'Published versions', exact: true }).click();
+  await publishedRow(page, after).getByRole('button', { name: 'Diff', exact: true }).click();
+
+  const dialog = page.getByRole('dialog', { name: 'Compare graph versions' });
+  await expect(dialog.getByText(`v${after.version}`, { exact: true })).toBeVisible();
+  const compare = dialog.getByRole('button', { name: 'Compare', exact: true });
+  await expect(compare).toBeDisabled();
+  await dialog.getByRole('button', { name: 'Next page' }).click();
+  await dialog.getByRole('combobox', { name: 'Base version' }).selectOption(`${before.id}:${before.version}`);
+  expect(requests).toEqual([]);
+  await compare.click();
+
+  const canvas = dialog.getByRole('region', { name: 'Graph comparison canvas' });
+  const modifiedNode = canvas.getByRole('group', { name: 'Plan cleanup, Modified', exact: true });
+  const addedNode = canvas.getByRole('group', { name: 'Clean archive, Added', exact: true });
+  const removedNode = canvas.getByRole('group', { name: 'Remove expired records, Removed', exact: true });
+  const unchangedNode = canvas.getByRole('group', { name: 'Load inventory, Unchanged', exact: true });
+  await expect(modifiedNode.getByText('Modified', { exact: true })).toBeVisible();
+  await expect(addedNode.getByText('Added', { exact: true })).toBeVisible();
+  await expect(removedNode.getByText('Removed', { exact: true })).toBeVisible();
+  await expect(removedNode.locator('.task-node')).toHaveCSS('border-top-style', 'dashed');
+  await expect(unchangedNode).toBeVisible();
+
+  const connection = (name: string) => canvas.getByRole('img', { name, exact: true }).locator('.react-flow__edge-path');
+  const removedConnection = connection('Removed connection from Plan cleanup to Remove expired records');
+  const reversedConnection = connection('Removed connection from Plan cleanup to Review candidates');
+  const addedConnection = connection('Added connection from Review candidates to Plan cleanup');
+  await expect(removedConnection).toHaveCSS('stroke-dasharray', '6px, 4px');
+  await expect(reversedConnection).toHaveCSS('stroke-dasharray', '6px, 4px');
+  await expect(addedConnection).toHaveCSS('stroke-dasharray', 'none');
+  const pathTop = (path: Locator) => path.evaluate((element) => (element as SVGPathElement).getBBox().y);
+  expect(await pathTop(reversedConnection)).toBeLessThan(await pathTop(addedConnection));
+
+  const nodeChanges = dialog.getByRole('table', { name: 'Changes to Plan cleanup' });
+  const nodes = dialog.getByRole('table', { name: 'Added and removed nodes' });
+  await expect(nodes.getByRole('row', { name: /Added/ })).toContainText('Clean archive');
+  await expect(nodes.getByRole('row', { name: /Removed/ })).toContainText('Remove expired records');
+
+  await modifiedNode.click();
+  await expect(nodes).toHaveCount(0);
+  await expect(nodeChanges.getByRole('columnheader')).toHaveText(['Change', 'Before', 'After']);
+  await expect(nodeChanges.getByRole('row', { name: 'Name List candidates Plan cleanup' }).getByRole('cell')).toHaveText(['List candidates', 'Plan cleanup']);
+  const config = nodeChanges.getByRole('row', { name: /Settings · Configuration/ }).getByRole('cell');
+  await expect(config.first()).toContainText('"image": "alpine"');
+  await expect(config.last()).toContainText('"command":');
+  await expect(nodeChanges.getByRole('row', { name: /Settings · CPU cores/ }).getByRole('cell')).toHaveText(['1', '2']);
+  await expect(nodeChanges.getByRole('row', { name: /Settings · Memory/ }).getByRole('cell')).toHaveText(['512', '1024']);
+  await expect(nodeChanges.getByRole('row', { name: /Settings · Timeout/ }).getByRole('cell')).toHaveText(['10s', '20s']);
+  const override = nodeChanges.getByRole('row', { name: /Settings · Override · fast/ }).getByRole('cell');
+  await expect(override.first()).toContainText('"timeout": "5s"');
+  await expect(override.last()).toHaveText('—');
+  await expect(nodeChanges.getByRole('row', { name: /Input 1 · Required/ }).getByRole('cell')).toHaveText(['true', 'false']);
+  await expect(nodeChanges.getByRole('row', { name: /Output 1 · Added/ })).toContainText('summary.txt');
+
+  await removedNode.focus();
+  await removedNode.press('Enter');
+  await expect(nodeChanges).toHaveCount(0);
+  await expect(nodes.getByRole('row', { name: /Added/ })).toHaveCount(0);
+  await expect(nodes.getByRole('row', { name: /Removed/ })).toContainText('Remove expired records');
+  await unchangedNode.click();
+  await expect(dialog.getByRole('status')).toHaveText('Load inventory is unchanged.');
+  await dialog.getByRole('button', { name: 'Show all node changes' }).click();
+  await expect(nodeChanges).toBeVisible();
+  await expect(nodes.getByRole('row', { name: /Added/ })).toContainText('Clean archive');
+  await expect(nodes.getByRole('row', { name: /Removed/ })).toContainText('Remove expired records');
+  await expect(dialog.getByRole('table', { name: 'Connection changes' }).getByRole('cell')).toHaveText([
+    'List candidates → Review candidates', '—',
+    'List candidates → Remove expired records', '—',
+    '—', 'Load inventory → Review candidates',
+    '—', 'Review candidates → Plan cleanup',
+    '—', 'Plan cleanup → Clean archive',
+  ]);
+  await expect(dialog.getByRole('table', { name: 'Workflow field changes' }).getByRole('cell')).toHaveText(['2', '4']);
+  expect(requests).toEqual(['GET']);
+  await dialog.getByRole('button', { name: 'Close dialog' }).click();
+  await expect(dialog).toBeHidden();
+});
+
+test('Diff can compare another workflow and retry a failed comparison', async ({ page }) => {
+  await mockGraphs(page);
+  const base = { ...cleanup, id: ingestVersion.id, name: ingestVersion.name };
+  await page.route(`**${api}/graphs?limit=50`, (route) => route.fulfill({ json: { items: [cleanup, base], next_cursor: null } }));
+  await page.route(`**${api}/graphs?graph_id=${cleanup.id}&limit=50`, (route) => route.fulfill({ json: { items: [cleanup], next_cursor: null } }));
+  const path = `**${api}/graphs/${cleanup.id}/diff?from_version=${base.version}&version=${cleanup.version}&from_graph_id=${base.id}`;
+  const names = Object.fromEntries(cleanup.nodes.map(({ id, name }) => [id, name]));
+  let requests = 0;
+  await page.route(path, (route) => {
+    requests += 1;
+    if (requests === 1) return route.fulfill({ status: 503, json: { error: 'Comparison unavailable' } });
+    return route.fulfill({ json: {
+      changes: [{ field: 'id', change: [base.id, cleanup.id] }, { field: 'name', change: [base.name, cleanup.name] }],
+      before_node_names: names, after_node_names: names,
+    } });
+  });
+  await page.goto(home);
+  await page.getByRole('button', { name: 'Published versions', exact: true }).click();
+  await publishedRow(page, cleanup).getByRole('button', { name: 'Diff', exact: true }).click();
+
+  const dialog = page.getByRole('dialog', { name: 'Compare graph versions' });
+  await dialog.getByRole('checkbox', { name: 'Include other workflows' }).check();
+  await dialog.getByRole('combobox', { name: 'Base version' }).selectOption(`${base.id}:${base.version}`);
+  await dialog.getByRole('button', { name: 'Compare', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText('Comparison unavailable');
+  await dialog.getByRole('button', { name: 'Try again' }).click();
+  await expect(dialog.getByRole('table', { name: 'Workflow field changes' }).getByRole('row', { name: /Workflow name/ }).getByRole('cell')).toHaveText([base.name, cleanup.name]);
+  await expect(dialog.getByRole('group', { name: 'Remove expired records, Unchanged' })).toBeVisible();
+  await expect(dialog.getByRole('status')).toHaveText('The nodes and connections match.');
+  expect(requests).toBe(2);
 });
 
 test('Draft Runtime opens runs for its workflow without starting one', async ({ page }) => {
@@ -463,7 +775,7 @@ test('Draft Runtime opens runs for its workflow without starting one', async ({ 
   await page.goto(home);
   const [filteredRequest] = await Promise.all([
     page.waitForRequest(filtered),
-    card(page, draft.name).getByRole('button', { name: 'Runtime', exact: true }).click(),
+    draftRow(page, draft.name).getByRole('button', { name: 'Runtime', exact: true }).click(),
   ]);
   expect(filteredRequest.method()).toBe('GET');
   await expect(page).toHaveURL(/#\/runtime$/);
@@ -487,38 +799,35 @@ test('Draft Runtime opens runs for its workflow without starting one', async ({ 
   expect(mutations).toEqual([]);
 });
 
-test('Draft cards and the published table fit a narrow viewport', async ({ page }) => {
+test('Draft and published tables scroll within a narrow viewport', async ({ page }) => {
   const width = 320;
   await page.setViewportSize({ width, height: 844 });
   await mockGraphs(page);
   await page.goto(home);
 
-  const ingestCard = card(page, ingest.name);
-  await expectAuditTimesOnOneLine(ingestCard);
-  await expectPairedAuditRows(ingestCard);
-  const telemetryCard = card(page, telemetry.name);
-  await expect(telemetryCard.getByRole('heading', { name: longName, exact: true })).toBeVisible();
-  const draftId = telemetryCard.getByTitle(telemetry.id, { exact: true });
+  const ingestRow = draftRow(page, ingest.name);
+  await expectAuditTimesOnOneLine(ingestRow);
+  const telemetryRow = draftRow(page, telemetry.name);
+  await expect(telemetryRow.getByRole('button', { name: longName, exact: true })).toBeVisible();
+  const draftId = telemetryRow.getByTitle(telemetry.id, { exact: true });
   await expect(draftId).toHaveText(telemetry.id.slice(0, 6));
-  await expectIdentityBesideIcon(telemetryCard, telemetry);
   await expect(draftId).toBeVisible();
   expect(await draftId.evaluate((code) => code.scrollWidth <= code.clientWidth)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
-  const first = await card(page, ingest.name).boundingBox();
-  const last = await telemetryCard.boundingBox();
-  expect(first).not.toBeNull();
-  expect(last).not.toBeNull();
-  expect(last!.x).toBeGreaterThanOrEqual(0);
-  expect(last!.x + last!.width).toBeLessThanOrEqual(width);
-  expect(last!.y).toBeGreaterThan(first!.y + first!.height);
+  const draftRecords = page.getByRole('region', { name: 'Draft workflow records' });
+  expect(await draftRecords.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
+  await draftRecords.evaluate((element) => { element.scrollLeft = element.scrollWidth; });
+  await expect(telemetryRow.getByRole('button', { name: 'Edit', exact: true })).toBeInViewport();
 
   await page.getByRole('button', { name: 'Published versions', exact: true }).click();
   await expect(publishedTable(page)).toBeVisible();
-  const ingestRow = publishedRow(page, ingestVersion);
-  await expectAuditTimesOnOneLine(ingestRow);
-  const publishedId = ingestRow.getByTitle(ingestVersion.id, { exact: true });
+  const publishedIngest = publishedRow(page, ingestVersion);
+  await expectAuditTimesOnOneLine(publishedIngest);
+  const publishedId = publishedIngest.getByTitle(ingestVersion.id, { exact: true });
   await expect(publishedId).toHaveText(ingestVersion.id.slice(0, 6));
   await expect(publishedId).toBeVisible();
   expect(await publishedId.evaluate((code) => code.scrollWidth <= code.clientWidth)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+  const publishedRecords = page.getByRole('region', { name: 'Published workflow records' });
+  expect(await publishedRecords.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
 });

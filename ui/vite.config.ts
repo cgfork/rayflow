@@ -5,6 +5,10 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   return {
     plugins: [react()],
+    // Pre-bundle the lazy editor's dependencies before a draft is opened.
+    optimizeDeps: {
+      include: ['codemirror', '@codemirror/lang-json', '@codemirror/language', '@codemirror/lint', '@lezer/highlight'],
+    },
     server: {
       proxy: {
         '/api/v1': {

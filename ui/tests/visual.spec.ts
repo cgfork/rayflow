@@ -185,9 +185,10 @@ for (const { theme, width } of themes.flatMap((theme) => [320, 390, 768, 1440].m
     await page.goto('/#/orchestration');
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
 
-    const drafts = page.getByRole('list', { name: 'Workflows' });
-    const draft = drafts.getByRole('listitem').filter({ hasText: inventory.name });
-    await expect(drafts.getByRole('listitem')).toHaveCount(3);
+    const drafts = page.getByRole('table', { name: 'Draft workflows' });
+    const draftRows = drafts.getByRole('row').filter({ has: page.getByRole('cell') });
+    const draft = draftRows.filter({ has: page.getByRole('button', { name: inventory.name, exact: true }) });
+    await expect(draftRows).toHaveCount(3);
     const create = page.getByRole('button', { name: 'New workflow', exact: true });
     if (width <= 390) {
       expect(await create.evaluate((element) => element.getBoundingClientRect().height)).toBeGreaterThanOrEqual(44);
@@ -393,7 +394,9 @@ test('Changing theme preserves a dirty workflow and makes no API requests', asyn
     if (pathname.startsWith(api)) requests.push(`${request.method()} ${pathname}`);
   });
   await page.goto('/#/orchestration');
-  await page.getByRole('listitem').filter({ hasText: inventory.name }).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByRole('table', { name: 'Draft workflows' }).getByRole('row')
+    .filter({ has: page.getByRole('button', { name: inventory.name, exact: true }) })
+    .getByRole('button', { name: 'Edit', exact: true }).click();
   const name = page.getByRole('textbox', { name: 'Workflow name' });
   await name.fill('Inventory edits still in progress');
   await expect(page.getByText('Unsaved changes', { exact: true })).toBeVisible();

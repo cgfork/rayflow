@@ -33,6 +33,7 @@ where
         .route("/graphs/{graph_id}/publish", post(publish_graph_draft::<S>))
         .route("/graphs/{graph_id}", get(read_graph::<S>))
         .route("/graphs/{graph_id}/shared-nodes", get(shared_nodes::<S>))
+        .route("/graphs/{graph_id}/diff", get(compare_graphs::<S>))
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +55,33 @@ where
     app.shared_graph_nodes(graph_id, query.from_version, query.version)
         .await
         .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphDiffQuery {
+    from_graph_id: Option<Uuid>,
+    from_version: u64,
+    version: u64,
+}
+
+async fn compare_graphs<S>(
+    Path(graph_id): Path<Uuid>,
+    Query(query): Query<GraphDiffQuery>,
+    State(app): State<App<S>>,
+) -> Result<impl IntoResponse, AppError>
+where
+    S: GraphStore<Uuid, G = DAG> + Clone,
+    S::load(..): Send,
+    S::Err: Send + Sync + 'static,
+{
+    app.compare_graphs(
+        query.from_graph_id.unwrap_or(graph_id),
+        query.from_version,
+        graph_id,
+        query.version,
+    )
+    .await
+    .map(Json)
 }
 
 #[derive(Debug, Deserialize)]

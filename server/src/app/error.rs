@@ -257,13 +257,15 @@ fn runtime_error(error: &runtime::Error) -> (StatusCode, &'static str) {
     let status = match error {
         Error::Graph(error) => return graph_error(error.as_ref()),
         Error::Event(error) => return event_error(error),
-        Error::NodeNotFound(_) | Error::NodeRunNotFound(_) | Error::RunNotFound { .. } => {
-            Status::NOT_FOUND
-        }
+        Error::NodeNotFound(_)
+        | Error::NodeRunNotFound(_)
+        | Error::RunNotFound { .. }
+        | Error::RunConfigNotFound(_) => Status::NOT_FOUND,
         Error::InvalidUpgradeVersion { .. } | Error::InvalidUpgradeNode(_) => Status::BAD_REQUEST,
-        Error::AlreadyStarted | Error::InvalidTransition { .. } | Error::ConcurrentUpdate(_) => {
-            Status::CONFLICT
-        }
+        Error::AlreadyStarted
+        | Error::RunConfigInUse(_)
+        | Error::InvalidTransition { .. }
+        | Error::ConcurrentUpdate(_) => Status::CONFLICT,
         Error::Toasty(_) => Status::INTERNAL_SERVER_ERROR,
     };
     (status, error.code())

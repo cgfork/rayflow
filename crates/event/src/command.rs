@@ -20,17 +20,42 @@ pub fn models() -> toasty::ModelSet {
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
-    Start { nodes: Vec<Uuid> },
-    Rerun { node: Uuid },
-    Upgrade { version: u64, node: Uuid },
-    Dryrun { nodes: Vec<Uuid> },
-    Run { node: Uuid },
-    Pend { node: Uuid },
-    Resume { node: Uuid },
-    Succeed { node: Uuid },
-    Fail { node: Uuid },
-    Cancel { node: Uuid },
-    Terminate { node: Uuid },
+    Start {
+        nodes: Vec<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_config_id: Option<Uuid>,
+    },
+    Rerun {
+        node: Uuid,
+    },
+    Upgrade {
+        version: u64,
+        node: Uuid,
+    },
+    Dryrun {
+        nodes: Vec<Uuid>,
+    },
+    Run {
+        node: Uuid,
+    },
+    Pend {
+        node: Uuid,
+    },
+    Resume {
+        node: Uuid,
+    },
+    Succeed {
+        node: Uuid,
+    },
+    Fail {
+        node: Uuid,
+    },
+    Cancel {
+        node: Uuid,
+    },
+    Terminate {
+        node: Uuid,
+    },
 }
 
 /// A command recorded in the event log.
@@ -173,5 +198,24 @@ impl<B: Executor> crate::Read<uuid::Uuid, B> for CommandEntry {
             .exec(backend)
             .await?
             .ok_or(Error::CommandNotFound(id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_command_without_config_preserves_legacy_json() {
+        let json = serde_json::json!({"Start": {"nodes": []}});
+        let command = serde_json::from_value::<Command>(json.clone()).unwrap();
+        assert_eq!(
+            command,
+            Command::Start {
+                nodes: vec![],
+                run_config_id: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(command).unwrap(), json);
     }
 }
