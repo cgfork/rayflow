@@ -3,8 +3,10 @@ import { Activity, ArrowLeft, Box, CalendarClock, CalendarPlus, Check, Code2, Co
 import { api, dateTime, send, usePaged } from './api';
 import { useAuditActorName } from './audit';
 import { Badge, Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination, Refresh, SearchBox, UuidText } from './components';
+import { DockerConfigInput, parseDockerConfig } from './DockerConfigInput';
 import FlowCanvas from './FlowCanvas';
-import { createGraph, createNode, disconnectEdges, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
+import NodeOverrides from './NodeOverrides';
+import { createGraph, createNode, disconnectEdges, isJsonObject, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
 import { copyUuid } from './uuid';
 import type { User } from './Auth';
 import type { Graph, GraphNode } from './types';
@@ -358,6 +360,7 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
       </div>
       <label className="field">Timeout<input aria-label="Timeout" placeholder="10s" value={node.settings.timeout} onChange={(event) => update({ ...node, settings: { ...node.settings, timeout: event.target.value } })} /></label>
     </div>
+    <NodeOverrides settings={node.settings} update={(overrides) => update({ ...node, settings: { ...node.settings, overrides: Object.keys(overrides).length ? overrides : undefined } })} />
     <div className="field-section"><h3>Inputs <button type="button" className="icon-button" aria-label="Add input" onClick={() => update({ ...node, inputs: [...node.inputs, { file_name: '', source: '', required: true, format: null }] })}><Plus size={15} /></button></h3>{node.inputs.length === 0 && <p className="muted small-text">No inputs.</p>}{node.inputs.map((input, index) => <div className="port-form" key={index}><div className="actions"><input aria-label={`Input ${index + 1} file name`} placeholder="File name" value={input.file_name} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, file_name: event.target.value } : item) })} /><button type="button" className="icon-button" aria-label={`Remove input ${index + 1}`} onClick={() => update({ ...node, inputs: node.inputs.filter((_, offset) => offset !== index) })}><X size={14} /></button></div><select aria-label={`Input ${index + 1} source`} value={input.source} onChange={(event) => selectOutput(index, event.target.value)}><option value="">Select output</option>{input.source && !choices.some((choice) => choice.source === input.source) && <option value={input.source} disabled>{input.source} (unavailable)</option>}{choices.map((choice) => <option key={choice.source} value={choice.source}>{choice.source}</option>)}</select><input aria-label={`Input ${index + 1} format`} placeholder="Format (optional)" value={input.format ?? ''} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, format: event.target.value || null } : item) })} /><label className="checkbox"><input type="checkbox" checked={input.required} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, required: event.target.checked } : item) })} />Required</label></div>)}</div>
     <div className="field-section"><h3>Outputs <button type="button" className="icon-button" aria-label="Add output" onClick={() => update({ ...node, outputs: [...node.outputs, { file_name: '', kind: 'File', multiple: false }] })}><Plus size={15} /></button></h3>{node.outputs.length === 0 && <p className="muted small-text">No outputs defined.</p>}{node.outputs.map((output, index) => <div className="port-form" key={index}><div className="actions"><input aria-label={`Output ${index + 1} file name`} placeholder="File name" value={output.file_name} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, file_name: event.target.value } : item) })} /><button type="button" className="icon-button" aria-label={`Remove output ${index + 1}`} onClick={() => update({ ...node, outputs: node.outputs.filter((_, offset) => offset !== index) })}><X size={14} /></button></div><select aria-label={`Output ${index + 1} kind`} value={output.kind} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, kind: event.target.value as 'File' | 'Directory' } : item) })}><option>File</option><option>Directory</option></select><label className="checkbox"><input type="checkbox" checked={output.multiple} onChange={(event) => update({ ...node, outputs: node.outputs.map((item, offset) => offset === index ? { ...item, multiple: event.target.checked } : item) })} />Multiple files</label></div>)}</div>
     <div className="field-section"><h3>Connections <Link2 size={14} /></h3>{graph.edges.filter(([source]) => source === node.id).map(([source, destination]) => <div className="connection" key={destination}><span>→ {graph.nodes.find((item) => item.id === destination)?.name}</span><button type="button" className="icon-button" aria-label="Remove connection" onClick={() => change(disconnectEdges(graph, [[source, destination]]))}><X size={13} /></button></div>)}<div className="actions"><select aria-label="Connect to node" value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Connect to…</option>{graph.nodes.filter((item) => item.id !== node.id && !upstream.has(item.id) && !graph.edges.some(([source, destination]) => source === node.id && destination === item.id)).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button type="button" className="icon-button" disabled={!target} aria-label="Add connection" onClick={() => { change({ ...graph, edges: [...graph.edges, [node.id, target]] }); setTarget(''); }}><Plus size={16} /></button></div></div>
@@ -366,16 +369,34 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
 }
 
 function DockerConfigEditor({ config, close, apply }: { config: GraphNode['settings']['config']; close: () => void; apply: (config: GraphNode['settings']['config']) => void }) {
-  const [text, setText] = useState(JSON.stringify(config ?? {}, null, 2));
+  const initialValue = JSON.stringify(config ?? {}, null, 2);
+  const [text, setText] = useState(initialValue);
   const [error, setError] = useState<string>();
   function submit() {
     try {
-      const value: unknown = JSON.parse(text);
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Docker configuration must be a JSON object.');
-      apply(value as GraphNode['settings']['config']);
+      apply(parseDockerConfig(text));
     } catch (failure) { setError((failure as Error).message); }
   }
-  return <Modal title="Docker configuration" close={close} wide><ErrorBanner error={error} /><textarea className="json-editor" spellCheck={false} aria-label="Docker configuration JSON" value={text} onChange={(event) => setText(event.target.value)} /><div className="modal-actions"><button className="button" onClick={close}>Cancel</button><button className="button primary" onClick={submit}><Check size={15} />Apply configuration</button></div></Modal>;
+  return <Modal title="Docker configuration" close={close} wide>
+    <ErrorBanner error={error} />
+    <DockerConfigInput initialValue={initialValue} onChange={setText} />
+    <div className="modal-actions"><button className="button" onClick={close}>Cancel</button><button className="button primary" onClick={submit}><Check size={15} />Apply configuration</button></div>
+  </Modal>;
+}
+
+function isDraftResource(value: unknown): boolean {
+  if (!isJsonObject(value)) return false;
+  const { cpu_cores, memory_bytes } = value;
+  return typeof cpu_cores === 'number' && Number.isInteger(cpu_cores) && cpu_cores >= 0 && cpu_cores <= 4294967295
+    && typeof memory_bytes === 'number' && Number.isSafeInteger(memory_bytes) && memory_bytes >= 0;
+}
+
+function isDraftOverride(value: unknown): boolean {
+  return isJsonObject(value)
+    && (value.annotation_match == null || typeof value.annotation_match === 'string')
+    && (value.config == null || isJsonObject(value.config))
+    && (value.resource == null || isDraftResource(value.resource))
+    && (value.timeout == null || typeof value.timeout === 'string');
 }
 
 function JsonEditor({ value, close, apply, graphId }: { value: string; close: () => void; apply: (graph: Graph) => void; graphId: string }) {
@@ -390,7 +411,8 @@ function JsonEditor({ value, close, apply, graphId }: { value: string; close: ()
         if (!uuid.test(node.id) || typeof node.name !== 'string' || typeof node.node_type !== 'string' || !Array.isArray(node.inputs) || !Array.isArray(node.outputs)) throw new Error('Each node needs a UUID, name, node_type, inputs, and outputs.');
         if (node.settings !== undefined) {
           const settings = node.settings;
-          if (!settings || !settings.config || typeof settings.config !== 'object' || Array.isArray(settings.config) || !settings.resource || !Number.isInteger(settings.resource.cpu_cores) || settings.resource.cpu_cores < 0 || settings.resource.cpu_cores > 4294967295 || !Number.isSafeInteger(settings.resource.memory_bytes) || settings.resource.memory_bytes < 0 || typeof settings.timeout !== 'string') throw new Error('Node settings need a JSON config object, resource.cpu_cores, resource.memory_bytes, and a duration-string timeout.');
+          if (!settings || !isJsonObject(settings.config) || !isDraftResource(settings.resource) || typeof settings.timeout !== 'string') throw new Error('Node settings need a JSON config object, resource.cpu_cores, resource.memory_bytes, and a duration-string timeout.');
+          if (settings.overrides !== undefined && (!isJsonObject(settings.overrides) || !Object.values(settings.overrides).every(isDraftOverride))) throw new Error('Node overrides must be an object keyed by override name. Each override can specify annotation_match, config, resource, and timeout.');
         }
         if (node.inputs.some((input) => !input || typeof input.file_name !== 'string' || typeof input.source !== 'string' || typeof input.required !== 'boolean' || !(input.format === null || typeof input.format === 'string'))) throw new Error('Inputs need file_name, source, required, and format (string or null).');
         if (node.outputs.some((output) => !output || typeof output.file_name !== 'string' || !['File', 'Directory'].includes(output.kind) || typeof output.multiple !== 'boolean')) throw new Error('Outputs need file_name, kind (File or Directory), and multiple.');

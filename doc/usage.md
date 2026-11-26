@@ -349,7 +349,7 @@ Node execution settings are stored together under `settings`:
     "timeout": "10s",
     "overrides": {
       "long": {
-        "annotation_match": "$[?($.priority == 'high')]",
+        "annotation_match": "has(annotations.priority) && annotations.priority == 'high'",
         "timeout": "2m"
       }
     }
@@ -357,9 +357,9 @@ Node execution settings are stored together under `settings`:
 }
 ```
 
-Docker requires `image`; `command`, `env`, and `working_dir` are optional.
-The JSON editor preserves additional configuration keys. The Docker provider
-currently uses these four fields and applies CPU/memory limits from `resource`.
+Docker requires `image`. `command`, `env`, and `working_dir` are optional.
+The JSON editor for base and override settings preserves additional keys. The
+Docker provider uses these four fields and applies CPU/memory limits from `resource`.
 The UI displays memory in MiB; JSON stores bytes. Timeouts accept duration
 strings such as `10s`, `250ms`, and `2m`, with positive whole-millisecond precision.
 Timeouts use the existing job lease: delivery starts the expiry clock, and
@@ -370,11 +370,16 @@ Publishing creates a `default` config and one config for each key in
 `settings.overrides`. Each override can supply `annotation_match`, `config`,
 `resource`, or `timeout`. Omitted settings inherit the base values. A supplied
 `config` replaces the base JSON object as a whole. A nonempty `annotation_match`
-must be a JSONPath expression. It matches when it selects at least one value
-from the run's `annotations` object. For example, the override above matches
-`{"priority": "high"}`, and `$.priority` checks for the key's presence. If
-multiple overrides match, the one whose name sorts first wins. When none
-match, the job uses `default` from the node run's graph version.
+must be a Google CEL expression of at most 255 bytes with a boolean result.
+It matches when it evaluates to `true` over the run's `annotations` map of
+string keys to string values. The example matches `{"priority": "high"}`.
+Use `has(annotations.priority)` to check for a key, or `'dataset-id' in annotations`
+when the key contains a hyphen. If multiple overrides match, the one whose
+name sorts first wins. When no annotation snapshot exists or no predicate
+matches, the job uses `default` from the node run's graph version.
+
+Rewrite existing JSONPath expressions in the draft and publish a new version
+to use CEL. Job creation skips older stored JSONPath predicates.
 
 Choose an input's source from another node's declared outputs. Selection creates
 the dependency when needed and excludes sources that would create a cycle.
@@ -502,7 +507,8 @@ Run commands and task events return `202 Accepted` with the appended entry ID.
 In Runtime, click **Upgrade** on a run or its detail page. Select a newer
 published version and an eligible shared restart node, then confirm. The UI
 uses the graph's shared-node calculation and the same node-state rules as rerun.
-Shared nodes include all upstream ancestors of the fork point, including the root.
+Every node is shared when both versions have the same graph structure. If there
+is a unique fork point, its upstream ancestors are shared.
 To upgrade a run, send `POST /api/v1/runs/upgrade` with a body such as:
 
 ```json

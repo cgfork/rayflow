@@ -226,7 +226,7 @@ async fn run_workflow(mut db: toasty::Db) {
     let graph_id = graph.id;
     let producer = graph.nodes[0].id;
     let consumer = graph.nodes[1].id;
-    let normal_priority = "$[?($.priority == 'normal')]";
+    let normal_priority = "has(annotations.priority) && annotations.priority == 'normal'";
     let mut graph = json!(graph);
     graph["nodes"][0]["settings"]["overrides"] = json!({
         "large": {
@@ -540,20 +540,35 @@ async fn job_config_matching_and_fallback_use_the_node_run_version() {
         let graph_id = graph.id;
         let node_id = graph.nodes[0].id;
         let mut graph = json!(graph);
-        let high_priority = "$[?($.priority == 'high')]";
+        let high_priority = "annotations.priority == 'high'";
         for (version, overrides, cases) in [
             (
                 1,
                 json!({
+                    "aardvark": {"timeout": "1s"},
                     "zeta": {"annotation_match": high_priority},
                     "alpha": {"annotation_match": high_priority, "timeout": "5s"}
                 }),
-                vec![(Some("high"), "alpha"), (Some("low"), "default"), (None, "default")],
+                vec![
+                    (Some(json!({"priority": "high"})), "alpha"),
+                    (Some(json!({"priority": "low"})), "default"),
+                    (Some(json!({"dataset": "filetest"})), "default"),
+                    (None, "default"),
+                ],
             ),
             (
                 2,
-                json!({"legacy": {"annotation_match": "$.other"}}),
-                vec![(Some("high"), "default")],
+                json!({
+                    "empty": {"annotation_match": "size(annotations) == 0"},
+                    "legacy": {"annotation_match": "has(annotations.other)"},
+                    "tagged": {"annotation_match": "'dataset-id' in annotations && annotations['dataset-id'].startsWith('file')"}
+                }),
+                vec![
+                    (Some(json!({"priority": "high"})), "default"),
+                    (Some(json!({"priority": "high", "dataset-id": "filetest"})), "tagged"),
+                    (Some(json!({})), "empty"),
+                    (None, "default"),
+                ],
             ),
         ] {
             graph["nodes"][0]["settings"]["overrides"] = overrides;
@@ -575,16 +590,15 @@ async fn job_config_matching_and_fallback_use_the_node_run_version() {
             assert_eq!(published["version"], version);
 
             if version == 2 {
-                // Simulate a row published before JSONPath was validated.
+                // Simulate an override published while JSONPath was supported.
                 NodeConfig::filter_by_node_id_and_version_and_name(node_id, version, "legacy")
                     .update()
-                    .annotation_match("priority=high")
+                    .annotation_match("$.priority")
                     .exec(&mut db)
                     .await
                     .unwrap();
             }
-            for (priority, expected) in cases {
-                let annotations = priority.map(|priority| json!({"priority": priority}));
+            for (annotations, expected) in cases {
                 post(
                     &app,
                     "/runs/start",
@@ -606,6 +620,88 @@ async fn job_config_matching_and_fallback_use_the_node_run_version() {
 }
 
 #[tokio::test]
+async fn upgrade_restarts_a_shared_node_after_a_settings_only_publish() {
+    support::with_test_database(|db| async move {
+        let app = router(App::new(db.clone(), Config::default(), db.clone()));
+        let mut actuator = Actuator::new(Backend::new(db.clone(), db), 64);
+        let mut graph = workflow();
+        let graph_id = graph.id;
+        let node_ids: Vec<_> = graph.nodes.iter().map(|node| node.id).collect();
+        let node_id = node_ids[0];
+        let data_id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let draft = format!("/graphs/{graph_id}/draft");
+        let publish = format!("/graphs/{graph_id}/publish");
+
+        request(
+            &app,
+            Method::PUT,
+            &draft,
+            json!({"graph": graph}),
+            StatusCode::OK,
+        )
+        .await;
+        post(&app, &publish, json!({}), StatusCode::CREATED).await;
+        post(
+            &app,
+            "/runs/start",
+            json!({"data_id": data_id, "graph_id": graph_id}),
+            StatusCode::ACCEPTED,
+        )
+        .await;
+        assert_eq!(actuator.tick().await.unwrap().tasks, 1);
+        let original = poll_one(&app, owner, node_id).await;
+        assert_eq!(original.node_run.get().version, 1);
+        post(
+            &app,
+            "/job/fail",
+            json!({"job_id": original.uuid, "agent_id": owner}),
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+        assert_eq!(actuator.tick().await.unwrap().events, 1);
+
+        graph.nodes[0].settings.timeout = Duration::from_secs(30);
+        request(
+            &app,
+            Method::PUT,
+            &draft,
+            json!({"graph": graph}),
+            StatusCode::OK,
+        )
+        .await;
+        post(&app, &publish, json!({}), StatusCode::CREATED).await;
+        let shared = request(
+            &app,
+            Method::GET,
+            &format!("/graphs/{graph_id}/shared-nodes?from_version=1&version=2"),
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(shared, json!(node_ids));
+
+        post(
+            &app,
+            "/runs/upgrade",
+            json!({"data_id": data_id, "graph_id": graph_id, "version": 2, "node": node_id}),
+            StatusCode::ACCEPTED,
+        )
+        .await;
+        assert_eq!(actuator.tick().await.unwrap().tasks, 1);
+        let upgraded = poll_one(&app, owner, node_id).await;
+        assert_eq!(upgraded.run_id, original.run_id);
+        assert_eq!(upgraded.node_run.get().revision, 1);
+        assert_eq!(upgraded.node_run.get().version, 2);
+        assert_eq!(
+            upgraded.node_config.get().as_ref().unwrap().lease,
+            Some(30_000)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn invalid_node_overrides_leave_the_graph_unpublished() {
     support::with_test_database(|mut db| async move {
         let app = router(App::new(db.clone(), Config::default(), db.clone()));
@@ -616,7 +712,16 @@ async fn invalid_node_overrides_leave_the_graph_unpublished() {
         for (name, value) in [
             ("default", json!({})),
             ("short", json!({"timeout": "1us"})),
-            ("broken", json!({"annotation_match": "$[?"})),
+            (
+                "broken",
+                json!({"annotation_match": "has(annotations.priority"}),
+            ),
+            (
+                "nonboolean",
+                json!({"annotation_match": "annotations.priority"}),
+            ),
+            ("unknown", json!({"annotation_match": "priority == 'high'"})),
+            ("jsonpath", json!({"annotation_match": "$.priority"})),
         ] {
             graph["nodes"][0]["settings"]["overrides"] = json!({(name): value});
             request(
@@ -636,6 +741,14 @@ async fn invalid_node_overrides_leave_the_graph_unpublished() {
             .await;
             assert_eq!(error["error_code"], "RAYFLOW_INVALID_GRAPH");
             assert!(error["error"].as_str().unwrap().contains(name));
+            if name == "nonboolean" {
+                assert!(
+                    error["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("must return a boolean")
+                );
+            }
         }
         assert!(
             GraphRecord::filter_by_uuid(graph_id)

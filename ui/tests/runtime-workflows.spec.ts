@@ -130,7 +130,58 @@ test('Workflow search supports keyboard selection, ID lookup, and a scoped start
   expect(dataId).toMatch(/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i);
   await dialog.getByRole('button', { name: 'Start run', exact: true }).click();
   await expect(dialog).toBeHidden();
-  expect(startBody).toMatchObject({ graph_id: second.id, data_id: dataId, nodes: [] });
+  expect(startBody).toEqual({ graph_id: second.id, data_id: dataId, nodes: [] });
+});
+
+test('Start run validates annotation keys and submits values from editable rows', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 844 });
+  await mock(page);
+  const bodies: unknown[] = [];
+  await page.route('**/api/v1/runs/start', (route) => {
+    bodies.push(route.request().postDataJSON());
+    return route.fulfill({ status: 202, json: { id: 'command-id' } });
+  });
+  await page.goto('/#/runtime');
+  await choose(page, first);
+  await page.getByRole('button', { name: 'Start a run', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Start a workflow run' });
+  const annotations = dialog.getByRole('group', { name: 'Annotations (optional)', exact: true });
+  const row = (number: number) => annotations.getByRole('group', { name: `Annotation ${number}`, exact: true });
+  const key = (number: number) => row(number).getByRole('textbox', { name: 'Key', exact: true });
+  const value = (number: number) => row(number).getByRole('textbox', { name: 'Value', exact: true });
+  const add = annotations.getByRole('button', { name: 'Add annotation', exact: true });
+  const dataId = await dialog.getByRole('textbox', { name: 'Data ID' }).inputValue();
+  const start = dialog.getByRole('button', { name: 'Start run', exact: true });
+
+  await value(1).fill('10');
+  await start.click();
+  await expect(dialog.getByRole('alert')).toContainText('Enter a key for each annotation.');
+  expect(bodies).toHaveLength(0);
+
+  await key(1).fill('priority');
+  await add.click();
+  await expect(key(2)).toBeFocused();
+  await key(2).fill('priority');
+  await start.click();
+  await expect(dialog.getByRole('alert')).toContainText('Annotation key "priority" is already used.');
+  expect(bodies).toHaveLength(0);
+
+  await add.click();
+  await key(3).fill('empty');
+  await row(2).getByRole('button', { name: 'Remove annotation 2', exact: true }).click();
+  await expect(key(2)).toHaveValue('empty');
+  await add.click();
+  await key(3).fill('dataset');
+  await value(3).fill(' filetest\nrevision 2 ');
+  await add.click();
+  expect(await dialog.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+
+  await start.click();
+  await expect(dialog).toBeHidden();
+  expect(bodies).toEqual([{
+    graph_id: first.id, data_id: dataId, nodes: [],
+    annotations: { priority: '10', empty: '', dataset: ' filetest\nrevision 2 ' },
+  }]);
 });
 
 test('Workflow loading errors can be retried without requesting unfiltered runs', async ({ page }) => {

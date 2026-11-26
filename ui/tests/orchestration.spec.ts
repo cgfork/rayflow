@@ -136,6 +136,138 @@ function publishedRow(page: Page, graph: Graph) {
     .filter({ has: page.getByRole('cell', { name: `v${graph.version}`, exact: true }) });
 }
 
+test('Ready to publish has equal spacing above and below on desktop and mobile', async ({ page }) => {
+  const margin = 8;
+  const desktop = { width: 1440, height: 1400 };
+  await page.setViewportSize(desktop);
+  await mockGraphs(page);
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => route.fulfill({ json: report }));
+  await page.goto(home);
+  await card(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+
+  const studio = page.locator('.studio');
+  const panels = studio.locator('.studio-body');
+  const canvas = studio.locator('.canvas-panel');
+  const inspector = studio.getByRole('complementary');
+  const validation = studio.locator('.validation-panel').filter({ hasText: 'Ready to publish' });
+  const footer = page.getByRole('contentinfo').filter({ hasText: 'Workflow console' });
+  await expect(validation).toBeVisible();
+
+  const desktopCanvas = (await canvas.boundingBox())!;
+  const desktopInspector = (await inspector.boundingBox())!;
+  const desktopPanels = (await panels.boundingBox())!;
+  const desktopValidation = (await validation.boundingBox())!;
+  const desktopFooter = (await footer.boundingBox())!;
+  expect(desktopInspector.y).toBeCloseTo(desktopCanvas.y, 1);
+  expect(desktopInspector.height).toBeCloseTo(desktopCanvas.height, 1);
+  expect(desktopValidation.y - (desktopPanels.y + desktopPanels.height)).toBeCloseTo(margin, 1);
+  expect(desktopFooter.y - (desktopValidation.y + desktopValidation.height)).toBeCloseTo(margin, 1);
+  expect(desktopFooter.y + desktopFooter.height).toBeCloseTo(desktop.height, 1);
+
+  await page.setViewportSize({ width: 320, height: 844 });
+  const mobileCanvas = (await canvas.boundingBox())!;
+  const mobileInspector = (await inspector.boundingBox())!;
+  const mobilePanels = (await panels.boundingBox())!;
+  const mobileValidation = (await validation.boundingBox())!;
+  const mobileFooter = (await footer.boundingBox())!;
+  expect(mobileInspector.width).toBeCloseTo(mobileCanvas.width, 1);
+  expect(mobileInspector.y).toBeCloseTo(mobileCanvas.y + mobileCanvas.height, 1);
+  expect(mobileValidation.y - (mobilePanels.y + mobilePanels.height)).toBeCloseTo(margin, 1);
+  expect(mobileFooter.y - (mobileValidation.y + mobileValidation.height)).toBeCloseTo(margin, 1);
+});
+
+test('CEL annotation overrides can be added, edited, saved, and removed before publish', async ({ page }) => {
+  await mockGraphs(page);
+  const node = report.nodes[0];
+  const existing = { annotation_match: 'has(annotations.dataset)', config: null, resource: null, timeout: '2m' };
+  let draft: Graph = { ...report, nodes: [{ ...node, settings: { ...node.settings, overrides: { legacy: existing } } }] };
+  let published: Graph | undefined;
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+  await page.route(`**${api}/graphs/${report.id}/publish`, (route) => {
+    published = { ...draft, version: 1 };
+    return route.fulfill({ status: 201, json: published });
+  });
+
+  await page.goto(home);
+  await card(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByRole('button', { name: 'Edit override legacy' }).click();
+  const edit = page.getByRole('dialog', { name: 'Edit annotation override' });
+  await expect(edit.getByLabel('Annotation match (CEL)')).toHaveValue(existing.annotation_match);
+  await expect(edit.getByRole('textbox', { name: 'Docker configuration JSON' })).toHaveText('');
+  await expect(edit.getByLabel('Override CPU and memory')).not.toBeChecked();
+  await expect(edit.getByLabel('Timeout')).toHaveValue(existing.timeout);
+  await edit.getByLabel('Override name').fill('dataset');
+  await edit.getByLabel('Timeout').clear();
+  await edit.getByRole('button', { name: 'Apply override' }).click();
+  await expect(page.getByRole('button', { name: 'Edit override legacy' })).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Add override' }).click();
+  const add = page.getByRole('dialog', { name: 'Add annotation override' });
+  const apply = add.getByRole('button', { name: 'Apply override' });
+  await add.getByLabel('Override name').fill('dataset');
+  await apply.click();
+  await expect(add.getByRole('alert')).toContainText('An override with this name already exists.');
+
+  const annotationMatch = 'has(annotations.priority) &&\nannotations.priority == "high"';
+  const config = { image: 'example.invalid/priority-worker', env: ['MODE=fast'] };
+  await add.getByLabel('Override name').fill('priority');
+  await add.getByLabel('Annotation match (CEL)').fill(annotationMatch);
+  await add.getByLabel('Timeout').fill('45s');
+  await add.getByLabel('Override CPU and memory').check();
+  await add.getByLabel('CPU cores').fill('2');
+  await add.getByLabel('Memory (MiB)').fill('64');
+  await add.getByRole('textbox', { name: 'Docker configuration JSON' }).fill(JSON.stringify(config, null, 2));
+  await apply.click();
+  await expect(add).toBeHidden();
+
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  const priority = { annotation_match: annotationMatch, config, resource: { cpu_cores: 2, memory_bytes: 64 * 1048576 }, timeout: '45s' };
+  expect(draft.nodes[0].settings).toEqual({ ...node.settings, overrides: { dataset: { annotation_match: existing.annotation_match }, priority } });
+
+  await page.getByRole('button', { name: 'Remove override dataset' }).click();
+  await page.getByRole('button', { name: 'Publish', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Publish workflow' }).getByRole('button', { name: 'Publish version' }).click();
+  await expect(page.getByText(`Published ${report.name} · v1.`, { exact: true })).toBeVisible();
+  expect(published?.nodes[0].settings.overrides).toEqual({ priority });
+});
+
+test('Docker configuration code editor marks syntax errors and saves a JSON object', async ({ page }) => {
+  await mockGraphs(page);
+  let draft = report;
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+  await page.goto(home);
+  await card(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByRole('button', { name: 'Edit Docker configuration JSON' }).click();
+  const configDialog = page.getByRole('dialog', { name: 'Docker configuration' });
+  const editor = configDialog.getByRole('textbox', { name: 'Docker configuration JSON' });
+  const apply = configDialog.getByRole('button', { name: 'Apply configuration' });
+  await expect(editor).toContainText('example.invalid/worker');
+  await expect(configDialog.locator('.cm-lineNumbers')).toBeVisible();
+  await editor.fill('{\n  "image":\n}');
+  await expect(configDialog.locator('.cm-lint-marker-error')).toBeVisible();
+  await apply.click();
+  await expect(configDialog.getByRole('alert')).toBeVisible();
+  await editor.fill('[]');
+  await apply.click();
+  await expect(configDialog.getByRole('alert')).toContainText('Docker configuration must be a JSON object.');
+
+  const config = { image: 'example.invalid/new-worker', env: ['MODE=batch'], labels: { team: 'data' } };
+  await editor.fill(JSON.stringify(config, null, 2));
+  await apply.click();
+  await expect(configDialog).toBeHidden();
+  await expect(page.getByLabel('Docker image', { exact: true })).toHaveValue(config.image);
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].settings.config).toEqual(config);
+});
+
 test('Draft cards show graph metadata and let users copy the full workflow ID', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await mockGraphs(page);

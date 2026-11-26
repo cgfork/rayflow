@@ -1,6 +1,7 @@
 //! Consumes runtime logs and materializes jobs from logical tasks.
 use crate::Error;
 use event::{Emit, command::CommandEntry, task::Task, task_event::TaskEventEntry};
+use graph::annotation_match::AnnotationMatch;
 use graph::types::DEFAULT_NODE_CONFIG_NAME;
 use graph::{ForkPoint, GraphStore};
 use jiff::Timestamp;
@@ -9,7 +10,7 @@ use runtime::{
     backend::Backend,
     command::{NodeRun, Run},
 };
-use serde_json_path::JsonPath;
+use std::collections::HashMap;
 use std::time::Duration;
 use toasty::Executor;
 use uuid::Uuid;
@@ -245,13 +246,10 @@ fn default_node_config_name() -> String {
 }
 
 impl NodeConfig {
-    fn matches_annotations(&self, annotations: &serde_json::Value) -> bool {
-        let expression = self.annotation_match.trim();
-        if expression.is_empty() {
-            return false;
-        }
-        match JsonPath::parse(expression) {
-            Ok(path) => !path.query(annotations).is_empty(),
+    fn matches_annotations(&self, annotations: &HashMap<String, String>) -> bool {
+        match AnnotationMatch::compile(&self.annotation_match) {
+            Ok(Some(matcher)) => matcher.matches(annotations),
+            Ok(None) => false,
             Err(error) => {
                 tracing::warn!(node_config_id = %self.uuid, %error, "ignoring invalid annotation_match");
                 false
@@ -408,19 +406,17 @@ impl Job {
             .exec(&mut *backend)
             .await?;
         let run_config_id = run_config.as_ref().map_or(Uuid::nil(), |row| row.uuid);
-        let annotations = run_config.map(|row| serde_json::json!(row.annotation.0));
-
         let node_configs = NodeConfig::filter_by_node_id(task.node_id)
             .filter(NodeConfig::fields().version().eq(node_run.version))
             .order_by(NodeConfig::fields().name().asc())
             .exec(&mut *backend)
             .await?;
-        let node_config = annotations
+        let node_config = run_config
             .as_ref()
-            .and_then(|annotations| {
+            .and_then(|run_config| {
                 node_configs.iter().find(|config| {
                     config.name != DEFAULT_NODE_CONFIG_NAME
-                        && config.matches_annotations(annotations)
+                        && config.matches_annotations(&run_config.annotation.0)
                 })
             })
             .or_else(|| {

@@ -1,8 +1,11 @@
 use jiff::Timestamp;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, convert::Infallible, time::Duration};
 use uuid::Uuid;
 
-use crate::{Diff, Graph, Id, NodeMut, NodeRef};
+use crate::{
+    Diff, Graph, Id, NodeMut, NodeRef,
+    diff::{field_diffs, value_diff},
+};
 
 impl Id for Uuid {}
 
@@ -16,7 +19,7 @@ impl Diff for Kind {
     type Item = (Self, Self);
 
     fn diff(&self, other: &Self) -> Option<Self::Item> {
-        (self != other).then(|| (self.clone(), other.clone()))
+        value_diff(self, other)
     }
 }
 
@@ -31,11 +34,25 @@ pub struct Output {
     pub multiple: bool,
 }
 
+/// A changed output field and its before and after values.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OutputDiff {
+    FileName((String, String)),
+    Kind((Kind, Kind)),
+    Multiple((bool, bool)),
+}
+
 impl Diff for Output {
-    type Item = (Self, Self);
+    type Item = Vec<OutputDiff>;
 
     fn diff(&self, other: &Self) -> Option<Self::Item> {
-        (self != other).then(|| (self.clone(), other.clone()))
+        field_diffs([
+            self.file_name
+                .diff(&other.file_name)
+                .map(OutputDiff::FileName),
+            self.kind.diff(&other.kind).map(OutputDiff::Kind),
+            value_diff(&self.multiple, &other.multiple).map(OutputDiff::Multiple),
+        ])
     }
 }
 
@@ -52,11 +69,27 @@ pub struct Input {
     pub format: Option<String>,
 }
 
+/// A changed input field and its before and after values.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InputDiff {
+    FileName((String, String)),
+    Source((String, String)),
+    Required((bool, bool)),
+    Format((Option<String>, Option<String>)),
+}
+
 impl Diff for Input {
-    type Item = (Self, Self);
+    type Item = Vec<InputDiff>;
 
     fn diff(&self, other: &Self) -> Option<Self::Item> {
-        (self != other).then(|| (self.clone(), other.clone()))
+        field_diffs([
+            self.file_name
+                .diff(&other.file_name)
+                .map(InputDiff::FileName),
+            self.source.diff(&other.source).map(InputDiff::Source),
+            value_diff(&self.required, &other.required).map(InputDiff::Required),
+            value_diff(&self.format, &other.format).map(InputDiff::Format),
+        ])
     }
 }
 
@@ -66,11 +99,21 @@ pub struct Resource {
     pub memory_bytes: u64,
 }
 
+/// A changed resource field and its before and after values.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResourceDiff {
+    CpuCores((u32, u32)),
+    MemoryBytes((u64, u64)),
+}
+
 impl Diff for Resource {
-    type Item = (Self, Self);
+    type Item = Vec<ResourceDiff>;
 
     fn diff(&self, other: &Self) -> Option<Self::Item> {
-        (self != other).then(|| (self.clone(), other.clone()))
+        field_diffs([
+            value_diff(&self.cpu_cores, &other.cpu_cores).map(ResourceDiff::CpuCores),
+            value_diff(&self.memory_bytes, &other.memory_bytes).map(ResourceDiff::MemoryBytes),
+        ])
     }
 }
 
@@ -150,7 +193,7 @@ fn timeout_ms(timeout: Duration) -> Option<u64> {
 }
 
 impl Diff for NodeSettings {
-    type Item = (Self, Self);
+    type Item = Infallible;
 
     fn diff(&self, _other: &Self) -> Option<Self::Item> {
         None
@@ -174,22 +217,31 @@ pub struct Node {
     pub outputs: Vec<Output>,
 }
 
+/// A changed node field, including item-level changes for inputs and outputs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeDiff {
+    Id((Uuid, Uuid)),
+    Name((String, String)),
+    NodeType((String, String)),
+    Settings(<NodeSettings as Diff>::Item),
+    Inputs(<Vec<Input> as Diff>::Item),
+    Outputs(<Vec<Output> as Diff>::Item),
+}
+
 impl Diff for Node {
-    type Item = (Self, Self);
+    type Item = Vec<NodeDiff>;
 
     fn diff(&self, other: &Self) -> Option<Self::Item> {
-        let changes = [
-            self.id.diff(&other.id).is_some(),
-            self.name.diff(&other.name).is_some(),
-            self.node_type.diff(&other.node_type).is_some(),
-            self.settings.diff(&other.settings).is_some(),
-            self.inputs.diff(&other.inputs).is_some(),
-            self.outputs.diff(&other.outputs).is_some(),
-        ];
-        changes
-            .into_iter()
-            .any(|changed| changed)
-            .then(|| (self.clone(), other.clone()))
+        field_diffs([
+            self.id.diff(&other.id).map(NodeDiff::Id),
+            self.name.diff(&other.name).map(NodeDiff::Name),
+            self.node_type
+                .diff(&other.node_type)
+                .map(NodeDiff::NodeType),
+            self.settings.diff(&other.settings).map(NodeDiff::Settings),
+            self.inputs.diff(&other.inputs).map(NodeDiff::Inputs),
+            self.outputs.diff(&other.outputs).map(NodeDiff::Outputs),
+        ])
     }
 }
 
@@ -285,10 +337,10 @@ impl Graph for DAG {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ForkPoint;
+    use crate::{ForkPoint, diff::VecDiff};
 
     #[test]
-    fn node_diff_compares_each_field_and_ignores_settings_changes() {
+    fn settings_only_changes_do_not_affect_structural_diffs() {
         let node = Node {
             id: Uuid::new_v4(),
             name: "task".into(),
@@ -325,35 +377,127 @@ mod tests {
         assert_eq!(current.diff(&previous), None);
         assert_eq!(current.fork_point(&previous), None);
 
-        let mut input_change = node.clone();
-        input_change.inputs[0].required = false;
-        let mut output_change = node.clone();
-        output_change.outputs[0].multiple = true;
-        for changed in [
-            Node {
-                id: Uuid::new_v4(),
-                ..node.clone()
-            },
-            Node {
-                name: "renamed".into(),
-                ..node.clone()
-            },
-            Node {
-                node_type: "other".into(),
-                ..node.clone()
-            },
-            Node {
-                outputs: vec![],
-                ..node.clone()
-            },
-            input_change,
-            output_change,
-        ] {
-            assert_eq!(node.diff(&changed), Some((node.clone(), changed)));
-        }
-
         current.nodes[0].outputs[0].multiple = true;
         assert!(current.diff(&previous).is_some());
         assert_eq!(current.fork_point(&previous), Some(node.id));
+    }
+
+    #[test]
+    fn node_diff_reports_all_changed_fields_and_port_items() {
+        let input = Input {
+            file_name: "input.txt".into(),
+            source: "build.result.txt".into(),
+            required: true,
+            format: None,
+        };
+        let added_input = Input {
+            file_name: "extra.txt".into(),
+            ..input.clone()
+        };
+        let output = Output {
+            file_name: "result.txt".into(),
+            kind: Kind::File,
+            multiple: false,
+        };
+        let removed_output = Output {
+            file_name: "unused.txt".into(),
+            ..output.clone()
+        };
+        let before = Node {
+            id: Uuid::from_u128(1),
+            name: "task".into(),
+            node_type: "docker".into(),
+            settings: NodeSettings::default(),
+            inputs: vec![
+                input.clone(),
+                Input {
+                    file_name: "other.txt".into(),
+                    ..input
+                },
+            ],
+            outputs: vec![output, removed_output.clone()],
+        };
+        let mut after = before.clone();
+        after.id = Uuid::from_u128(2);
+        after.name = "renamed".into();
+        after.node_type = "other".into();
+        after.inputs[0] = Input {
+            file_name: "input.csv".into(),
+            source: "build.result.csv".into(),
+            required: false,
+            format: Some("csv".into()),
+        };
+        after.inputs[1].required = false;
+        after.inputs.push(added_input.clone());
+        after.outputs[0] = Output {
+            file_name: "results".into(),
+            kind: Kind::Directory,
+            multiple: true,
+        };
+        after.outputs.pop();
+
+        assert_eq!(
+            before.diff(&after),
+            Some(vec![
+                NodeDiff::Id((before.id, after.id)),
+                NodeDiff::Name(("task".into(), "renamed".into())),
+                NodeDiff::NodeType(("docker".into(), "other".into())),
+                NodeDiff::Inputs(vec![
+                    VecDiff::Changed {
+                        index: 0,
+                        changes: vec![
+                            InputDiff::FileName(("input.txt".into(), "input.csv".into())),
+                            InputDiff::Source((
+                                "build.result.txt".into(),
+                                "build.result.csv".into()
+                            )),
+                            InputDiff::Required((true, false)),
+                            InputDiff::Format((None, Some("csv".into()))),
+                        ],
+                    },
+                    VecDiff::Changed {
+                        index: 1,
+                        changes: vec![InputDiff::Required((true, false))],
+                    },
+                    VecDiff::Added {
+                        index: 2,
+                        value: added_input,
+                    },
+                ]),
+                NodeDiff::Outputs(vec![
+                    VecDiff::Changed {
+                        index: 0,
+                        changes: vec![
+                            OutputDiff::FileName(("result.txt".into(), "results".into())),
+                            OutputDiff::Kind((Kind::File, Kind::Directory)),
+                            OutputDiff::Multiple((false, true)),
+                        ],
+                    },
+                    VecDiff::Removed {
+                        index: 1,
+                        value: removed_output,
+                    },
+                ]),
+            ])
+        );
+    }
+
+    #[test]
+    fn resource_diff_reports_both_changed_limits() {
+        let before = Resource {
+            cpu_cores: 1,
+            memory_bytes: 512,
+        };
+        let after = Resource {
+            cpu_cores: 2,
+            memory_bytes: 1024,
+        };
+        assert_eq!(
+            before.diff(&after),
+            Some(vec![
+                ResourceDiff::CpuCores((1, 2)),
+                ResourceDiff::MemoryBytes((512, 1024)),
+            ])
+        );
     }
 }

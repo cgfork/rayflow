@@ -13,7 +13,12 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/lint": "^6.9.8",
+    "@lezer/highlight": "^1.2.5",
     "@xyflow/react": "^12.0.0",
+    "codemirror": "^6.0.2",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

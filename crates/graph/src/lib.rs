@@ -1,3 +1,4 @@
+pub mod annotation_match;
 pub mod diff;
 mod fork_point;
 pub mod pagination;
@@ -167,7 +168,7 @@ pub trait DraftGraphStore<I: Id>: GraphStore<I> {
     async fn publish(&mut self, graph_id: I, actor: &str) -> Result<(), Self::Err>;
 }
 
-/// Compares values, returning `None` when there are no differences.
+/// Reports all compared changes from `self` to `other`, or `None` if there are none.
 pub trait Diff {
     type Item;
     fn diff(&self, other: &Self) -> Option<Self::Item>;
@@ -179,9 +180,14 @@ pub trait ForkPoint: Graph {
     /// Returns `None` when no nodes need execution or changes start on separate branches.
     fn fork_point(&self, other: &Self) -> Option<Self::NodeId>;
 
-    /// Returns every ancestor of the fork point once, in this graph's node order.
+    /// Returns whether the graphs have the same node payloads and edges for execution.
+    fn same_structure(&self, other: &Self) -> bool;
+
+    /// Returns all nodes when the graphs have the same structure.
+    /// With a unique fork point, returns each of its ancestors in this graph's node order.
     fn shared_nodes(&self, other: &Self) -> impl Iterator<Item = NodeRef<'_, Self>> {
         let fork_point = self.fork_point(other);
+        let same_structure = fork_point.is_none() && self.same_structure(other);
         let mut pending: Vec<_> = fork_point.into_iter().collect();
         let mut ancestors = std::collections::HashSet::new();
         while let Some(node) = pending.pop() {
@@ -192,6 +198,6 @@ pub trait ForkPoint: Graph {
             }
         }
         self.nodes()
-            .filter(move |node| ancestors.contains(&node.id))
+            .filter(move |node| same_structure || ancestors.contains(&node.id))
     }
 }

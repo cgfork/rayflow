@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use serde_json_path::JsonPath;
 use uuid::Uuid;
 
+use crate::annotation_match::AnnotationMatch;
 use crate::types::{DAG, DEFAULT_NODE_CONFIG_NAME, NamedNodeSettings, Node, Output};
 use crate::{Graph, Id};
 
@@ -100,8 +100,8 @@ pub enum WorkflowValidationError {
         "{node}: invalid settings override name {name:?} (reserve 'default' for base settings and use up to 255 bytes without trailing spaces)"
     )]
     InvalidOverrideName { node: String, name: String },
-    #[error("{node}: annotation_match must be a JSONPath expression of at most 255 bytes")]
-    InvalidAnnotationMatch { node: String },
+    #[error("{node} has an invalid CEL annotation_match expression ({reason})")]
+    InvalidAnnotationMatch { node: String, reason: String },
     #[error("{node}: task type and a JSON configuration object are required")]
     InvalidTaskConfig { node: String },
     #[error("{node}: CPU cores and memory must be positive")]
@@ -213,12 +213,12 @@ fn validate_node_settings(
             format!("{} override {:?}", node.name, settings.name)
         }
     };
-    let expression = settings.annotation_match.trim();
-    if settings.annotation_match.len() > 255
-        || (!expression.is_empty() && JsonPath::parse(expression).is_err())
-    {
-        return Err(WorkflowValidationError::InvalidAnnotationMatch { node: label() });
-    }
+    AnnotationMatch::compile(settings.annotation_match).map_err(|error| {
+        WorkflowValidationError::InvalidAnnotationMatch {
+            node: label(),
+            reason: error.to_string(),
+        }
+    })?;
     if node.node_type.trim().is_empty() || !settings.config.is_object() {
         return Err(WorkflowValidationError::InvalidTaskConfig { node: label() });
     }

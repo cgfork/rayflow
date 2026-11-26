@@ -1,5 +1,15 @@
 import { randomUUID } from './uuid';
-import type { Graph, GraphNode } from './types';
+import type { Graph, GraphNode, NodeSettings } from './types';
+
+const utf8 = new TextEncoder();
+
+export function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function isOverrideNameValid(name: string): boolean {
+  return name !== 'default' && !name.endsWith(' ') && utf8.encode(name).length <= 255;
+}
 
 export function createGraph(name: string): Graph {
   return { id: randomUUID(), name, version: 0, node_count: 1, nodes: [createNode('start')], edges: [] };
@@ -57,6 +67,24 @@ function durationMilliseconds(value: string): number {
   if (!parts.length || value.trim().replace(/\d+(?:\.\d+)?\s*(?:ms|s|m|h|d)\s*/g, '')) return NaN;
   return parts.reduce((sum, part) => sum + Number(part[1]) * units[part[2]], 0);
 }
+
+function validateNodeSettings(label: string, settings: NodeSettings | undefined, errors: string[]) {
+  const { config, resource, timeout } = settings ?? {};
+  if (!isJsonObject(config)) errors.push(`${label}: Docker configuration must be a JSON object.`);
+  if (typeof config?.image !== 'string' || !config.image.trim()) errors.push(`${label}: Docker image is required.`);
+  for (const field of ['command', 'env']) {
+    const value = config?.[field];
+    if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== 'string'))) errors.push(`${label}: Docker ${field} must be an array of strings.`);
+  }
+  if (config?.working_dir !== undefined && typeof config.working_dir !== 'string') errors.push(`${label}: Docker working_dir must be a string.`);
+  const cpu = resource?.cpu_cores ?? 0;
+  const memory = resource?.memory_bytes ?? 0;
+  if (!Number.isInteger(cpu) || cpu < 1 || cpu > 4294967295) errors.push(`${label}: CPU cores must be a positive integer.`);
+  if (!Number.isSafeInteger(memory) || memory < 1) errors.push(`${label}: Memory must be positive whole bytes within the supported range.`);
+  const milliseconds = typeof timeout === 'string' ? durationMilliseconds(timeout) : NaN;
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 1) errors.push(`${label}: Timeout must be a positive duration such as 10s or 250ms.`);
+}
+
 export function validateGraph(graph: Graph) {
   const errors: string[] = [];
   const ids = new Set(graph.nodes.map((node) => node.id));
@@ -68,17 +96,17 @@ export function validateGraph(graph: Graph) {
   if (ids.size !== graph.nodes.length) errors.push('Node IDs must be unique.');
   for (const node of graph.nodes) {
     const settings = node.settings;
-    if (!settings?.config || typeof settings.config !== 'object' || Array.isArray(settings.config)) errors.push(`${node.name}: Docker configuration must be a JSON object.`);
-    if (typeof settings?.config?.image !== 'string' || !settings.config.image.trim()) errors.push(`${node.name}: Docker image is required.`);
-    for (const field of ['command', 'env']) {
-      const value = settings?.config?.[field];
-      if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== 'string'))) errors.push(`${node.name}: Docker ${field} must be an array of strings.`);
+    validateNodeSettings(node.name, settings, errors);
+    for (const [name, override] of Object.entries(settings?.overrides ?? {})) {
+      const label = `${node.name} override ${JSON.stringify(name)}`;
+      if (!isOverrideNameValid(name)) errors.push(`${label} has an invalid name. Use up to 255 bytes, with no trailing space, and reserve “default” for the base settings.`);
+      if (utf8.encode(override.annotation_match ?? '').length > 255) errors.push(`The CEL expression for ${label} exceeds 255 bytes.`);
+      validateNodeSettings(label, {
+        config: override.config ?? settings.config,
+        resource: override.resource ?? settings.resource,
+        timeout: override.timeout ?? settings.timeout,
+      }, errors);
     }
-    if (settings?.config?.working_dir !== undefined && typeof settings.config.working_dir !== 'string') errors.push(`${node.name}: Docker working_dir must be a string.`);
-    if (!Number.isInteger(settings?.resource?.cpu_cores) || settings.resource.cpu_cores < 1 || settings.resource.cpu_cores > 4294967295) errors.push(`${node.name}: CPU cores must be a positive integer.`);
-    if (!Number.isSafeInteger(settings?.resource?.memory_bytes) || settings.resource.memory_bytes < 1) errors.push(`${node.name}: Memory must be positive whole bytes within the supported range.`);
-    const timeout = typeof settings?.timeout === 'string' ? durationMilliseconds(settings.timeout) : NaN;
-    if (!Number.isSafeInteger(timeout) || timeout < 1) errors.push(`${node.name}: Timeout must be a positive duration such as 10s or 250ms.`);
     for (const [label, ports] of [['Input', node.inputs], ['Output', node.outputs]] as const) {
       if (ports.some((port) => !port.file_name.trim()) || new Set(ports.map((port) => port.file_name)).size !== ports.length) errors.push(`${node.name}: ${label} file names must be nonempty and unique.`);
     }
