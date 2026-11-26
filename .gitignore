@@ -22,3 +22,5 @@ target
 # Local agent state.
 .rayflow/
 rayflow.yaml
+pilot.yaml
+agent.yaml
