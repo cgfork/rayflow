@@ -328,7 +328,7 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
   const script = Buffer.from('print("hello")');
   const asset = {
     asset_id: 'aa000000-0000-4000-8000-000000000001',
-    name: 'transform', version: 1, size: script.length, format: 'text/x-lua',
+    name: 'transform-v1_example.lua', version: 1, size: script.length, format: 'text/x-lua',
     sha256: createHash('sha256').update(script).digest('hex'), published_at: '2026-11-15T02:30:00Z',
   };
   const uploadId = 'aa000000-0000-4000-8000-000000000002';
@@ -354,6 +354,7 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
     const headers = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'PUT', 'access-control-allow-headers': '*' };
     if (request.method() === 'OPTIONS') return route.fulfill({ status: 204, headers });
     expect(request.method()).toBe('PUT');
+    expect(request.headers()['content-type']).toBe(asset.format);
     expect(request.headers()['x-upload-marker']).toBe('staging');
     expect(request.headers()['x-rayflow-request']).toBeUndefined();
     expect(request.postDataBuffer()).toEqual(script);
@@ -374,7 +375,10 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
   await page.goto('/#/assets');
   await page.getByRole('button', { name: 'Upload asset' }).click();
   const upload = page.getByRole('dialog', { name: 'Upload asset' });
-  await upload.getByLabel('Asset name').fill(asset.name);
+  const assetName = upload.getByLabel('Asset name');
+  await assetName.fill('scripts/transform.lua');
+  expect(await assetName.evaluate((input: HTMLInputElement) => input.validity.patternMismatch)).toBe(true);
+  await assetName.fill(asset.name);
   await upload.getByLabel('File').setInputFiles({ name: 'script.lua', mimeType: asset.format, buffer: script });
   await upload.getByRole('button', { name: 'Publish asset' }).click();
   await expect(page.getByRole('table', { name: 'Published assets' })).toContainText(asset.name);

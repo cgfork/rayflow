@@ -316,6 +316,35 @@ Validate the optional adapter with `cargo test -p catalog --features s3`.
 The feature is disabled by default, so default builds do not include the AWS
 signing dependencies.
 
+### S3 CORS requirements
+
+When the console and object storage have different origins, configure CORS on
+Rayflow's storage bucket. The endpoint in each presigned URL must be reachable
+from the browser. Set `AllowedOrigins` to the console origins as sent by the
+browser, including the scheme, host, and any non-default port.
+
+| Console operation | `AllowedMethods` | `AllowedHeaders` |
+| --- | --- | --- |
+| Read `result.json` and `usage.json` in Runtime | `GET` | Omit for the current presigned archive requests. |
+| Upload a file in Assets | `PUT` | `content-type` and any additional headers listed in the browser's `Access-Control-Request-Headers`. |
+
+The browser sends an `OPTIONS` preflight before the upload. S3 matches the
+requested `PUT` method and must allow the origin and requested headers. The
+actual `GET` and `PUT` responses must also include `Access-Control-Allow-Origin`
+for the console origin.
+
+[rustfs-cors.json](../rustfs-cors.json) records the rules for the
+`rayflow-artifacts` bucket. To apply them from the repository root, use an AWS
+CLI identity with `s3:PutBucketCORS` permission.
+
+```sh
+aws --endpoint-url http://10.10.2.199:9000 --region us-east-1 \
+  s3api put-bucket-cors --bucket rayflow-artifacts \
+  --cors-configuration file://rustfs-cors.json
+```
+
+`put-bucket-cors` replaces the bucket's rule set. When adapting the example,
+update the console origins and include any rules other clients still need.
 
 ## Shared assets
 
@@ -346,9 +375,9 @@ so editing a draft to use another version affects jobs on the new graph.
 | `POST /api/v1/job/asset/presign` | Presign a job asset selected by `job_id`, `agent_id`, and declared `filename`. |
 
 The browser sends `PUT` directly to the URL from a pending prepare response
-using the returned headers. RustFS must be reachable from the browser and
-allow the console's origin for uploads. On commit Rayflow copies the staging
-object to a private key and verifies its size and SHA-256 before publishing.
+using the returned headers. Configure the bucket according to the
+[S3 CORS requirements](#s3-cors-requirements). On commit Rayflow copies the
+staging object to a private key and verifies its size and SHA-256 before publishing.
 The managed object remains separate from the upload key. Matching retries
 reuse the reservation or return the published version. Configure storage
 lifecycle expiry for objects under the `asset-staging` prefix and retain

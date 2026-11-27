@@ -1,0 +1,17 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["http://10.10.2.199:5173"],
+      "AllowedMethods": ["GET"]
+    },
+    {
+      "AllowedOrigins": ["http://10.10.2.199:9999"],
+      "AllowedMethods": ["GET"]
+    },
+    {
+      "AllowedOrigins": ["http://10.10.2.199:9999"],
+      "AllowedMethods": ["PUT"],
+      "AllowedHeaders": ["content-type"]
+    }
+  ]
+}

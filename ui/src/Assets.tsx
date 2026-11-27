@@ -128,7 +128,7 @@ function UploadAsset({ close, published }: { close: () => void; published: (asse
   return <Modal title="Upload asset" close={() => { if (!status) close(); }}>
     <form onSubmit={(event) => void submit(event)}>
       <ErrorBanner error={error} />
-      <label className="field">Asset name<input required maxLength={255} pattern="[A-Za-z0-9][A-Za-z0-9._\\-]*" value={name} onChange={(event) => setName(event.target.value)} disabled={Boolean(status)} /></label>
+      <label className="field">Asset name<input required maxLength={255} pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" value={name} onChange={(event) => setName(event.target.value)} disabled={Boolean(status)} /></label>
       <label className="field">Version<input required type="number" min="1" step="1" value={version} onChange={(event) => setVersion(event.target.value)} disabled={Boolean(status)} /></label>
       <label className="field">File<input required type="file" onChange={(event) => setFile(event.target.files?.[0])} disabled={Boolean(status)} /></label>
       {status && <p role="status" className="muted">{status}</p>}
