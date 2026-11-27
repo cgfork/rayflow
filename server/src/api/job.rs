@@ -11,7 +11,7 @@ use axum::{
 use catalog::{PresignedUrl, model::Catalog};
 use event::task_event::TaskEvent;
 use graph::{GraphStore, types::DAG};
-use scheduler::{AgentRef, GpuDevice, JobArtifactName, ResourceCapacity};
+use scheduler::{AgentRef, GpuChoice, GpuDevice, GpuOffers, JobArtifactName, ResourceCapacity};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::{Instant, sleep_until};
@@ -26,6 +26,8 @@ pub struct PollJobsRequest {
     pub resources: ResourceCapacity,
     #[serde(default)]
     pub gpu_devices: Vec<GpuDevice>,
+    #[serde(default)]
+    pub gpu_choices: Vec<GpuChoice>,
     #[serde(default)]
     pub active_jobs: Vec<Uuid>,
     /// Idle wait in milliseconds; defaults to a random half-to-full configured timeout.
@@ -147,6 +149,8 @@ pub struct SessionMultipartOutputRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PollJobsResponse {
     pub jobs: Vec<scheduler::Job>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_offers: Option<GpuOffers>,
 }
 
 pub(super) fn routes<S>() -> Router<App<S>>
@@ -448,13 +452,21 @@ async fn poll<S>(
         )));
     }
     let deadline = Instant::now() + request.wait(app.config.poll_timeout);
+    let has_gpu_choices = !request.gpu_choices.is_empty();
     let agent = AgentRef::new(request.agent_id, request.resources, request.active_jobs)
         .with_gpu_devices(request.gpu_devices)
+        .and_then(|agent| agent.with_gpu_choices(request.gpu_choices, request.batch))
         .map_err(|error| AppError::InvalidRequest(error.into()))?;
     loop {
-        let jobs = app.poll(&mut agent.clone(), request.batch).await?;
-        let response = PollJobsResponse { jobs };
+        let mut polling = agent.clone();
+        let jobs = app.poll(&mut polling, request.batch).await?;
+        let response = PollJobsResponse {
+            jobs,
+            gpu_offers: polling.take_gpu_offers(),
+        };
         if !response.jobs.is_empty()
+            || response.gpu_offers.is_some()
+            || has_gpu_choices
             || !agent.active_jobs().is_empty()
             || Instant::now() >= deadline
         {

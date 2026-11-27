@@ -2,7 +2,7 @@ import { useState, type FormEvent } from 'react';
 import { Check, Pencil, Plus, X } from 'lucide-react';
 import { ErrorBanner, Modal } from './components';
 import { DockerConfigInput, parseDockerConfig } from './DockerConfigInput';
-import { bytesPerMiB, isOptionalGpuCdiDevice, isOptionalGpuMemory, isOverrideNameValid } from './graph';
+import { bytesPerMiB, isOptionalGpuMemory, isOverrideNameValid } from './graph';
 import type { AnnotationMatchNodeSettings, NodeSettings } from './types';
 
 type Overrides = NonNullable<NodeSettings['overrides']>;
@@ -64,7 +64,6 @@ function OverrideEditor({ originalName, overrides, baseResource, allowGpuMemory,
   const [cpu, setCpu] = useState(String(resource.cpu_cores));
   const [memory, setMemory] = useState(String(resource.memory_bytes / bytesPerMiB));
   const [gpuMemory, setGpuMemory] = useState(resource.gpu_memory_bytes == null ? '' : String(resource.gpu_memory_bytes / bytesPerMiB));
-  const [gpuDevice, setGpuDevice] = useState(resource.gpu_cdi_device ?? '');
   const [error, setError] = useState<string>();
 
   function submit(event: FormEvent) {
@@ -77,12 +76,10 @@ function OverrideEditor({ originalName, overrides, baseResource, allowGpuMemory,
       if (overrideResources && !Number.isSafeInteger(memoryBytes)) throw new Error('Memory exceeds the supported range.');
       const gpuMemoryBytes = gpuMemory === '' ? undefined : Math.round(Number(gpuMemory) * bytesPerMiB);
       if (overrideResources && !isOptionalGpuMemory(gpuMemoryBytes)) throw new Error('GPU memory must be positive whole bytes within the supported range.');
-      const gpuCdiDevice = gpuDevice || undefined;
-      if (overrideResources && !isOptionalGpuCdiDevice(gpuCdiDevice, gpuMemoryBytes)) throw new Error('Specify a qualified GPU CDI device name and positive GPU memory.');
       apply(name, {
         annotation_match: expression.trim() ? expression : undefined,
         config,
-        resource: overrideResources ? { cpu_cores: Number(cpu), memory_bytes: memoryBytes, gpu_memory_bytes: gpuMemoryBytes, gpu_cdi_device: gpuCdiDevice } : undefined,
+        resource: overrideResources ? { cpu_cores: Number(cpu), memory_bytes: memoryBytes, gpu_memory_bytes: gpuMemoryBytes } : undefined,
         timeout: timeout.trim() || undefined,
       });
     } catch (failure) { setError((failure as Error).message); }
@@ -104,10 +101,6 @@ function OverrideEditor({ originalName, overrides, baseResource, allowGpuMemory,
       {overrideResources && allowGpuMemory && <label className="field">GPU memory (MiB)<input
         type="number" min={1 / bytesPerMiB} step="any" placeholder="Optional"
         value={gpuMemory} onChange={(event) => setGpuMemory(event.target.value)}
-      /></label>}
-      {overrideResources && allowGpuMemory && <label className="field">GPU CDI device<input
-        className="mono" placeholder="Automatic" maxLength={255}
-        value={gpuDevice} onChange={(event) => setGpuDevice(event.target.value)}
       /></label>}
       <div className="field">
         <span>Docker configuration JSON</span>

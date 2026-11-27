@@ -8,7 +8,7 @@ import { DockerConfigFields, DockerConfigInput, parseDockerConfig } from './Dock
 import FlowCanvas from './FlowCanvas';
 import GraphDiffDialog from './GraphDiffDialog';
 import NodeOverrides from './NodeOverrides';
-import { bytesPerMiB, createGraph, createNode, disconnectEdges, isJsonObject, isOptionalGpuCdiDevice, isOptionalGpuMemory, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
+import { bytesPerMiB, createGraph, createNode, disconnectEdges, isJsonObject, isOptionalGpuMemory, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
 import { copyUuid } from './uuid';
 import type { User } from './Auth';
 import type { Graph, GraphNode } from './types';
@@ -344,11 +344,6 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
           update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, gpu_memory_bytes } } });
         }}
       /></label>}
-      {node.node_type === 'docker' && <label className="field">GPU CDI device<input
-        className="mono" placeholder="Automatic" maxLength={255}
-        value={node.settings.resource.gpu_cdi_device ?? ''}
-        onChange={(event) => update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, gpu_cdi_device: event.target.value || undefined } } })}
-      /></label>}
       <label className="field">Timeout<input aria-label="Timeout" placeholder="10s" value={node.settings.timeout} onChange={(event) => update({ ...node, settings: { ...node.settings, timeout: event.target.value } })} /></label>
     </div>
     <NodeOverrides settings={node.settings} allowGpuMemory={node.node_type === 'docker'} update={(overrides) => update({ ...node, settings: { ...node.settings, overrides: Object.keys(overrides).length ? overrides : undefined } })} />
@@ -394,8 +389,7 @@ function isDraftResource(value: unknown): boolean {
   const { cpu_cores, memory_bytes } = value;
   return typeof cpu_cores === 'number' && Number.isInteger(cpu_cores) && cpu_cores >= 0 && cpu_cores <= 4294967295
     && typeof memory_bytes === 'number' && Number.isSafeInteger(memory_bytes) && memory_bytes >= 0
-    && isOptionalGpuMemory(value.gpu_memory_bytes)
-    && isOptionalGpuCdiDevice(value.gpu_cdi_device, value.gpu_memory_bytes);
+    && isOptionalGpuMemory(value.gpu_memory_bytes);
 }
 
 function isDraftOverride(value: unknown): boolean {
@@ -418,8 +412,8 @@ function JsonEditor({ value, close, apply, graphId }: { value: string; close: ()
         if (!uuid.test(node.id) || typeof node.name !== 'string' || typeof node.node_type !== 'string' || !Array.isArray(node.inputs) || !Array.isArray(node.outputs)) throw new Error('Each node needs a UUID, name, node_type, inputs, and outputs.');
         if (node.settings !== undefined) {
           const settings = node.settings;
-          if (!settings || !isJsonObject(settings.config) || !isDraftResource(settings.resource) || typeof settings.timeout !== 'string') throw new Error('Node settings need a JSON config object, resource.cpu_cores, resource.memory_bytes, and a duration-string timeout. A GPU CDI device requires a qualified name and positive GPU memory.');
-          if (settings.overrides !== undefined && (!isJsonObject(settings.overrides) || !Object.values(settings.overrides).every(isDraftOverride))) throw new Error('Node overrides must be an object keyed by override name. Each override can specify annotation_match, config, resource, and timeout. A GPU CDI device requires a qualified name and positive GPU memory.');
+          if (!settings || !isJsonObject(settings.config) || !isDraftResource(settings.resource) || typeof settings.timeout !== 'string') throw new Error('Node settings need a JSON config object, resource.cpu_cores, resource.memory_bytes, and a duration-string timeout. GPU memory must be positive whole bytes when specified.');
+          if (settings.overrides !== undefined && (!isJsonObject(settings.overrides) || !Object.values(settings.overrides).every(isDraftOverride))) throw new Error('Node overrides must be an object keyed by override name. Each override can specify annotation_match, config, resource, and timeout.');
         }
         if (node.inputs.some((input) => !input || typeof input.file_name !== 'string' || typeof input.source !== 'string' || typeof input.required !== 'boolean' || !(input.format === null || typeof input.format === 'string'))) throw new Error('Inputs need file_name, source, required, and format (string or null).');
         if (node.outputs.some((output) => !output || typeof output.file_name !== 'string' || !['File', 'Directory'].includes(output.kind))) throw new Error('Outputs need file_name and kind (File or Directory).');

@@ -237,9 +237,6 @@ pub struct NodeConfig {
     #[default(0)]
     #[serde(default)]
     pub required_gpu_memory_bytes: u64,
-    #[column(type = varchar(255))]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_gpu_cdi_device: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     #[column(type = varchar(64))]
@@ -311,10 +308,7 @@ pub struct Job {
     #[default(0)]
     #[serde(default)]
     pub required_gpu_memory_bytes: u64,
-    #[column(type = varchar(255))]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_gpu_cdi_device: Option<String>,
-    /// Device selected when the agent claimed this job.
+    /// CDI device chosen by the agent for this claim.
     #[column(type = varchar(255))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_gpu_cdi_device: Option<String>,
@@ -395,7 +389,6 @@ impl Job {
             required_cpu_cores: 0,
             required_memory_bytes: 0,
             required_gpu_memory_bytes: 0,
-            required_gpu_cdi_device: None,
             assigned_gpu_cdi_device: None,
             agent_id: None,
             polled_at: None,
@@ -452,7 +445,6 @@ impl Job {
         entry.required_cpu_cores = node_config.required_cpu_cores;
         entry.required_memory_bytes = node_config.required_memory_bytes;
         entry.required_gpu_memory_bytes = node_config.required_gpu_memory_bytes;
-        entry.required_gpu_cdi_device = node_config.required_gpu_cdi_device.clone();
         entry.write(backend).await?;
         Ok(Self::filter_by_uuid(entry.uuid).get(backend).await?)
     }
@@ -496,7 +488,6 @@ where
             .required_cpu_cores(self.required_cpu_cores)
             .required_memory_bytes(self.required_memory_bytes)
             .required_gpu_memory_bytes(self.required_gpu_memory_bytes)
-            .required_gpu_cdi_device(self.required_gpu_cdi_device.clone())
             .assigned_gpu_cdi_device(self.assigned_gpu_cdi_device.clone())
             .agent_id(self.agent_id)
             .polled_at(self.polled_at)

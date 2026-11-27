@@ -54,8 +54,6 @@ pub struct DockerSpec {
     #[serde(default)]
     pub gpu_memory_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_gpu_cdi_device: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_gpu_cdi_device: Option<String>,
 }
 
@@ -95,7 +93,6 @@ impl TryFrom<&scheduler::Job> for DockerSpec {
             cpu_cores: job.required_cpu_cores,
             memory_bytes: job.required_memory_bytes,
             gpu_memory_bytes: job.required_gpu_memory_bytes,
-            required_gpu_cdi_device: job.required_gpu_cdi_device.clone(),
             assigned_gpu_cdi_device: job.assigned_gpu_cdi_device.clone(),
         })
     }
@@ -113,13 +110,6 @@ impl DockerSpec {
             if !gpu_cdi_devices.iter().any(|name| name == device) {
                 return Err(Error::Provider(format!(
                     "assigned GPU CDI device {device:?} is unavailable on this agent"
-                )));
-            }
-            if let Some(required) = self.required_gpu_cdi_device.as_deref()
-                && device != required
-            {
-                return Err(Error::Provider(format!(
-                    "GPU CDI device {device:?} does not match job requirement {required:?}"
                 )));
             }
             Some(vec![DeviceRequest {
@@ -569,7 +559,6 @@ mod tests {
             required_cpu_cores: job.required_cpu_cores,
             required_memory_bytes: job.required_memory_bytes,
             required_gpu_memory_bytes: gpu_memory_bytes,
-            required_gpu_cdi_device: None,
             created_at: now,
             updated_at: now,
             created_by: "test".into(),
@@ -582,7 +571,6 @@ mod tests {
             String::from("vendor.example/gpu=1"),
         ];
         for device in &devices {
-            job.required_gpu_cdi_device = Some(device.clone());
             job.assigned_gpu_cdi_device = Some(device.clone());
             let spec = DockerSpec::try_from(&job).unwrap();
             let host_config = spec.create_body(&devices).unwrap().host_config.unwrap();
@@ -594,12 +582,6 @@ mod tests {
             );
         }
 
-        job.required_gpu_cdi_device = Some(devices[0].clone());
-        let spec = DockerSpec::try_from(&job).unwrap();
-        assert!(matches!(
-            spec.create_body(&devices),
-            Err(Error::Provider(_))
-        ));
         job.assigned_gpu_cdi_device = Some("vendor.example/gpu=unconfigured".into());
         let spec = DockerSpec::try_from(&job).unwrap();
         assert!(matches!(
@@ -607,7 +589,6 @@ mod tests {
             Err(Error::Provider(_))
         ));
 
-        job.required_gpu_cdi_device = None;
         job.assigned_gpu_cdi_device = None;
         let spec = DockerSpec::try_from(&job).unwrap();
         assert_eq!(spec.gpu_memory_bytes, gpu_memory_bytes);

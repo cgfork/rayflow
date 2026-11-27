@@ -283,7 +283,7 @@ gpu_devices:
 ```
 
 Use `gpu_devices` for one or more GPUs. For a CPU-only agent, omit the list or
-set it to `[]`. Apply database migrations 29 and 30 before starting the
+set it to `[]`. Apply database migrations 29 through 31 before starting the
 upgraded server.
 
 `asset_dir` (or `RAYFLOW_AGENT_ASSET_DIR`) holds the shared cache and
@@ -409,10 +409,9 @@ The JSON editor for base and override settings preserves additional keys. The
 Docker provider uses these four fields and applies CPU/memory limits from `resource`.
 The UI displays memory in MiB. JSON stores bytes. Set
 `settings.resource.gpu_memory_bytes` to a positive byte count to request GPU
-memory, or leave the GPU memory field blank for CPU-only jobs. Set
-`settings.resource.gpu_cdi_device` with a positive memory request to select a
-specific GPU. Otherwise Rayflow picks the device with the least free memory
-that can fit the request, breaking ties by CDI name. Jobs share a device when
+memory, or leave the GPU memory field blank for CPU-only jobs. When polling for
+work, the agent chooses the device with the smallest available VRAM budget
+that fits the request, breaking ties by CDI name. Jobs share a device when
 their reservations fit. Each job reserves memory on a single device, and
 Docker exposes that device through CDI. The workload controls its own GPU
 memory usage. Timeouts
@@ -426,8 +425,7 @@ Publishing creates a `default` config and one config for each key in
 `settings.overrides`. Each override can supply `annotation_match`, `config`,
 `resource`, or `timeout`. Omitted settings inherit the base values. A supplied
 `config` replaces the base JSON object as a whole. A supplied `resource`
-replaces all base resource values, including the optional GPU memory request
-and device selector.
+replaces all base resource values, including the optional GPU memory request.
 A nonempty `annotation_match` must be a Google CEL expression of at most
 255 bytes with a boolean result.
 It matches when it evaluates to `true` over the run's `annotations` map of
@@ -694,7 +692,8 @@ the published version. Publishing does not delete the draft.
 `batch` must be between 1 and 1000. `wait_ms` is optional and must be between
 zero and `poll_timeout`; `0` performs an immediate poll. When omitted or null,
 the server chooses a random wait in the half-open range
-`[poll_timeout / 2, poll_timeout)`. The response is `{ "jobs": [...] }`.
+`[poll_timeout / 2, poll_timeout)`. The response includes a `jobs` array of
+claimed jobs and can include `gpu_offers` for scheduled GPU work.
 
 When no jobs are available, the server retries short, independent database
 transactions at `poll_retry_interval` until the deadline. It never holds a
@@ -703,11 +702,24 @@ server returns after one attempt so lease acknowledgements and lost claims are
 not delayed. Keep one outstanding poll per agent ID and set client, proxy, and
 server timeouts above the long-poll wait plus request-processing time.
 
-The agent advertises GPU capacity through the top-level `gpu_devices` array.
-Each entry contains a `cdi_device` name and its `memory_bytes` budget. The
-scheduler accounts for existing claims on each device. It stores the selected
-name in `assigned_gpu_cdi_device` when claiming a GPU job and reuses that
-assignment on redelivery. Jobs with a selector require a matching device.
+CPU-only jobs can be claimed in a single poll. The agent advertises GPU
+capacity through the optional top-level `gpu_devices` array. Each entry
+contains a `cdi_device` name and its total `memory_bytes` budget.
+
+For new GPU jobs, the server can return `gpu_offers` containing `jobs` entries
+with `job_id` and `required_gpu_memory_bytes`, and `devices` entries with
+`cdi_device` and `memory_bytes`. Here `memory_bytes` is the remaining budget
+after accounting for existing claims. Offers return immediately and do not
+start a job lease.
+
+The agent chooses a device for each job it can fit and submits a follow-up
+poll with the same inventory and an optional top-level `gpu_choices` array of
+`{ "job_id": "...", "cdi_device": "..." }` entries. This poll returns after one
+attempt. The server checks that each job is still scheduled and that the chosen
+device still has capacity before claiming it. The agent starts jobs in the
+response's top-level `jobs` array. The server records each selected device in
+`assigned_gpu_cdi_device` and reuses that assignment on redelivery.
+
 Jobs are delivered at least once, so agents must tolerate redelivery. Active
 job IDs are excluded from delivery and do not renew their expiry. Job expiry
 comes from the pinned `node_config.lease`. The server and pilot require that lease.

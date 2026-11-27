@@ -144,6 +144,11 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "gpu_devices",
         include_str!("../migrations/0030_gpu_devices.sql"),
     ),
+    MigrationFile::new(
+        31,
+        "remove_required_gpu_cdi_device",
+        include_str!("../migrations/0031_remove_required_gpu_cdi_device.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

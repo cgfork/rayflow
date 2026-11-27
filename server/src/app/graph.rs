@@ -156,7 +156,6 @@ impl<S> App<S> {
                     .required_gpu_memory_bytes(
                         settings.resource.gpu_memory_bytes.unwrap_or_default(),
                     )
-                    .required_gpu_cdi_device(settings.resource.gpu_cdi_device.clone())
                     .created_at(graph.created_at)
                     .updated_at(graph.updated_at)
                     .created_by(actor.to_owned())

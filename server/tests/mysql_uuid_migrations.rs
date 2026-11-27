@@ -103,7 +103,6 @@ async fn assert_migrated(db: &mut Db) {
     assert_eq!(node_config.config["image"], "example");
     assert_eq!(node_config.name, "default");
     assert_eq!(node_config.required_gpu_memory_bytes, 0);
-    assert_eq!(node_config.required_gpu_cdi_device, None);
     assert_eq!(run_config.created_by, "creator");
     assert_eq!(run_config.updated_by, "updater");
     assert_eq!(node_config.created_by, "creator");
@@ -115,7 +114,6 @@ async fn assert_migrated(db: &mut Db) {
     assert_eq!(job.run_config_id, run_config.uuid);
     assert_eq!(job.status, Status::Succeeded);
     assert_eq!(job.required_gpu_memory_bytes, 0);
-    assert_eq!(job.required_gpu_cdi_device, None);
     assert_eq!(job.assigned_gpu_cdi_device, None);
     assert!(sql::query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'job' AND COLUMN_NAME IN ('node_run_uuid', 'node_config_uuid', 'run_config_uuid')")
         .exec(&mut *db).await.unwrap().is_empty());
@@ -308,6 +306,41 @@ async fn node_config_migration_preserves_legacy_configs_and_allows_named_version
             .await
             .unwrap();
     assert_eq!(named.name, "large");
+    cleanup(&url, &mut db).await;
+}
+
+#[tokio::test]
+async fn gpu_selector_migration_removes_requirements_and_keeps_claim_assignments() {
+    const CDI_DEVICE: &str = "nvidia.com/gpu=1";
+    const GPU_MEMORY: u64 = 4 * 1024 * 1024 * 1024;
+
+    let Some((url, mut db)) = legacy_database().await else {
+        return;
+    };
+    MigrationSet::new(&MIGRATIONS.migrations()[..30])
+        .apply(&db)
+        .await
+        .unwrap();
+    sql::statement("UPDATE node_config SET required_gpu_memory_bytes = ?, required_gpu_cdi_device = ? WHERE id = 22")
+        .bind(GPU_MEMORY).bind(CDI_DEVICE).exec(&mut db).await.unwrap();
+    sql::statement("UPDATE job SET required_gpu_memory_bytes = ?, required_gpu_cdi_device = ?, assigned_gpu_cdi_device = ? WHERE id = 44")
+        .bind(GPU_MEMORY).bind(CDI_DEVICE).bind(CDI_DEVICE).exec(&mut db).await.unwrap();
+
+    assert_eq!(initialize(&url).await.unwrap().applied(), 1);
+    sql::statement("DELETE FROM __toasty_migrations WHERE id = 31")
+        .exec(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(initialize(&url).await.unwrap().applied(), 1);
+
+    let columns = sql::query("SELECT TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('node_config', 'job') AND COLUMN_NAME = 'required_gpu_cdi_device'")
+        .exec(&mut db).await.unwrap();
+    assert!(columns.is_empty());
+    let config = NodeConfig::filter_by_id(22).get(&mut db).await.unwrap();
+    let job = Job::filter_by_id(44).get(&mut db).await.unwrap();
+    assert_eq!(config.required_gpu_memory_bytes, GPU_MEMORY);
+    assert_eq!(job.required_gpu_memory_bytes, GPU_MEMORY);
+    assert_eq!(job.assigned_gpu_cdi_device.as_deref(), Some(CDI_DEVICE));
     cleanup(&url, &mut db).await;
 }
 
