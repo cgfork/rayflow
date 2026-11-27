@@ -522,7 +522,8 @@ locking, and atomic renames. This can be a separate cloud disk. The cache
 persists across agent restarts, and job preparation accesses it only for nodes
 with declared assets.
 
-The agent evicts least recently used assets to meet `asset_cache_max_bytes`
-(10 GiB by default). A job's hard link protects the cached file from eviction
-until cleanup removes the link. The cache can exceed its budget while files
-are in use. A budget of zero evicts every file once no job links to it.
+The agent updates each cached file's access time when it stages a job asset
+and evicts the oldest accesses first to meet `asset_cache_max_bytes` (10 GiB by
+default). A job's hard link protects the cached file from eviction until
+cleanup removes the link. The cache can exceed its budget while files are in
+use. A budget of zero evicts every file once no job links to it.

@@ -602,15 +602,24 @@ async fn evicts_least_recently_used_assets_only_after_jobs_release_their_links()
     // Set distinct cache timestamps through the job links before releasing them.
     for (job, age) in [(&first, 1), (&second, 2)] {
         job.prepare(&transfer).await.unwrap();
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(age);
         File::open(job.staged())
             .unwrap()
             .set_times(
-                FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(age)),
+                FileTimes::new()
+                    .set_accessed(timestamp)
+                    .set_modified(timestamp),
             )
             .unwrap();
         fs::remove_dir_all(&job.staging_dir).await.unwrap();
     }
     first.prepare(&transfer).await.unwrap();
+    let metadata = fs::metadata(first.staged()).await.unwrap();
+    assert!(metadata.accessed().unwrap() > SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+    assert_eq!(
+        metadata.modified().unwrap(),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+    );
     fs::remove_dir_all(&first.staging_dir).await.unwrap();
     third.prepare(&transfer).await.unwrap();
 

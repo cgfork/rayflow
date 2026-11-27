@@ -37,6 +37,7 @@ struct CacheFile {
     asset_id: Uuid,
     path: PathBuf,
     kind: CacheFileKind,
+    accessed: SystemTime,
     modified: SystemTime,
     size: u64,
 }
@@ -175,7 +176,9 @@ impl LockedAsset {
             if let Err(error) = fs::OpenOptions::new()
                 .write(true)
                 .open(&source)
-                .and_then(|file| file.set_modified(SystemTime::now()))
+                .and_then(|file| {
+                    file.set_times(fs::FileTimes::new().set_accessed(SystemTime::now()))
+                })
             {
                 tracing::warn!(%error, path = %source.display(), "failed to update asset cache recency");
             }
@@ -202,7 +205,7 @@ impl LockedAsset {
 fn evict_files(root: &Path, max_bytes: u64) -> Result<(), Error> {
     let mut files = list_cache_files(root)?;
     files.sort_unstable_by(|left, right| {
-        (left.kind, left.modified, &left.path).cmp(&(right.kind, right.modified, &right.path))
+        (left.kind, left.accessed, &left.path).cmp(&(right.kind, right.accessed, &right.path))
     });
     let mut total: u128 = files.iter().map(|file| u128::from(file.size)).sum();
 
@@ -222,7 +225,9 @@ fn evict_files(root: &Path, max_bytes: u64) -> Result<(), Error> {
             continue;
         };
         if file.kind == CacheFileKind::Verified
-            && (metadata.modified()? != file.modified || metadata.len() != file.size)
+            && (metadata.accessed()? != file.accessed
+                || metadata.modified()? != file.modified
+                || metadata.len() != file.size)
         {
             // A job touched or replaced this blob after the snapshot.
             continue;
@@ -266,6 +271,7 @@ fn list_cache_files(root: &Path) -> Result<Vec<CacheFile>, Error> {
                 asset_id,
                 path,
                 kind,
+                accessed: metadata.accessed()?,
                 modified: metadata.modified()?,
                 size: if kind == CacheFileKind::Download {
                     0
