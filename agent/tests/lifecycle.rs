@@ -13,8 +13,8 @@ use agent::{
     JobManager, JobOutcome, JobResult, JobUsage, StopReason, Usage, UsagePercentiles,
     client::Client,
     containerd::{
-        Container, ContainerEvent, ContainerState, Containerd, ExitStatus,
-        docker::{DockerContainerd, DockerFiles, DockerSpec},
+        Container, ContainerEvent, ContainerFile, ContainerState, Containerd, ExitStatus,
+        docker::{DockerContainerd, DockerSpec},
     },
     errors::Error,
     settings::Settings,
@@ -23,7 +23,7 @@ use event::task::Task;
 use futures_util::{FutureExt, Stream, StreamExt, stream};
 use graph::{
     GraphStore, Page, PageRequest,
-    types::{DAG, Kind, Node, NodeSettings, Output},
+    types::{AssetRef, DAG, Kind, Node, NodeSettings, Output},
 };
 use jiff::Timestamp;
 use runtime::command::{NodeRun, Run};
@@ -32,6 +32,7 @@ use scheduler::{
     actuator::{NodeConfig, Status},
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 use tokio::{fs, sync::Notify, time::timeout};
 use uuid::Uuid;
@@ -112,6 +113,7 @@ impl Workflow {
                     id: node_run.node_id,
                     name: "execute".into(),
                     node_type: "docker".into(),
+                    assets: vec![],
                     settings: NodeSettings::default(),
                     inputs: vec![],
                     outputs: output
@@ -345,19 +347,13 @@ impl Containerd for FakeProvider {
         DockerSpec::try_from(job)
     }
 
-    fn spec_with_files<'a>(
+    fn spec_with_files<'a, 'files>(
         &'a self,
         job: &'a Job,
-        metadata: &Path,
-        inputs: &Path,
-        outputs: &Path,
+        files: impl IntoIterator<Item = &'files ContainerFile>,
     ) -> Result<Self::Spec<'a>, Error> {
         let mut spec = self.spec(job)?;
-        spec.files = Some(DockerFiles {
-            metadata: metadata.into(),
-            inputs: inputs.into(),
-            outputs: outputs.into(),
-        });
+        spec.files = files.into_iter().cloned().collect();
         Ok(spec)
     }
 
@@ -456,6 +452,59 @@ async fn recover_job<C: Containerd>(manager: &JobManager<C, Graphs>, job_id: Uui
 }
 
 #[tokio::test]
+async fn mounts_job_asset_links_read_only_from_the_configured_root() {
+    let mut workflow = Workflow::new(false);
+    workflow.settings.asset_dir = workflow._root.path().join("asset-volume");
+    let asset_id = Uuid::new_v4();
+    let file_name = "scripts/main.lua";
+    workflow.graph.0[0].nodes[0].assets.push(AssetRef {
+        asset_id,
+        file_name: file_name.into(),
+    });
+    let script = b"return 1";
+    let cache = workflow
+        .settings
+        .asset_dir
+        .join("cache")
+        .join(asset_id.to_string());
+    fs::create_dir_all(&cache).await.unwrap();
+    fs::write(
+        cache.join(format!("{:x}.blob", Sha256::digest(script))),
+        script,
+    )
+    .await
+    .unwrap();
+    let provider = FakeProvider::default();
+    let manager = workflow.open(provider.clone()).await;
+    let job = workflow.claim("fixture-image", "true");
+    manager.start(job.clone()).await;
+
+    let spec = provider.0.lock().unwrap().prepared[0].clone();
+    let mount = spec
+        .files
+        .iter()
+        .find(|file| file.target == "/data/assets")
+        .unwrap();
+    let aliases = workflow
+        .settings
+        .asset_dir
+        .join("jobs")
+        .join(job.uuid.to_string());
+    assert_eq!(mount.source, aliases.canonicalize().unwrap());
+    assert!(mount.read_only);
+    assert_eq!(fs::read(aliases.join(file_name)).await.unwrap(), script);
+    assert!(!workflow.data_dir(job.uuid).join("asset").exists());
+    assert!(
+        provider
+            .container(&spec.name)
+            .inspect()
+            .await
+            .unwrap()
+            .is_running()
+    );
+}
+
+#[tokio::test]
 async fn yield_and_resume_isolate_job_data_and_keep_unarchived_files() {
     let workflow = Workflow::new(true);
     let provider = FakeProvider::default();
@@ -469,10 +518,23 @@ async fn yield_and_resume_isolate_job_data_and_keep_unarchived_files() {
     manager.start(job.clone()).await;
     let spec = provider.0.lock().unwrap().prepared[0].clone();
     assert_eq!(spec.image, "fixture-image");
-    let mounts = spec.files.unwrap();
-    assert_eq!(mounts.inputs, data.join("inputs").canonicalize().unwrap());
-    assert_eq!(mounts.outputs, data.join("outputs").canonicalize().unwrap());
-    assert_eq!(mounts.metadata, dir.canonicalize().unwrap());
+    assert_eq!(spec.files.len(), 4);
+    for (target, source, read_only) in [
+        ("/rayflow", dir.clone(), true),
+        ("/data/inputs", data.join("inputs"), true),
+        ("/data/outputs", data.join("outputs"), false),
+        ("/data/assets", data.join("asset"), true),
+    ] {
+        let mount = spec
+            .files
+            .iter()
+            .find(|mount| mount.target == target)
+            .unwrap();
+        assert_eq!(mount.source, source.canonicalize().unwrap());
+        assert_eq!(mount.read_only, read_only);
+    }
+    assert!(data.join("asset").read_dir().unwrap().next().is_none());
+    assert!(!workflow.settings.asset_dir.exists());
     let pinned: DAG =
         serde_json::from_slice(&fs::read(dir.join("graph.json")).await.unwrap()).unwrap();
     assert_eq!(pinned.version, workflow.run.version);

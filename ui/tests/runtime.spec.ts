@@ -1,6 +1,6 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import type { Graph, GraphNode, Job, NodeRun, Run, RunView } from '../src/types';
+import type { Graph, GraphNode, Job, NodeRun, Run, RunArchiveTransfer, RunView } from '../src/types';
 import { expectDrawerAlignedWithInspector } from './drawer';
 
 const timestamp = '2026-11-18T00:00:00Z';
@@ -20,7 +20,7 @@ function graphNode(id: string, name: string): GraphNode {
   return {
     id, name, node_type: 'script',
     settings: { config: {}, resource: { cpu_cores: 1, memory_bytes: 1024 }, timeout: '10s' },
-    inputs: [], outputs: [],
+    inputs: [], outputs: [], assets: [],
   };
 }
 
@@ -68,14 +68,22 @@ test('Node State loads result and usage on selection, manual refresh, and retry'
   await mockRuntime(page);
   await page.route(`**${detailPath}`, (route) => route.fulfill({ json: view }));
   const storageOrigin = 'https://rayflow-archives.example.invalid';
-  const makeArchive = (nodeRun: NodeRun, filename: string, body: object) => ({
-    path: `${detailPath}/node-runs/${nodeRun.uuid}/artifacts/${filename}`,
-    signed: {
-      url: `${storageOrigin}/jobs/${nodeRun.uuid}/${filename}?X-Amz-Security-Token=fixture%2Btoken%3D&X-Amz-Signature=0123456789abcdef`,
-      operation: 'download', headers: {}, expires_at: '2030-01-01T00:00:00Z',
-    },
-    body,
-  });
+  const makeArchive = (nodeRun: NodeRun, filename: string, body: object) => {
+    const key = `/jobs/${nodeRun.uuid}/${filename}`;
+    return {
+      path: `${detailPath}/node-runs/${nodeRun.uuid}/artifacts/${filename}`,
+      signed: {
+        url: `${storageOrigin}${key}?X-Amz-Security-Token=fixture%2Btoken%3D&X-Amz-Signature=0123456789abcdef`,
+        operation: 'download', headers: {}, expires_at: '2030-01-01T00:00:00Z',
+        catalog: {
+          id: 1, uuid: 'fd000004-0000-4000-8000-000000000004', key, url: `s3://rayflow-fixtures${key}`,
+          size: Buffer.byteLength(JSON.stringify(body)), format: 'application/json', uploaded: true,
+          created_at: timestamp, updated_at: timestamp,
+        },
+      } satisfies RunArchiveTransfer,
+      body,
+    };
+  };
   const result = makeArchive(succeeded, 'result.json', { outcome: 'succeed', exit_code: 0, duration_ms: 1250, finished_at: timestamp });
   const usage = makeArchive(succeeded, 'usage.json', {
     summary: { sampled_at: timestamp, peak_cpu_millicores: 750, peak_memory_usage_bytes: 536_870_912 },

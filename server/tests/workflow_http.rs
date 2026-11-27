@@ -5,7 +5,7 @@ use std::time::Duration;
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{Method, Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
 };
 use catalog::{
     CatalogOptionalData, CatalogSystem, FileInput, FileSystem, PresignOperation, PresignedUrl,
@@ -52,6 +52,9 @@ async fn request(
         .await
         .unwrap();
     let status = response.status();
+    if method == Method::GET && path.contains("/node-runs/") && path.contains("/artifacts/") {
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(
         status,
@@ -130,6 +133,7 @@ fn workflow() -> DAG {
             id: Uuid::new_v4(),
             name: name.into(),
             node_type: "test".into(),
+            assets: vec![],
             settings: NodeSettings {
                 config: json!({}),
                 resource: Resource {
@@ -191,13 +195,29 @@ async fn commit_artifact(
     assert_eq!(prepared["catalog"]["uuid"], json!(catalog_uuid));
     assert_eq!(prepared["catalog"]["uploaded"], false);
     assert_eq!(prepared["presigned"]["operation"], "upload");
-    post(
+    let commit_body = json!({"job_id": job_id, "agent_id": agent_id, "filename": filename, "catalog_uuid": catalog_uuid});
+    let committed = post(
         app,
         "/job/output/commit",
-        json!({"job_id": job_id, "agent_id": agent_id, "filename": filename, "catalog_uuid": catalog_uuid}),
+        commit_body.clone(),
         StatusCode::OK,
     )
     .await;
+    let file_uuid: Uuid = serde_json::from_value(committed["file_uuid"].clone()).unwrap();
+    assert!(!file_uuid.is_nil());
+    let catalog: catalog::model::Catalog =
+        serde_json::from_value(committed["catalog"].clone()).unwrap();
+    assert_eq!(catalog.uuid, catalog_uuid);
+    assert!(catalog.uploaded);
+    assert_eq!(catalog.size, size);
+    assert_eq!(catalog.format, format);
+    for field in ["id", "key", "url", "created_at"] {
+        assert_eq!(committed["catalog"][field], prepared["catalog"][field]);
+    }
+    assert_eq!(
+        post(app, "/job/output/commit", commit_body, StatusCode::OK).await,
+        committed
+    );
     catalog_uuid
 }
 
@@ -207,6 +227,7 @@ fn storage_config() -> Config {
             endpoint: "http://127.0.0.1:9000".into(),
             bucket: "workflow-test".into(),
             prefix: "artifacts".into(),
+            asset_import_prefix: None,
             region: "us-east-1".into(),
             access_key: "test-key".into(),
             secret_key: "test-secret".into(),
@@ -895,7 +916,8 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
             .unwrap();
         let node = NodeRun::filter_by_uuid(job.node_run_id).get(&mut db).await.unwrap();
         let archive_path = |filename| format!("/runs/{}/node-runs/{}/artifacts/{filename}", job.run_id, node.uuid);
-        let assert_signed_archive = |filename: &str, body: Value| {
+        let assert_signed_archive = |filename: &str, catalog: &Value, mut body: Value| {
+            assert_eq!(body.as_object_mut().unwrap().remove("catalog").as_ref(), Some(catalog));
             let signed: PresignedUrl = serde_json::from_value(body.clone()).unwrap();
             assert_eq!(body, serde_json::to_value(&signed).unwrap());
             assert_eq!(signed.operation, PresignOperation::Download);
@@ -956,7 +978,9 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
         assert_eq!(prepared_after_expiry["catalog_uuid"], json!(result_id));
         for _ in 0..2 {
             let acknowledged = post(&app, "/job/result/commit", commit(owner, result_id), StatusCode::OK).await;
-            assert_eq!(acknowledged, json!(result_id));
+            let catalog = db.get_catalog(result_id).await.unwrap().unwrap();
+            assert!(catalog.uploaded);
+            assert_eq!(acknowledged, json!({"catalog_uuid": result_id, "catalog": catalog}));
         }
         let committed = post(&app, "/job/result/prepare", prepare(owner, 42), StatusCode::OK).await;
         assert_eq!(committed["catalog_uuid"], json!(result_id));
@@ -964,6 +988,7 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
         assert_eq!(committed["presigned"]["operation"], "download");
         assert_signed_archive(
             "result.json",
+            &committed["catalog"],
             request(&app, Method::GET, &archive_path("result.json"), Value::Null, StatusCode::OK).await,
         );
         let different_run = format!("/runs/{}/node-runs/{}/artifacts/result.json", Uuid::new_v4(), node.uuid);
@@ -984,12 +1009,14 @@ async fn job_result_upload_survives_expiry_and_preserves_catalog_ownership() {
         assert!(request(&app, Method::GET, &archive_path("usage.json"), Value::Null, StatusCode::OK).await.is_null());
         post(&app, "/job/result/prepare", usage_prepare(owner, 22), StatusCode::BAD_REQUEST).await;
         post(&app, "/job/result/commit", commit(owner, usage_id), StatusCode::BAD_REQUEST).await;
-        post(&app, "/job/result/commit", usage_commit(usage_id), StatusCode::OK).await;
+        let acknowledged = post(&app, "/job/result/commit", usage_commit(usage_id), StatusCode::OK).await;
         let usage = post(&app, "/job/result/prepare", usage_prepare(owner, 21), StatusCode::OK).await;
         assert_eq!(usage["catalog_uuid"], json!(usage_id));
+        assert_eq!(acknowledged, json!({"catalog_uuid": usage_id, "catalog": usage["catalog"]}));
         assert_eq!(usage["presigned"]["operation"], "download");
         assert_signed_archive(
             "usage.json",
+            &usage["catalog"],
             request(&app, Method::GET, &archive_path("usage.json"), Value::Null, StatusCode::OK).await,
         );
         let invalid = json!({

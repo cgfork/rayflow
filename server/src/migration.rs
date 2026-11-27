@@ -128,6 +128,12 @@ pub const MIGRATIONS: MigrationSet = MigrationSet::new(&[
         "named_node_config",
         include_str!("../migrations/0026_named_node_config.sql"),
     ),
+    MigrationFile::new(27, "asset", include_str!("../migrations/0027_asset.sql")),
+    MigrationFile::new(
+        28,
+        "asset_promotion",
+        include_str!("../migrations/0028_asset_promotion.sql"),
+    ),
 ]);
 
 #[derive(Debug, thiserror::Error)]

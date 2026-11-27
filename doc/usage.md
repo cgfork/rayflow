@@ -250,6 +250,8 @@ id: 12345678-1234-4234-8234-123456789abc
 server_url: http://127.0.0.1:8080
 workdir: .rayflow/jobs
 data_dir: .rayflow/data
+asset_dir: .rayflow/assets
+asset_cache_max_bytes: 10737418240
 batch: 64
 poll_interval: 1s
 request_timeout: 60s
@@ -264,7 +266,21 @@ otherwise `RAYFLOW_CONFIG` is used. Environment variables use the
 `RAYFLOW_AGENT_` prefix. Nested resource fields use double underscores, for
 example `RAYFLOW_AGENT_RESOURCES__CPU_CORES=2`.
 Files larger than `multipart_threshold` bytes use multipart upload and ranged
-download; the default is 64 MiB.
+download. The default threshold is 64 MiB.
+
+`asset_dir` (or `RAYFLOW_AGENT_ASSET_DIR`) holds the shared cache and
+per-job asset directories. It can point to a separate cloud disk that supports
+hard links and link counts, file locking, and atomic renames.
+`asset_source_dir` (or `RAYFLOW_AGENT_ASSET_SOURCE_DIR`) can point to a
+read-only mounted object storage bucket. On a cache miss, the agent reads the
+granted object key below the mount and verifies it before writing to
+`asset_dir`. Point `asset_source_dir` at the bucket root so the mounted paths
+include the server's configured storage prefix.
+
+`asset_cache_max_bytes` (or `RAYFLOW_AGENT_ASSET_CACHE_MAX_BYTES`) is the
+shared asset cache budget in bytes. The default is 10 GiB. The agent evicts
+the least recently used files that have no job links. Set the budget to zero
+to keep files only while jobs link to them.
 
 Run the default Docker-backed agent with Docker available:
 
@@ -297,7 +313,7 @@ Open `http://127.0.0.1:5173`. Vite forwards `/api/v1/*` requests to
 RAYFLOW_API_URL=http://127.0.0.1:8081 npm run dev --prefix ui
 ```
 
-The four sections use the same resource APIs as other clients:
+The console uses the same resource APIs as other clients:
 
 - **Orchestration** lets you create graphs, connect nodes, edit inputs and
   outputs, save drafts, and publish immutable versions. The Drafts table lists
@@ -314,6 +330,9 @@ The four sections use the same resource APIs as other clients:
   cycles and invalid roots and marks unreferenced outputs as informational.
   Publishing also runs the server validator. Node positions are local to the
   open editor.
+- **Assets** publishes versioned files for reuse by nodes. The browser sends
+  file bytes to RustFS using a presigned upload URL. In a draft, add an asset
+  under Node Properties and choose the exact version and mount path.
 - **Runtime:** start runs and inspect every node in a run's pinned graph version.
   Use **Rerun** in the run list or detail header to choose a starting node, or
   select a node on the graph and use **Rerun node**. Ready, succeeded, failed,
@@ -494,9 +513,9 @@ The service endpoints are:
 | `POST` | `/api/v1/job/fail` | Report a claimed job failure. |
 | `POST` | `/api/v1/job/terminate` | Terminate a claimed job. |
 | `POST` | `/api/v1/job/result/prepare` | Prepare a job's result catalog and return its upload signature; body has `job_id`, `agent_id`, and `size`. |
-| `POST` | `/api/v1/job/result/commit` | Acknowledge the uploaded result; body has `job_id`, `agent_id`, and `catalog_uuid`. |
+| `POST` | `/api/v1/job/result/commit` | Acknowledge the uploaded result and return `catalog_uuid` and `catalog`. |
 | `POST` | `/api/v1/job/output/prepare` | Create or reset an output catalog and return its upload signature. |
-| `POST` | `/api/v1/job/output/commit` | Mark an uploaded output catalog as uploaded and publish its file. |
+| `POST` | `/api/v1/job/output/commit` | Acknowledge the output and return the published `file_uuid` and `catalog`. |
 | `POST` | `/api/v1/job/input/presign` | Return a signed download URL for a declared input. |
 | `POST` | `/api/v1/runs/{run_id}/files/download` | Return a signed download URL for a succeeded declared input or output. |
 | `GET` | `/api/v1/runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}` | Return a signed download URL for `result.json` or `usage.json`. |
@@ -507,8 +526,8 @@ The server exports `rayflow_http_requests_total` and
 template, and response status. Route labels use templates rather than raw URLs,
 so request IDs do not create unbounded metric cardinality.
 
-The file-download response contains `catalog`, `presigned.url`,
-`presigned.operation`, `presigned.headers`, and `presigned.expires_at`. The
+The file-download response contains the complete `catalog`, `multipart`, and
+`presigned` with `url`, `operation`, `headers`, and `expires_at`. The
 browser or client must request the returned absolute URL exactly as provided,
 including its query string, and include any returned headers. There is no
 Rayflow `/files/content` proxy route; the server does not stream the object
@@ -569,8 +588,9 @@ The `run` record contains the run UUID, data ID, graph/version, and revision;
 `node_runs` contains effective node-run records joined with their graph nodes.
 `GET /runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}` signs
 `result.json` or `usage.json` from the latest job for the specified node-run
-UUID. The response contains `url`, `operation`, `headers`, and `expires_at`
-after the upload is committed, or JSON `null` while the archive is unavailable.
+UUID. The response contains top-level `url`, `operation`, `headers`,
+`expires_at`, and the complete `catalog` after the upload is committed,
+or JSON `null` while the archive is unavailable.
 Runtime fetches the JSON directly from the signed URL. The storage endpoint
 must be reachable from the browser. For cross-origin downloads, configure the
 storage bucket's CORS rules to allow `GET` from the console's origin, including
@@ -761,7 +781,8 @@ disabled pauses archive requests for 30 seconds. The manager writes each
 `.upload` receipt after the server confirms the expected catalog UUID.
 The usage monitor removes the stopped container after saving `usage.json`.
 Periodic cleanup removes checkpoints, staged inputs and outputs, and metadata
-once the terminal acknowledgment and both archive receipts are present.
+once the terminal acknowledgment and both archive receipts are present. It
+also removes the job's asset links.
 `cleanup-ready.json` lets cleanup resume after an interruption.
 
 Migration 24 generalizes `job_result` to `job_artifact` and retains existing
@@ -774,9 +795,9 @@ files whose uploads lack a receipt. Object keys are
 
 The agent also holds a process-wide lock for the entire `workdir`. Start an
 upgraded binary only after the previous process has exited, using the same
-agent UUID, `workdir`, and `data_dir`. The new process acquires the lock,
-reconnects to persisted containers, retries durable results, and resumes
-active jobs. The owner JSON is diagnostic metadata; the OS lock is the
+agent UUID, `workdir`, `data_dir`, and `asset_dir`. The new process acquires
+the lock, reconnects to persisted containers, retries durable results, and
+resumes active jobs. The owner JSON is diagnostic metadata; the OS lock is the
 authority, so a stale owner file after a crash does not block recovery. Running
 containers and unacknowledged results remain available during this handoff.
 If a persisted container ID no longer exists, recovery fails closed instead of
@@ -784,12 +805,12 @@ creating a second container for the same job.
 
 ## Agent inputs and outputs
 
-The manager keeps metadata and artifact bytes in separate roots. Metadata is under
-`<workdir>/<job_uuid>`. Artifact data is under
-`<data_dir>/<job_uuid>`, with `inputs/`, `outputs/`, and per-job transfer
-markers under `.rayflow/<job_uuid>/`. Each job therefore has an isolated local
-artifact directory, including resumed jobs that share a run or node-run.
-Artifact data stays available for upload retries until the cleanup sweep.
+The manager keeps metadata under `<workdir>/<job_uuid>`. Inputs, outputs, and
+per-job transfer markers live under `<data_dir>/<job_uuid>`. Jobs with declared
+assets receive their own hard links under `<asset_dir>/jobs/<job_uuid>`, backed
+by the shared cache under `<asset_dir>/cache`. Each job has isolated staging
+paths, including resumed jobs that share a run or node-run. Artifact data
+stays available for upload retries until the cleanup sweep.
 
 Declare each output as `File` or `Directory` on the producer node and bind
 downstream inputs with `source: "producer.output_name"`. In containers, read from
@@ -805,6 +826,43 @@ Docker jobs receive the job directory as a read-only `/rayflow` mount. The
 container can read `/rayflow/job.json` and the pinned `/rayflow/graph.json`;
 `RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to those paths. Inputs and
 outputs remain mounted separately at `/data/inputs` and `/data/outputs`.
+
+### Run a Lua script from a shared asset
+
+Build the runner image from the repository root and make it available to each
+agent that will execute the task.
+
+```sh
+docker build -f examples/runlua/Dockerfile -t rayflow-runlua:local .
+```
+
+Upload `transform.lua` through **Assets** and add that version to the node as
+an asset with `transform.lua` as its mount path. Set the node's Docker config:
+
+```json
+{
+  "image": "rayflow-runlua:local",
+  "command": ["/data/assets/transform.lua", "daily"]
+}
+```
+
+`runlua` executes the first argument as a Lua 5.4 source file. Remaining
+arguments are available as `arg[1]`, `arg[2]`, and top-level varargs. The
+runner exposes the mounted metadata as `rayflow.job`, `rayflow.graph`, and
+`rayflow.node`. It provides these helpers for declared files:
+
+| Lua function | Behavior |
+| --- | --- |
+| `rayflow.input_path(name[, member])` | Resolve a staged input or a member of a directory input. An absent optional input returns `nil`. |
+| `rayflow.list_input(name)` | Read a directory input's manifest entries. |
+| `rayflow.output_path(name[, member])` | Resolve an output and create any required parent directories. |
+| `rayflow.asset_path(name)` | Resolve a staged shared asset relative to `RAYFLOW_ASSET_DIR`. |
+
+Scripts can open those paths with Lua's `io.open`. Rayflow mounts asset and
+input directories read-only. An uncaught Lua error exits nonzero. The job
+container provides the same runtime isolation as for other Docker tasks.
+
+See [Shared assets](catalog.md#shared-assets) for the upload and download APIs.
 
 Configure the server's S3-compatible storage before running nodes with artifacts.
 See [Catalog and object storage](catalog.md#job-artifact-api) for

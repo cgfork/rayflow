@@ -115,29 +115,67 @@ pub trait FileSystem: CatalogSystem {
 #[serde(rename_all = "snake_case")]
 pub enum PresignOperation {
     Upload,
+    /// A PUT whose request body must have the exact signed length.
+    UploadSized {
+        size: u64,
+    },
     Download,
+    /// A GET whose response uses the supplied attachment filename.
+    DownloadAttachment {
+        filename: String,
+    },
+    Head,
+    Copy {
+        source: String,
+    },
+    Delete,
     CreateMultipart,
-    UploadPart { upload_id: String, part_number: u32 },
-    CompleteMultipart { upload_id: String },
-    AbortMultipart { upload_id: String },
+    UploadPart {
+        upload_id: String,
+        part_number: u32,
+    },
+    CompleteMultipart {
+        upload_id: String,
+    },
+    AbortMultipart {
+        upload_id: String,
+    },
 }
 
 impl PresignOperation {
     pub const fn method(&self) -> &'static str {
         match self {
-            Self::Upload | Self::UploadPart { .. } => "PUT",
-            Self::Download => "GET",
+            Self::Upload
+            | Self::UploadSized { .. }
+            | Self::Copy { .. }
+            | Self::UploadPart { .. } => "PUT",
+            Self::Download | Self::DownloadAttachment { .. } => "GET",
+            Self::Head => "HEAD",
             Self::CreateMultipart | Self::CompleteMultipart { .. } => "POST",
-            Self::AbortMultipart { .. } => "DELETE",
+            Self::Delete | Self::AbortMultipart { .. } => "DELETE",
         }
     }
 
     pub const fn is_multipart(&self) -> bool {
-        !matches!(self, Self::Upload | Self::Download)
+        matches!(
+            self,
+            Self::CreateMultipart
+                | Self::UploadPart { .. }
+                | Self::CompleteMultipart { .. }
+                | Self::AbortMultipart { .. }
+        )
     }
 
     pub fn is_valid(&self) -> bool {
         let id = match self {
+            Self::DownloadAttachment { filename } => {
+                return !filename.is_empty()
+                    && filename.len() <= 255
+                    && filename.trim() == filename
+                    && !matches!(filename.as_str(), "." | "..")
+                    && !filename.contains(['/', '\\', ':'])
+                    && !filename.chars().any(char::is_control);
+            }
             Self::UploadPart {
                 upload_id,
                 part_number,

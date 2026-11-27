@@ -631,6 +631,7 @@ fn agent_route(method: &Method, path: &str) -> bool {
                 | "/job/output/multipart/complete"
                 | "/job/output/multipart/abort"
                 | "/job/input/presign"
+                | "/job/asset/presign"
         );
     }
     *method == Method::GET

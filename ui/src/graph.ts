@@ -11,6 +11,11 @@ export function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string');
 }
 
+export function isAssetPath(path: string): boolean {
+  return !/[\\:\p{Cc}]/u.test(path)
+    && path.split('/').every((component) => component !== '' && component !== '.' && component !== '..');
+}
+
 export function isOverrideNameValid(name: string): boolean {
   return name !== 'default' && !name.endsWith(' ') && utf8.encode(name).length <= 255;
 }
@@ -19,7 +24,7 @@ export function createGraph(name: string): Graph {
   return { id: randomUUID(), name, version: 0, node_count: 1, nodes: [createNode('start')], edges: [] };
 }
 export function createNode(name: string): GraphNode {
-  return { id: randomUUID(), name, node_type: 'docker', settings: { config: { image: '' }, resource: { cpu_cores: 1, memory_bytes: 268435456 }, timeout: '30s' }, inputs: [], outputs: [] };
+  return { id: randomUUID(), name, node_type: 'docker', settings: { config: { image: '' }, resource: { cpu_cores: 1, memory_bytes: 268435456 }, timeout: '30s' }, inputs: [], outputs: [], assets: [] };
 }
 
 export function normalizeGraph(graph: Graph): Graph {
@@ -29,6 +34,7 @@ export function normalizeGraph(graph: Graph): Graph {
     nodes: graph.nodes.map((node) => ({
       ...node,
       settings: node.settings ?? { config: {}, resource: { cpu_cores: 0, memory_bytes: 0 }, timeout: '0s' },
+      assets: node.assets ?? [],
       outputs: node.outputs.map(({ file_name, kind, multiple }: Output & { multiple?: boolean }) => ({
         file_name,
         kind: multiple === true ? 'Directory' : kind,
@@ -125,6 +131,12 @@ export function validateGraph(graph: Graph) {
     for (const [label, ports] of [['Input', node.inputs], ['Output', node.outputs]] as const) {
       if (ports.some((port) => !port.file_name.trim()) || new Set(ports.map((port) => port.file_name)).size !== ports.length) errors.push(`${node.name}: ${label} file names must be nonempty and unique.`);
     }
+    const assets = node.assets;
+    const paths = new Set(assets.map((asset) => asset.file_name));
+    if (paths.size !== assets.length || assets.some(({ file_name }) =>
+      !isAssetPath(file_name)
+      || file_name.split('/').slice(0, -1).some((_part, index, parts) => paths.has(parts.slice(0, index + 1).join('/'))),
+    )) errors.push(`${node.name}: Asset paths must be relative, unique, and non-overlapping.`);
     const upstream = upstreamIds(graph, node.id);
     for (const input of node.inputs) {
       const producers = graph.nodes.filter((producer) => producer.outputs.some((output) => input.source === `${producer.name}.${output.file_name}`));

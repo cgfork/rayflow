@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Activity, ArrowUpRight, Box, ChevronRight, GitBranch, Layers3, ListTodo, Menu, Radio, Server, Workflow, X } from 'lucide-react';
+import { Activity, ArrowUpRight, Box, ChevronRight, Files, GitBranch, Layers3, ListTodo, Menu, Radio, Server, Workflow, X } from 'lucide-react';
 import Agents from './Agents';
+import Assets from './Assets';
 import { useRemote } from './api';
 import Orchestration from './Orchestration';
 import Runtime from './Runtime';
@@ -12,6 +13,7 @@ import type { User } from './Auth';
 
 const navigation = [
   { id: 'orchestration', title: 'Orchestration', subtitle: 'Build & publish', icon: Workflow },
+  { id: 'assets', title: 'Assets', subtitle: 'Shared files', icon: Files },
   { id: 'runtime', title: 'Runtime', subtitle: 'Workflow execution', icon: Activity },
   { id: 'schedule', title: 'Schedule', subtitle: 'Jobs & claims', icon: ListTodo },
   { id: 'agents', title: 'Agents', subtitle: 'Connected fleet', icon: Server },
@@ -69,6 +71,7 @@ export default function App({ user, logout }: { user: User | null; logout: () =>
     <div className="main-shell"><header className="topbar"><div className="breadcrumb"><button className="icon-button menu-button" aria-label="Open navigation" onClick={() => setMenu(true)}><Menu size={20} /></button><span>Workspace</span><ChevronRight size={14} /><strong>{active.title}</strong></div><div className="topbar-right"><span className="environment"><span />Default workspace</span><span className={`connection-state ${!checkingHealth && !connected ? 'disconnected' : ''}`} title={connectionStatus}><Radio size={14} />{connectionStatus}</span><ThemePicker /></div></header>
       <main key={section}>
         {section === 'orchestration' && <Orchestration actor={user?.id || actor || 'operator'} user={user} notify={setMessage} dirtyChanged={setDirty} openRuntime={(id) => { setRuntimeGraphId(id); navigate('runtime'); }} />}
+        {section === 'assets' && <Assets notify={setMessage} />}
         {section === 'runtime' && <Runtime graphId={runtimeGraphId} onGraphChange={setRuntimeGraphId} notify={setMessage} openJobs={(id) => { setJobFilter({ run_id: id }); navigate('schedule'); }} />}
         {section === 'schedule' && <Schedule notify={setMessage} filter={jobFilter} clearFilter={() => setJobFilter({})} />}
         {section === 'agents' && <Agents openJobs={(id) => { setJobFilter({ agent_id: id }); navigate('schedule'); }} />}

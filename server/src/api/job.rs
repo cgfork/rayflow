@@ -8,7 +8,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use catalog::PresignedUrl;
+use catalog::{PresignedUrl, model::Catalog};
 use event::task_event::TaskEvent;
 use graph::{GraphStore, types::DAG};
 use scheduler::{AgentRef, JobArtifactName, ResourceCapacity};
@@ -67,6 +67,12 @@ pub struct CommitJobArtifactRequest {
     pub catalog_uuid: Uuid,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CommitJobArtifactResponse {
+    pub catalog_uuid: Uuid,
+    pub catalog: Catalog,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PrepareOutputRequest {
     pub job_id: Uuid,
@@ -89,6 +95,12 @@ pub struct CommitOutputRequest {
     pub agent_id: Uuid,
     pub filename: String,
     pub catalog_uuid: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitOutputResponse {
+    pub file_uuid: Uuid,
+    pub catalog: Catalog,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,15 +206,19 @@ async fn prepare_job_artifact<S>(
 async fn commit_job_artifact<S>(
     State(app): State<App<S>>,
     Json(request): Json<CommitJobArtifactRequest>,
-) -> Result<Json<Uuid>, AppError> {
-    app.commit_job_artifact(
-        request.job_id,
-        request.agent_id,
-        request.filename,
-        request.catalog_uuid,
-    )
-    .await
-    .map(Json)
+) -> Result<Json<CommitJobArtifactResponse>, AppError> {
+    let catalog = app
+        .commit_job_artifact(
+            request.job_id,
+            request.agent_id,
+            request.filename,
+            request.catalog_uuid,
+        )
+        .await?;
+    Ok(Json(CommitJobArtifactResponse {
+        catalog_uuid: catalog.uuid,
+        catalog,
+    }))
 }
 
 async fn prepare_output<S>(
@@ -233,20 +249,21 @@ where
 async fn commit_output<S>(
     State(app): State<App<S>>,
     Json(request): Json<CommitOutputRequest>,
-) -> Result<Json<Uuid>, AppError>
+) -> Result<Json<CommitOutputResponse>, AppError>
 where
     S: GraphStore<Uuid, G = DAG> + Clone,
     S::load(..): Send,
     S::Err: Send + Sync + 'static,
 {
-    app.commit_output(
-        request.job_id,
-        request.agent_id,
-        request.filename,
-        request.catalog_uuid,
-    )
-    .await
-    .map(Json)
+    let (file_uuid, catalog) = app
+        .commit_output(
+            request.job_id,
+            request.agent_id,
+            request.filename,
+            request.catalog_uuid,
+        )
+        .await?;
+    Ok(Json(CommitOutputResponse { file_uuid, catalog }))
 }
 
 async fn presign_input<S>(

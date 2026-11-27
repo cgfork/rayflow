@@ -12,7 +12,7 @@ pub enum Error {
     Http(#[from] reqwest::Error),
     #[error("unexpected HTTP status {0}")]
     UnexpectedStatus(reqwest::StatusCode),
-    #[error("archive commit acknowledged catalog {actual}, expected {expected}")]
+    #[error("commit acknowledged catalog {actual}, expected {expected}")]
     CatalogMismatch {
         expected: uuid::Uuid,
         actual: uuid::Uuid,

@@ -239,6 +239,7 @@ fn workflow(image: &str) -> DAG {
             id: Uuid::new_v4(),
             name: name.into(),
             node_type: "docker".into(),
+            assets: vec![],
             settings: NodeSettings {
                 config: json!({"image": image, "command": ["sh", "-c", command]}),
                 resource: Resource {

@@ -17,12 +17,13 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    CONTAINER_FILE, JobManager, JobOutcome, JobResult, invalid_directory, is_not_found,
-    read_optional_json,
+    ASSET_STAGE_FILE, CONTAINER_FILE, JobManager, JobOutcome, JobResult, invalid_directory,
+    is_not_found, read_optional_json,
 };
 use crate::{
     containerd::{Container, ContainerState, Containerd},
     errors::Error,
+    settings::Settings,
     transfer::JobTransfer,
     write_json,
 };
@@ -335,6 +336,10 @@ where
         }
 
         self.remove_stopped_container(job_id).await?;
+        let staged_assets = fs::try_exists(dir.join(ASSET_STAGE_FILE)).await?;
+        if staged_assets {
+            remove_job_assets(self.settings(), job_id).await?;
+        }
         remove_job_data(&self.settings().data_dir, job_id, &dir).await?;
 
         // Keep cleanup discoverable until all job data and metadata has gone.
@@ -352,21 +357,30 @@ where
         fs::remove_file(dir.join("lock")).await?;
         fs::remove_file(&ready).await?;
         fs::remove_dir(&dir).await?;
+        if staged_assets && let Err(error) = self.inner.transfer.trim_asset_cache().await {
+            tracing::warn!(%job_id, %error, "failed to trim the asset cache after job cleanup");
+        }
         Ok(())
     }
+}
+
+async fn remove_job_assets(settings: &Settings, job_id: Uuid) -> Result<(), Error> {
+    let root: PathBuf = settings.asset_dir.components().collect();
+    let jobs = root.join("jobs");
+    let assets = settings.job_asset_dir(job_id);
+    if job_directories_exist(&[&root, &jobs, &assets]).await? {
+        let assets = settings.canonical_job_asset_dir(job_id).await?;
+        fs::remove_dir_all(assets).await?;
+    }
+    Ok(())
 }
 
 async fn remove_job_data(data_root: &Path, job_id: Uuid, metadata_dir: &Path) -> Result<(), Error> {
     // Ignore trailing separators so symlink_metadata checks the root itself.
     let data_root: PathBuf = data_root.components().collect();
     let data_dir = data_root.join(job_id.to_string());
-    for path in [&data_root, &data_dir] {
-        match fs::symlink_metadata(path).await {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Err(invalid_directory(path)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        }
+    if !job_directories_exist(&[&data_root, &data_dir]).await? {
+        return Ok(());
     }
     // When the roots share one directory, the metadata sweep also removes the
     // job data and keeps the cleanup marker discoverable until then.
@@ -374,6 +388,18 @@ async fn remove_job_data(data_root: &Path, job_id: Uuid, metadata_dir: &Path) ->
         fs::remove_dir_all(&data_dir).await?;
     }
     Ok(())
+}
+
+async fn job_directories_exist(paths: &[&Path]) -> Result<bool, Error> {
+    for path in paths {
+        match fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(invalid_directory(path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

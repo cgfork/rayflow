@@ -13,7 +13,23 @@ export interface AnnotationMatchNodeSettings {
   resource?: NodeResource | null;
   timeout?: string | null;
 }
-export interface GraphNode { id: string; name: string; node_type: string; settings: NodeSettings; inputs: Input[]; outputs: Output[] }
+export interface AssetRef { file_name: string; asset_id: string }
+export interface AssetVersion {
+  asset_id: string;
+  name: string;
+  version: number;
+  size: number;
+  format: string;
+  sha256: string;
+  created_by: string;
+  created_at: string;
+  published_at: string;
+}
+export interface PublishedAsset extends AssetVersion { catalog: Catalog }
+export type PrepareAssetResponse =
+  | { state: 'pending'; asset_id: string; upload_id: string; catalog: Catalog; upload: PresignedUrl<'upload'> }
+  | (PublishedAsset & { state: 'published' });
+export interface GraphNode { id: string; name: string; node_type: string; settings: NodeSettings; inputs: Input[]; outputs: Output[]; assets: AssetRef[] }
 export interface Graph {
   id: string;
   name: string;
@@ -44,9 +60,32 @@ export interface NodeRun {
   updated_at: string;
 }
 export interface RunView { run: Run; graph: Graph; node_runs: [NodeRun, GraphNode][] }
-export interface PresignedDownload { url: string; operation: 'download'; headers: Record<string, string>; expires_at: string }
-export interface RunFileTransfer { presigned: PresignedDownload }
+export interface Catalog {
+  id: number;
+  uuid: string;
+  key: string;
+  url: string;
+  size: number;
+  format: string;
+  uploaded: boolean;
+  created_at: string;
+  updated_at: string;
+}
+interface PresignedUrl<Operation extends 'upload' | 'download'> {
+  url: string;
+  operation: Operation;
+  headers: Record<string, string>;
+  expires_at: string;
+}
+interface CatalogDownload {
+  catalog: Catalog;
+  presigned: PresignedUrl<'download'>;
+  multipart: boolean;
+}
+export interface AssetTransfer extends CatalogDownload { asset_id: string; sha256: string }
+export type RunFileTransfer = CatalogDownload;
+export interface RunArchiveTransfer extends PresignedUrl<'download'> { catalog: Catalog }
 export type JobStatus = 'Scheduled' | 'Polled' | 'Yielded' | 'Succeeded' | 'Failed' | 'Terminated';
 export interface Job { id: number; uuid: string; task_id: string; run_id: string; node_run_id: number; status: JobStatus; required_cpu_cores: number; required_memory_bytes: number; agent_id: string | null; polled_at: string | null; expired_at: string | null; created_at: string; updated_at: string }
 export interface Agent { id: number; uuid: string; cpu_cores: number; memory_bytes: number; active_jobs: number; first_seen_at: string; last_seen_at: string; online_until: string; online: boolean }
-export type Section = 'orchestration' | 'runtime' | 'schedule' | 'agents';
+export type Section = 'orchestration' | 'assets' | 'runtime' | 'schedule' | 'agents';

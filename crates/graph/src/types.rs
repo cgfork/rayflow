@@ -117,6 +117,36 @@ impl Diff for Input {
     }
 }
 
+/// A pinned shared asset mounted under the node's requested file name.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssetRef {
+    pub file_name: String,
+    pub asset_id: Uuid,
+}
+
+/// A changed shared asset declaration.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "field", content = "change", rename_all = "snake_case")]
+pub enum AssetRefDiff {
+    FileName((String, String)),
+    AssetId((Uuid, Uuid)),
+}
+
+impl Diff for AssetRef {
+    type Item = Vec<AssetRefDiff>;
+
+    fn diff(&self, other: &Self) -> Option<Self::Item> {
+        field_diffs([
+            self.file_name
+                .diff(&other.file_name)
+                .map(AssetRefDiff::FileName),
+            self.asset_id
+                .diff(&other.asset_id)
+                .map(AssetRefDiff::AssetId),
+        ])
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Resource {
     pub cpu_cores: u32,
@@ -288,9 +318,12 @@ pub struct Node {
     pub inputs: Vec<Input>,
     /// Outputs produced by the node.
     pub outputs: Vec<Output>,
+    /// Shared files available before this node starts.
+    #[serde(default)]
+    pub assets: Vec<AssetRef>,
 }
 
-/// A changed node field, including settings and individual input and output changes.
+/// A changed node field, including settings and individual artifact declarations.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "field", content = "change", rename_all = "snake_case")]
 pub enum NodeDiff {
@@ -300,6 +333,7 @@ pub enum NodeDiff {
     Settings(<NodeSettings as Diff>::Item),
     Inputs(<Vec<Input> as Diff>::Item),
     Outputs(<Vec<Output> as Diff>::Item),
+    Assets(<Vec<AssetRef> as Diff>::Item),
 }
 
 impl Diff for Node {
@@ -315,6 +349,7 @@ impl Diff for Node {
             self.settings.diff(&other.settings).map(NodeDiff::Settings),
             self.inputs.diff(&other.inputs).map(NodeDiff::Inputs),
             self.outputs.diff(&other.outputs).map(NodeDiff::Outputs),
+            self.assets.diff(&other.assets).map(NodeDiff::Assets),
         ])
     }
 }
@@ -453,6 +488,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "task".into(),
             node_type: "docker".into(),
+            assets: vec![],
             settings: NodeSettings {
                 overrides: HashMap::from([
                     ("large".into(), timeout_override(3)),
@@ -561,6 +597,7 @@ mod tests {
             id: Uuid::from_u128(1),
             name: "task".into(),
             node_type: "docker".into(),
+            assets: vec![],
             settings: NodeSettings::default(),
             inputs: vec![
                 input.clone(),

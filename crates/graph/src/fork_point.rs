@@ -13,6 +13,7 @@ fn same_node_structure(before: &Node, after: &Node) -> bool {
         && before.node_type == after.node_type
         && before.inputs == after.inputs
         && before.outputs == after.outputs
+        && before.assets == after.assets
 }
 
 impl ForkPoint for DAG {
@@ -80,6 +81,7 @@ impl ForkPoint for DAG {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AssetRef;
     use uuid::Uuid;
 
     #[test]
@@ -95,6 +97,7 @@ mod tests {
                     id,
                     name: format!("node-{}", id.as_u128()),
                     node_type: "docker".into(),
+                    assets: vec![],
                     settings: Default::default(),
                     inputs: vec![],
                     outputs: vec![],
@@ -134,5 +137,19 @@ mod tests {
         removed_tail.delete_node(right);
         assert_eq!(removed_tail.fork_point(&previous), None);
         assert!(removed_tail.shared_nodes(&previous).next().is_none());
+
+        let mut changed_asset = previous.clone();
+        changed_asset.nodes[1].assets.push(AssetRef {
+            file_name: "scripts/run.lua".into(),
+            asset_id: Uuid::from_u128(33),
+        });
+        assert_eq!(changed_asset.fork_point(&previous), Some(left));
+        assert_eq!(
+            changed_asset
+                .shared_nodes(&previous)
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            [root],
+        );
     }
 }

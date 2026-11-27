@@ -3,6 +3,7 @@ members = [
     "server",
     "pilot",
     "agent",
+    "examples/runlua",
     "crates/graph",
     "crates/event",
     "crates/runtime",

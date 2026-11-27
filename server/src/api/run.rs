@@ -71,6 +71,13 @@ where
     app.inspect_run_at(id, query.revision).await.map(Json)
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct JobArtifactDownload {
+    pub catalog: Catalog,
+    #[serde(flatten)]
+    pub presigned: PresignedUrl,
+}
+
 async fn presign_job_artifact<S>(
     State(app): State<App<S>>,
     Path((run_id, node_run_id, filename)): Path<(Uuid, Uuid, JobArtifactName)>,

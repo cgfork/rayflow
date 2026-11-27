@@ -1,9 +1,6 @@
 //! Docker-backed `Containerd` implementation.
 
-use std::{
-    path::{Path, PathBuf},
-    pin::Pin,
-};
+use std::pin::Pin;
 
 use bollard::{
     Docker,
@@ -25,6 +22,10 @@ use crate::{Usage, errors::Error};
 
 use super::{Container, ContainerAction, ContainerEvent, ContainerState, Containerd, ExitStatus};
 
+pub use super::ContainerFile as DockerFile;
+
+pub type DockerFiles = Vec<DockerFile>;
+
 /// The Docker container creation parameters derived from a pinned job.
 ///
 /// This type is deliberately defined in the Docker module rather than in the
@@ -33,7 +34,7 @@ use super::{Container, ContainerAction, ContainerEvent, ContainerState, Containe
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerSpec {
     #[serde(default)]
-    pub files: Option<DockerFiles>,
+    pub files: DockerFiles,
     /// Deterministic Docker name used to reconnect after an agent restart.
     pub name: String,
     /// Image reference that must be available before creation.
@@ -50,14 +51,6 @@ pub struct DockerSpec {
     pub memory_bytes: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DockerFiles {
-    /// Read-only job metadata and the pinned graph definition.
-    pub metadata: PathBuf,
-    pub inputs: PathBuf,
-    pub outputs: PathBuf,
-}
-
 impl TryFrom<&scheduler::Job> for DockerSpec {
     type Error = Error;
 
@@ -70,7 +63,7 @@ impl TryFrom<&scheduler::Job> for DockerSpec {
             .filter(|image| !image.trim().is_empty())
             .ok_or(Error::MissingImage)?;
         Ok(Self {
-            files: None,
+            files: Vec::new(),
             name: container_name(job.uuid),
             image: image.to_owned(),
             command: config
@@ -93,6 +86,46 @@ impl TryFrom<&scheduler::Job> for DockerSpec {
                 .transpose()?,
             cpu_cores: job.required_cpu_cores,
             memory_bytes: job.required_memory_bytes,
+        })
+    }
+}
+
+impl DockerSpec {
+    fn create_body(&self) -> Result<ContainerCreateBody, Error> {
+        let memory = i64::try_from(self.memory_bytes).map_err(|error| {
+            Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+        })?;
+        let mut env = self.env.clone();
+        for (key, value) in self.files.iter().flat_map(|file| &file.env) {
+            let env = env.get_or_insert_with(Vec::new);
+            env.retain(|entry| entry.split('=').next() != Some(key.as_str()));
+            env.push(format!("{key}={value}"));
+        }
+        let mounts = (!self.files.is_empty()).then(|| {
+            self.files
+                .iter()
+                .map(|file| Mount {
+                    typ: Some(MountType::BIND),
+                    source: Some(file.source.to_string_lossy().into_owned()),
+                    target: Some(file.target.clone()),
+                    read_only: Some(file.read_only),
+                    ..Default::default()
+                })
+                .collect()
+        });
+        Ok(ContainerCreateBody {
+            image: Some(self.image.clone()),
+            cmd: self.command.clone(),
+            env,
+            working_dir: self.working_dir.clone(),
+            host_config: Some(HostConfig {
+                mounts,
+                nano_cpus: (self.cpu_cores > 0)
+                    .then_some(i64::from(self.cpu_cores) * 1_000_000_000),
+                memory: (memory > 0).then_some(memory),
+                ..Default::default()
+            }),
+            ..Default::default()
         })
     }
 }
@@ -322,29 +355,13 @@ impl Containerd for DockerContainerd {
         DockerSpec::try_from(job)
     }
 
-    fn spec_with_files<'a>(
+    fn spec_with_files<'a, 'files>(
         &'a self,
         job: &'a scheduler::Job,
-        metadata: &Path,
-        inputs: &Path,
-        outputs: &Path,
+        files: impl IntoIterator<Item = &'files DockerFile>,
     ) -> Result<Self::Spec<'a>, Error> {
-        let mut spec = DockerSpec::try_from(job)?;
-        spec.files = Some(DockerFiles {
-            metadata: metadata.to_path_buf(),
-            inputs: inputs.to_path_buf(),
-            outputs: outputs.to_path_buf(),
-        });
-        let env = spec.env.get_or_insert_with(Vec::new);
-        env.retain(|value| {
-            !value.starts_with("RAYFLOW_INPUT_DIR=") && !value.starts_with("RAYFLOW_OUTPUT_DIR=")
-        });
-        env.extend([
-            "RAYFLOW_JOB_FILE=/rayflow/job.json".into(),
-            "RAYFLOW_GRAPH_FILE=/rayflow/graph.json".into(),
-            "RAYFLOW_INPUT_DIR=/data/inputs".into(),
-            "RAYFLOW_OUTPUT_DIR=/data/outputs".into(),
-        ]);
+        let mut spec = self.spec(job)?;
+        spec.files = files.into_iter().cloned().collect();
         Ok(spec)
     }
 
@@ -367,47 +384,7 @@ impl Containerd for DockerContainerd {
     }
 
     async fn create(&self, spec: Self::Spec<'_>) -> Result<Self::Container, Error> {
-        let memory = i64::try_from(spec.memory_bytes).map_err(|error| {
-            Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
-        })?;
-        let body = ContainerCreateBody {
-            image: Some(spec.image.clone()),
-            cmd: spec.command.clone(),
-            env: spec.env.clone(),
-            working_dir: spec.working_dir.clone(),
-            host_config: Some(HostConfig {
-                mounts: spec.files.as_ref().map(|files| {
-                    vec![
-                        Mount {
-                            typ: Some(MountType::BIND),
-                            source: Some(files.metadata.to_string_lossy().into_owned()),
-                            target: Some("/rayflow".into()),
-                            read_only: Some(true),
-                            ..Default::default()
-                        },
-                        Mount {
-                            typ: Some(MountType::BIND),
-                            source: Some(files.inputs.to_string_lossy().into_owned()),
-                            target: Some("/data/inputs".into()),
-                            read_only: Some(true),
-                            ..Default::default()
-                        },
-                        Mount {
-                            typ: Some(MountType::BIND),
-                            source: Some(files.outputs.to_string_lossy().into_owned()),
-                            target: Some("/data/outputs".into()),
-                            read_only: Some(false),
-                            ..Default::default()
-                        },
-                    ]
-                }),
-                nano_cpus: (spec.cpu_cores > 0)
-                    .then_some(i64::from(spec.cpu_cores) * 1_000_000_000),
-                memory: (memory > 0).then_some(memory),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let body = spec.create_body()?;
         let options = CreateContainerOptionsBuilder::new()
             .name(&spec.name)
             .build();
@@ -466,6 +443,48 @@ impl Containerd for DockerContainerd {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn constructs_docker_mounts_and_environment_from_file_descriptors() {
+        let spec: DockerSpec = serde_json::from_value(json!({
+            "name": "test",
+            "image": "fixture",
+            "cpu_cores": 0,
+            "memory_bytes": 0,
+            "env": ["KEEP=one=two", "ASSET_DIR=/old"],
+            "files": [
+                {
+                    "source": "/host/artifact",
+                    "target": "/shared",
+                    "read_only": true,
+                    "env": [["ASSET_DIR", "/shared"], ["SCRIPT_FILE", "/shared/script.lua"]]
+                },
+                {
+                    "source": "/host/result",
+                    "target": "/result",
+                    "read_only": false
+                }
+            ]
+        }))
+        .unwrap();
+        let body = spec.create_body().unwrap();
+        assert_eq!(
+            body.env.unwrap(),
+            [
+                "KEEP=one=two",
+                "ASSET_DIR=/shared",
+                "SCRIPT_FILE=/shared/script.lua"
+            ],
+        );
+        let mounts = body.host_config.unwrap().mounts.unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].typ, Some(MountType::BIND));
+        assert_eq!(mounts[0].source.as_deref(), Some("/host/artifact"));
+        assert_eq!(mounts[0].target.as_deref(), Some("/shared"));
+        assert_eq!(mounts[0].read_only, Some(true));
+        assert_eq!(mounts[1].target.as_deref(), Some("/result"));
+        assert_eq!(mounts[1].read_only, Some(false));
+    }
 
     #[test]
     fn normalizes_cpu_time_and_memory_for_both_linux_cgroup_versions() {

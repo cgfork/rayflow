@@ -59,6 +59,7 @@ fn graph() -> (TestGraphStore, Uuid, [Uuid; 3]) {
                 id,
                 name: format!("node-{position}"),
                 node_type: "test".into(),
+                assets: vec![],
                 settings: Default::default(),
                 inputs: vec![],
                 outputs: vec![],

@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import type { Graph, GraphNode, Run } from '../src/types';
+import type { AssetTransfer, AssetVersion, Catalog, Graph, GraphNode, PrepareAssetResponse, PublishedAsset, Run } from '../src/types';
 
 const api = '/api/v1';
 const home = '/#/orchestration';
@@ -15,6 +16,7 @@ function graph(id: string, name: string, version: number, nodeNames: string[]): 
     settings: { config: { image: 'example.invalid/worker' }, resource: { cpu_cores: 1, memory_bytes: 1048576 }, timeout: '30s' },
     inputs: [],
     outputs: [],
+    assets: [],
   }));
   return { id, name, version, node_count: nodes.length, nodes, edges: nodes.slice(1).map((node, index) => [nodes[index].id, node.id]) };
 }
@@ -319,6 +321,120 @@ test('The draft editor saves output kinds and converts legacy multi-file JSON', 
     { file_name: 'bundle', kind: 'Directory' },
     { file_name: 'report.json', kind: 'File' },
   ]);
+});
+
+test('The browser uploads a shared asset to RustFS and pins it on a node', async ({ page }) => {
+  await mockGraphs(page);
+  const script = Buffer.from('print("hello")');
+  const asset: AssetVersion = {
+    asset_id: 'aa000000-0000-4000-8000-000000000001',
+    name: 'transform-v1_example.lua', version: 1, size: script.length, format: 'text/x-lua',
+    sha256: createHash('sha256').update(script).digest('hex'),
+    created_by: 'local', created_at: '2026-11-15T02:29:00Z', published_at: '2026-11-15T02:30:00Z',
+  };
+  const uploadId = 'aa000000-0000-4000-8000-000000000002';
+  const uploadUrl = 'https://rustfs.example.test/bucket/asset-staging/upload?signature=fixture';
+  const downloadUrl = 'https://rustfs.example.test/bucket/assets/published?signature=attachment';
+  const expiresAt = '2030-01-01T00:00:00Z';
+  const catalog: Catalog = {
+    id: 2, uuid: 'aa000000-0000-4000-8000-000000000003', key: '/assets/published',
+    url: 's3://bucket/assets/published', size: asset.size, format: asset.format, uploaded: true,
+    created_at: asset.published_at, updated_at: asset.published_at,
+  };
+  let abandoned = true;
+  let committed = false;
+  let uploaded = false;
+  let draft = report;
+  await page.route(`**${api}/assets?limit=50`, (route) => route.fulfill({
+    json: { items: committed ? [asset] : [], next_cursor: null },
+  }));
+  await page.route(`**${api}/assets/${asset.asset_id}`, (route) => route.fulfill({ json: asset }));
+  await page.route(`**${api}/assets/prepare`, (route) => {
+    expect(route.request().postDataJSON()).toEqual({
+      name: asset.name, version: asset.version, size: asset.size, format: asset.format, sha256: asset.sha256,
+    });
+    if (abandoned) return route.fulfill({ status: 409, json: { error: 'The asset version is already reserved.' } });
+    return route.fulfill({ json: {
+      state: 'pending', asset_id: asset.asset_id, upload_id: uploadId,
+      catalog: {
+        ...catalog, id: 1, uuid: 'aa000000-0000-4000-8000-000000000004', key: '/asset-staging/upload',
+        url: 's3://bucket/asset-staging/upload', uploaded: false,
+        created_at: asset.created_at, updated_at: asset.created_at,
+      },
+      upload: { operation: 'upload', url: uploadUrl, headers: { 'x-upload-marker': 'staging' }, expires_at: expiresAt },
+    } satisfies PrepareAssetResponse });
+  });
+  await page.route(`**${api}/assets/${asset.name}/versions/${asset.version}/cancel`, (route) => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().postDataJSON()).toEqual({});
+    abandoned = false;
+    return route.fulfill({ status: 204 });
+  });
+  await page.route(uploadUrl, (route) => {
+    const request = route.request();
+    const headers = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'PUT', 'access-control-allow-headers': '*' };
+    if (request.method() === 'OPTIONS') return route.fulfill({ status: 204, headers });
+    expect(request.method()).toBe('PUT');
+    expect(request.headers()['content-type']).toBe(asset.format);
+    expect(request.headers()['x-upload-marker']).toBe('staging');
+    expect(request.headers()['x-rayflow-request']).toBeUndefined();
+    expect(request.postDataBuffer()).toEqual(script);
+    uploaded = true;
+    return route.fulfill({ status: 200, headers });
+  });
+  await page.route(`**${api}/assets/${asset.asset_id}/commit`, (route) => {
+    expect(uploaded).toBe(true);
+    expect(route.request().postDataJSON()).toEqual({ upload_id: uploadId });
+    committed = true;
+    return route.fulfill({ json: { ...asset, catalog } satisfies PublishedAsset });
+  });
+  await page.route(`**${api}/assets/${asset.asset_id}/download`, (route) => route.fulfill({
+    json: {
+      asset_id: asset.asset_id, sha256: asset.sha256, catalog, multipart: false,
+      presigned: { operation: 'download', url: downloadUrl, headers: {}, expires_at: expiresAt },
+    } satisfies AssetTransfer,
+  }));
+  await page.context().route(downloadUrl, (route) => route.fulfill({
+    headers: { 'content-type': 'text/html', 'content-disposition': `attachment; filename="${asset.name}"` },
+    body: script,
+  }));
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+
+  await page.goto('/#/assets');
+  await page.getByRole('button', { name: 'Upload asset' }).click();
+  const upload = page.getByRole('dialog', { name: 'Upload asset' });
+  const assetName = upload.getByLabel('Asset name');
+  await assetName.fill('scripts/transform.lua');
+  expect(await assetName.evaluate((input: HTMLInputElement) => input.validity.patternMismatch)).toBe(true);
+  await assetName.fill(asset.name);
+  await upload.getByLabel('File').setInputFiles({ name: 'script.lua', mimeType: asset.format, buffer: script });
+  await upload.getByRole('button', { name: 'Publish asset' }).click();
+  await expect(upload.getByRole('alert')).toContainText('The asset version is already reserved.');
+  await upload.getByRole('button', { name: 'Discard pending upload' }).click();
+  await expect(page.getByText('Pending upload discarded.', { exact: true })).toBeVisible();
+  await upload.getByRole('button', { name: 'Publish asset' }).click();
+  await expect(page.getByRole('table', { name: 'Published assets' })).toContainText(asset.name);
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: `Download ${asset.name} v${asset.version}` }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe(asset.name);
+
+  await page.getByRole('link', { name: /^Orchestration/ }).click();
+  await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByRole('button', { name: 'Add asset', exact: true }).click();
+  const picker = page.getByRole('dialog', { name: 'Add asset' });
+  await picker.getByLabel('Asset version').selectOption(asset.asset_id);
+  await picker.getByLabel('Mount path').fill('scripts/transform.lua');
+  await expect(picker.getByText('/data/assets/scripts/transform.lua', { exact: true })).toBeVisible();
+  await picker.getByRole('button', { name: 'Add asset' }).click();
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].assets).toEqual([{ asset_id: asset.asset_id, file_name: 'scripts/transform.lua' }]);
+  expect(draft.edges).toEqual([]);
 });
 
 test('The draft table shows workflow metadata, row actions, and copyable IDs', async ({ page, context }) => {

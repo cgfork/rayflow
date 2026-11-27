@@ -24,11 +24,11 @@ use uuid::Uuid;
 
 use crate::{
     client::Client,
-    containerd::{Container, ContainerState, Containerd},
+    containerd::{Container, ContainerFile, ContainerState, Containerd},
     errors::Error,
     read_json,
     settings::Settings,
-    transfer::JobTransfer,
+    transfer::{ASSET_DIR, JobTransfer},
     write_json,
 };
 
@@ -41,8 +41,12 @@ pub use usage::{JobUsage, Usage, UsagePercentiles, UsageSummary};
 
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const INPUT_MOUNT: &str = "/data/inputs";
+const OUTPUT_MOUNT: &str = "/data/outputs";
+const ASSET_MOUNT: &str = "/data/assets";
 const MAX_ARCHIVE_UPLOADS: usize = 4;
 const CONTAINER_FILE: &str = "container.json";
+const ASSET_STAGE_FILE: &str = "asset-stage.json";
 
 /// The terminal action reported to the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,18 +275,60 @@ where
         let outputs = data.join("outputs");
         ensure_dir(&inputs).await?;
         ensure_dir(&outputs).await?;
+        let assets = if node.assets.is_empty() {
+            let empty_assets = data.join(ASSET_DIR);
+            ensure_dir(&empty_assets).await?;
+            fs::canonicalize(&empty_assets).await?
+        } else {
+            let assets = self.inner.transfer.ensure_job_asset_dir(job_id).await?;
+            // Cleanup can recover the staging directory even if preparation
+            // stops before the container is created.
+            write_json(&directory.join(ASSET_STAGE_FILE), &true).await?;
+            assets
+        };
 
-        let metadata_mount = fs::canonicalize(&directory).await?;
-        let input_mount = fs::canonicalize(&inputs).await?;
-        let output_mount = fs::canonicalize(&outputs).await?;
+        let files = [
+            ContainerFile {
+                source: fs::canonicalize(&directory).await?,
+                target: "/rayflow".into(),
+                read_only: true,
+                env: vec![
+                    ("RAYFLOW_JOB_FILE".into(), "/rayflow/job.json".into()),
+                    ("RAYFLOW_GRAPH_FILE".into(), "/rayflow/graph.json".into()),
+                ],
+            },
+            ContainerFile {
+                source: fs::canonicalize(&inputs).await?,
+                target: INPUT_MOUNT.into(),
+                read_only: true,
+                env: vec![("RAYFLOW_INPUT_DIR".into(), INPUT_MOUNT.into())],
+            },
+            ContainerFile {
+                source: fs::canonicalize(&outputs).await?,
+                target: OUTPUT_MOUNT.into(),
+                read_only: false,
+                env: vec![("RAYFLOW_OUTPUT_DIR".into(), OUTPUT_MOUNT.into())],
+            },
+            ContainerFile {
+                source: assets,
+                target: ASSET_MOUNT.into(),
+                read_only: true,
+                env: vec![("RAYFLOW_ASSET_DIR".into(), ASSET_MOUNT.into())],
+            },
+        ];
         let provider = &self.inner.containerd;
-        let spec = || provider.spec_with_files(&job, &metadata_mount, &input_mount, &output_mount);
+        let spec = || provider.spec_with_files(&job, &files);
         provider.prepare(spec()?).await?;
         while !lease_expired(&job) {
-            match self.inner.transfer.prepare_input(&job, &data, node).await {
+            let prepared = async {
+                self.inner.transfer.prepare_input(&job, &data, node).await?;
+                self.inner.transfer.prepare_assets(&job, node).await
+            }
+            .await;
+            match prepared {
                 Ok(()) => break,
                 Err(Error::Http(error)) if retryable_input(&error) => {
-                    tracing::warn!(%job_id, %error, "input download failed, retrying");
+                    tracing::warn!(%job_id, %error, "artifact download failed, retrying");
                     time::sleep(self.settings().poll_interval).await;
                 }
                 Err(error) => return Err(error),

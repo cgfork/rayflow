@@ -1,3 +1,4 @@
+use catalog::model::Catalog;
 use graph::GraphStore;
 use graph::types::DAG;
 use scheduler::{Job, JobArtifactName, ResourceCapacity};
@@ -15,10 +16,40 @@ pub struct Client {
 /// Storage metadata and authorization returned by the job artifact API.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transfer {
-    pub catalog: catalog::model::Catalog,
+    pub catalog: Catalog,
     pub presigned: catalog::PresignedUrl,
     #[serde(default)]
     pub multipart: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AssetTransfer {
+    pub asset_id: Uuid,
+    pub sha256: String,
+    #[serde(flatten)]
+    pub transfer: Transfer,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum JobArtifactCommitAcknowledgment {
+    Committed {
+        catalog_uuid: Uuid,
+        catalog: Catalog,
+    },
+    Legacy(Uuid),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OutputCommitAcknowledgment {
+    Committed {
+        #[serde(rename = "file_uuid")]
+        _file_uuid: Uuid,
+        catalog: Catalog,
+    },
+    // Older servers return the published file UUID.
+    Legacy(Uuid),
 }
 
 #[derive(Serialize)]
@@ -105,14 +136,18 @@ impl Client {
             }))
             .send()
             .await?;
-        let acknowledged: Uuid = successful_response(response)?.json().await?;
-        if acknowledged != catalog_uuid {
-            return Err(Error::CatalogMismatch {
-                expected: catalog_uuid,
-                actual: acknowledged,
-            });
+        match successful_response(response)?.json().await? {
+            JobArtifactCommitAcknowledgment::Committed {
+                catalog_uuid: acknowledged,
+                catalog,
+            } => {
+                verify_catalog_uuid(catalog_uuid, acknowledged)?;
+                verify_committed_catalog(catalog_uuid, &catalog)
+            }
+            JobArtifactCommitAcknowledgment::Legacy(acknowledged) => {
+                verify_catalog_uuid(catalog_uuid, acknowledged)
+            }
         }
-        Ok(())
     }
 
     /// Prepares an output catalog and returns its ordinary upload signature.
@@ -150,9 +185,12 @@ impl Client {
             .json(&body)
             .send()
             .await?;
-        // The output commit returns the published file UUID.
-        claimed_response(response, job_id)?.json::<Uuid>().await?;
-        Ok(())
+        match claimed_response(response, job_id)?.json().await? {
+            OutputCommitAcknowledgment::Committed { catalog, .. } => {
+                verify_committed_catalog(catalog_uuid, &catalog)
+            }
+            OutputCommitAcknowledgment::Legacy(_file_uuid) => Ok(()),
+        }
     }
 
     pub async fn create_multipart_upload(
@@ -282,6 +320,25 @@ impl Client {
         Ok(Some(response.error_for_status()?.json().await?))
     }
 
+    pub(crate) async fn download_asset(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: &str,
+    ) -> Result<AssetTransfer, Error> {
+        let body =
+            serde_json::json!({"job_id": job_id, "agent_id": agent_id, "filename": filename});
+        Ok(self
+            .http
+            .post(format!("{}/job/asset/presign", self.base_url()))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     pub fn new(settings: Settings) -> Result<Self, Error> {
         if settings.request_timeout.is_zero() {
             return Err(Error::Settings("request timeout must be positive"));
@@ -364,6 +421,21 @@ impl Client {
         claimed_response(response, job_id)?;
         Ok(())
     }
+}
+
+fn verify_catalog_uuid(expected: Uuid, actual: Uuid) -> Result<(), Error> {
+    if actual != expected {
+        return Err(Error::CatalogMismatch { expected, actual });
+    }
+    Ok(())
+}
+
+fn verify_committed_catalog(expected: Uuid, catalog: &Catalog) -> Result<(), Error> {
+    verify_catalog_uuid(expected, catalog.uuid)?;
+    if !catalog.uploaded {
+        return Err(Error::Artifact("committed catalog must be uploaded".into()));
+    }
+    Ok(())
 }
 
 /// Only claim-scoped Rayflow API conflicts mean ownership was lost. Object

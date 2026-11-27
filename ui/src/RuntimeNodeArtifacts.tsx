@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import { api, dateTime, isHttpDownloadUrl, memory, useRemote } from './api';
 import { Details, ErrorBanner } from './components';
-import type { PresignedDownload } from './types';
+import type { RunArchiveTransfer } from './types';
 
 interface UsageSummary {
   sampled_at: string;
@@ -32,7 +32,7 @@ const outcomes = new Map([
 ]);
 
 async function downloadArchive<T>(path: string, options: RequestInit): Promise<T | null> {
-  const signed = await api<PresignedDownload | null>(path, options);
+  const signed = await api<RunArchiveTransfer | null>(path, options);
   if (signed === null) return null;
   if (signed?.operation !== 'download' || !isHttpDownloadUrl(signed.url)) {
     throw new Error('The server returned an invalid archive download link.');

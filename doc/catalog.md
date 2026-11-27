@@ -7,6 +7,9 @@ files (`File`). Catalog records store `id`, `uuid`, `key`, `url`, byte `size`,
 and the same timestamps. There is no `file.fullpath`: use the referenced
 catalog's key for the path. Catalog keys and URLs have separate unique
 `VARCHAR(750)` constraints. A catalog UUID identifies at most one file record.
+The `catalog` field in HTTP responses contains all of these catalog fields.
+Its `url` identifies the stored object. Clients transfer bytes using the
+signed URL and headers returned with the grant.
 
 Register `catalog::models()` or use `server::models()`. Run `./init-db.sh` before
 starting updated binaries. `rayflow.sql` contains the schema for fresh installs.
@@ -316,6 +319,91 @@ Validate the optional adapter with `cargo test -p catalog --features s3`.
 The feature is disabled by default, so default builds do not include the AWS
 signing dependencies.
 
+### S3 CORS requirements
+
+When the console and object storage have different origins, configure CORS on
+Rayflow's storage bucket. The endpoint in each presigned URL must be reachable
+from the browser. Set `AllowedOrigins` to the console origins as sent by the
+browser, including the scheme, host, and any non-default port.
+
+| Console operation | `AllowedMethods` | `AllowedHeaders` |
+| --- | --- | --- |
+| Read `result.json` and `usage.json` in Runtime | `GET` | Omit for the current presigned archive requests. |
+| Upload a file in Assets | `PUT` | `content-type` and any additional headers listed in the browser's `Access-Control-Request-Headers`. |
+
+The browser sends an `OPTIONS` preflight before the upload. S3 matches the
+requested `PUT` method and must allow the origin and requested headers. The
+actual `GET` and `PUT` responses must also include `Access-Control-Allow-Origin`
+for the console origin.
+
+[rustfs-cors.json](../rustfs-cors.json) records the rules for the
+`rayflow-artifacts` bucket. To apply them from the repository root, use an AWS
+CLI identity with `s3:PutBucketCORS` permission.
+
+```sh
+aws --endpoint-url http://10.10.2.199:9000 --region us-east-1 \
+  s3api put-bucket-cors --bucket rayflow-artifacts \
+  --cors-configuration file://rustfs-cors.json
+```
+
+`put-bucket-cors` replaces the bucket's rule set. When adapting the example,
+update the console origins and include any rules other clients still need.
+
+## Shared assets
+
+Migration 27 adds one `asset` row per named version. A ready row points to a
+verified, private object through `catalog_uuid`. Migration 28 tracks private
+copies while publication is in progress so the server can clean up unused
+copies after a failed commit or restart. Nodes pin the asset version
+UUID in `assets` and choose a relative mount filename:
+
+```json
+{
+  "assets": [{
+    "asset_id": "f27e2c15-e49b-49bf-85cf-f646ed55cfea",
+    "file_name": "scripts/transform.lua"
+  }]
+}
+```
+
+Asset references can be used on root nodes. A published graph pins the version,
+so editing a draft to use another version affects jobs on the new graph.
+
+| Endpoint | Operation |
+| --- | --- |
+| `GET /api/v1/assets` | List published asset versions. |
+| `GET /api/v1/assets/{asset_id}` | Read an exact published version. |
+| `POST /api/v1/assets/prepare` | Reserve an upload with `name`, `version`, `size`, `format`, and hex `sha256`. |
+| `POST /api/v1/assets/{asset_id}/commit` | Verify and publish the staged object selected by `upload_id`. |
+| `POST /api/v1/assets/{name}/versions/{version}/cancel` | Discard a pending version reserved by the calling user. |
+| `POST /api/v1/assets/{name}/versions/{version}/import` | Publish an existing object using `source_key`, `format`, and hex `sha256`. |
+| `POST /api/v1/assets/{asset_id}/download` | Presign a named attachment for the published object. |
+| `POST /api/v1/job/asset/presign` | Presign a job asset selected by `job_id`, `agent_id`, and declared `filename`. |
+
+A pending prepare response includes `state: "pending"`, `asset_id`,
+`upload_id`, the `upload` grant, and the staging object's `catalog`.
+A published prepare response includes `state: "published"`, the asset
+descriptor fields, and the published object's `catalog`. Commit and import
+return the descriptor fields and the published object's `catalog`. Asset
+download grants contain `asset_id`, `sha256`, `catalog`, `presigned`, and
+`multipart`.
+
+The browser sends `PUT` directly to the URL from a pending prepare response
+using the returned headers and the selected file as the body. The signature
+binds the declared file size to the browser's `Content-Length`. Configure the
+bucket according to the [S3 CORS requirements](#s3-cors-requirements). On commit
+Rayflow checks the staging object's size, copies it to a private key, and
+verifies the copied size and SHA-256 before publishing. Matching retries reuse
+the reservation or return the published version. After an upload attempt,
+**Discard pending upload** releases the calling user's reservation and lets
+them publish different bytes for that version. Configure storage
+lifecycle expiry for objects under the `asset-staging` prefix and retain
+published objects for reruns.
+
+Imports are available when `storage.asset_import_prefix` is configured.
+The source key is relative to that prefix, which must be disjoint from
+`storage.prefix`. The agent's endpoint checks the active claim and the
+consuming node's pinned graph version before granting a download.
 
 ## Job artifact API
 
@@ -325,15 +413,15 @@ Agents do not submit storage keys.
 
 | Endpoint | Request | Result |
 | --- | --- | --- |
-| `POST /api/v1/job/result/prepare` | `job_id`, `agent_id`, `size` | Result catalog UUID, catalog metadata, and a presigned upload URL |
-| `POST /api/v1/job/result/commit` | `job_id`, `agent_id`, `catalog_uuid` | Marks the job's prepared result catalog uploaded |
-| `POST /api/v1/job/output/prepare` | `job_id`, `agent_id`, `filename`, `size`, `format` | Catalog UUID and ordinary upload signature |
-| `POST /api/v1/job/output/commit` | `job_id`, `agent_id`, `filename`, `catalog_uuid` | Marks the catalog uploaded and publishes the file |
+| `POST /api/v1/job/result/prepare` | `job_id`, `agent_id`, `size` | `catalog_uuid`, `catalog`, `presigned`, and `multipart` |
+| `POST /api/v1/job/result/commit` | `job_id`, `agent_id`, `catalog_uuid` | `catalog_uuid` and the acknowledged `catalog` |
+| `POST /api/v1/job/output/prepare` | `job_id`, `agent_id`, `filename`, `size`, `format` | `catalog_uuid`, `catalog`, `presigned`, and `multipart` |
+| `POST /api/v1/job/output/commit` | `job_id`, `agent_id`, `filename`, `catalog_uuid` | Published `file_uuid` and the acknowledged `catalog` |
 | `POST /api/v1/job/output/multipart/create` | `job_id`, `agent_id`, `filename`, `size`, `format` | Creates the catalog and returns a multipart-create signature |
 | `POST /api/v1/job/output/multipart/upload` | `job_id`, `agent_id`, `filename`, `catalog_uuid`, `upload_id`, `part_number` | Returns an upload-part signature |
 | `POST /api/v1/job/output/multipart/complete` | `job_id`, `agent_id`, `filename`, `catalog_uuid`, `upload_id` | Returns a multipart-complete signature |
 | `POST /api/v1/job/output/multipart/abort` | `job_id`, `agent_id`, `filename`, `catalog_uuid`, `upload_id` | Returns a multipart-abort signature |
-| `POST /api/v1/job/input/presign` | `job_id`, `agent_id`, `filename` | Download signature and catalog metadata |
+| `POST /api/v1/job/input/presign` | `job_id`, `agent_id`, `filename` | `catalog`, `presigned`, and `multipart` |
 
 The server validates the active job claim, checks the declared input or output,
 and derives the producer node run for input downloads. Upload state and transfer
@@ -345,9 +433,9 @@ completion must succeed before `/job/output/commit` marks the catalog uploaded.
 
 The agent uploads `result.json` and `usage.json` as `application/json` at
 `/<prefix>/jobs/<job_uuid>/<filename>`. Their catalog associations are keyed by
-job and filename in `job_artifact`, independently of declared outputs. Apply
-migration 24 and upgrade the server before upgrading agents. Existing result
-rows remain associated with `result.json`. Both `/job/result/prepare` and
+job and filename in `job_artifact`, independently of declared outputs.
+Migration 24 introduced this layout and retained existing result associations
+under `result.json`. Both `/job/result/prepare` and
 `/job/result/commit` accept `filename`, which defaults to `result.json` for older
 agents. The assigned agent may use either filename after the lease expires or
 the scheduler clears active ownership.
@@ -361,15 +449,27 @@ already true, the agent skips PUT and commit and the returned signature permits
 download. Otherwise the agent uploads the exact local bytes using the returned
 URL and headers and commits the catalog UUID after a successful 2xx PUT.
 The archive commit must return a 2xx response with the expected catalog UUID.
+When the response includes a catalog, the agent verifies its UUID and
+`uploaded` status.
 The agent validates and commits required outputs before reporting success.
 It retries the JSON uploads independently and keeps both files across restarts.
 A server without object storage returns `RAYFLOW_STORAGE_UNAVAILABLE`. Pending
 output uploads delay completion, and pending JSON uploads delay local cleanup.
 
+Updated agents accept UUID-only output and archive commit responses from older
+servers. When upgrading from a release that supports both `result.json` and
+`usage.json` archives, upgrade the agents before deploying the server that
+returns catalog records with commit acknowledgments.
+
+The console reads committed archives through
+`GET /api/v1/runs/{run_id}/node-runs/{node_run_id}/artifacts/{filename}`.
+The response has top-level `operation`, `url`, `headers`, `expires_at`, and
+`catalog`. An unavailable archive returns JSON `null`.
+
 ### Local data layout
 
-`JobManager` stores metadata and artifact data under separate configured roots. Both
-roots are scoped by the job UUID; artifact data is isolated per job:
+`JobManager` uses independently configured roots for job metadata, job inputs
+and outputs, and shared assets.
 
 ```text
 <metadata_dir>/<job_uuid>/job.json
@@ -383,18 +483,47 @@ roots are scoped by the job UUID; artifact data is isolated per job:
 <metadata_dir>/<job_uuid>/pid
 <metadata_dir>/<job_uuid>/runtime/started_at
 <metadata_dir>/<job_uuid>/graph.json
+<metadata_dir>/<job_uuid>/asset-stage.json
 <data_dir>/<job_uuid>/inputs/<filename>
 <data_dir>/<job_uuid>/outputs/<filename>
 <data_dir>/<job_uuid>/.rayflow/<job_uuid>/inputs-ready.json
 <data_dir>/<job_uuid>/.rayflow/<job_uuid>/outputs-uploaded.json
+<asset_dir>/cache/<asset_id>/
+<asset_dir>/jobs/<job_uuid>/<filename>
 ```
 
-`metadata_dir` is the configured agent `workdir`; `data_dir` is configured
-separately (the defaults are `.rayflow/jobs` and `.rayflow/data`). Docker mounts
-the read-only job metadata directory at `/rayflow`, including `job.json` and
-the pinned `graph.json`; `RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to
-those files. The agent keeps input readiness, output completion, and transfer
-state in the per-job marker directory. Local artifacts stay available until the
-server acknowledges the outcome and both JSON archives have upload receipts.
-Docker mounts inputs read-only at `/data/inputs` and outputs writable at
-`/data/outputs`.
+`metadata_dir` is the configured agent `workdir`. The defaults for `workdir`,
+`data_dir`, and `asset_dir` are `.rayflow/jobs`, `.rayflow/data`, and
+`.rayflow/assets` respectively. Docker mounts the read-only job metadata
+directory at `/rayflow`, including `job.json` and the pinned `graph.json`.
+`RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to those files. The agent
+keeps input readiness, output completion, and transfer state in the per-job
+marker directory. Local artifacts stay available until the server acknowledges
+the outcome and both JSON archives have upload receipts.
+The optional `asset-stage.json` marker records that cleanup has a separate
+job asset directory to remove.
+Docker mounts inputs and assets read-only at `/data/inputs` and `/data/assets`
+and outputs writable at `/data/outputs`. The agent sets `RAYFLOW_ASSET_DIR` to
+the container path. Jobs without declared assets receive an empty asset mount
+from their job data directory.
+
+During job preparation, the agent obtains a claim-scoped grant for a missing
+asset and verifies its size and SHA-256 before caching it by pinned asset UUID.
+By default, the agent reads the bytes through the grant's presigned URL. With
+`asset_source_dir` configured, it reads the grant's catalog key from the
+mounted bucket, including any storage prefix. The mounted bucket serves as a
+read-only source. An unavailable object or a verification failure stops
+preparation.
+
+The agent verifies cached files before hard-linking them into the job's asset
+directory under the declared filenames. Both directories live on the
+`asset_dir` filesystem, which must support hard links and link counts, file
+locking, and atomic renames. This can be a separate cloud disk. The cache
+persists across agent restarts, and job preparation accesses it only for nodes
+with declared assets.
+
+The agent updates each cached file's access time when it stages a job asset
+and evicts the oldest accesses first to meet `asset_cache_max_bytes` (10 GiB by
+default). A job's hard link protects the cached file from eviction until
+cleanup removes the link. The cache can exceed its budget while files are in
+use. A budget of zero evicts every file once no job links to it.

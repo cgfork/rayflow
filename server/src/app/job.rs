@@ -6,6 +6,7 @@ use catalog::directory::DIRECTORY_MANIFEST;
 use catalog::path::validate_relative_path;
 use catalog::{
     CatalogOptionalData, CatalogSystem, FileInput, FileSystem, ObjectStorage, PresignOperation,
+    model::Catalog,
 };
 use graph::{
     Graph, GraphStore,
@@ -111,7 +112,7 @@ impl<S> App<S> {
         Ok((key, url))
     }
 
-    fn validate_output_job(job: &Job, agent_id: Uuid) -> Result<(), AppError> {
+    pub(super) fn validate_job_claim(job: &Job, agent_id: Uuid) -> Result<(), AppError> {
         if job.status != scheduler::actuator::Status::Polled
             || job.agent_id != Some(agent_id)
             || job
@@ -203,7 +204,7 @@ impl<S> App<S> {
             .exec(&mut tx)
             .await?
             .ok_or(AppError::JobNotFound(job_id))?;
-        Self::validate_output_job(&job, agent_id)?;
+        Self::validate_job_claim(&job, agent_id)?;
         let node_run = job.node_run.get();
         self.validate_output_filename(node_run, &filename).await?;
         let (key, url) = self.output_location(node_run, &filename)?;
@@ -274,7 +275,7 @@ impl<S> App<S> {
             .exec(&mut db)
             .await?
             .ok_or(AppError::JobNotFound(job_id))?;
-        Self::validate_output_job(&job, agent_id)?;
+        Self::validate_job_claim(&job, agent_id)?;
         let node_run = job.node_run.get();
         self.validate_output_filename(node_run, &filename).await?;
         let (key, _) = self.output_location(node_run, &filename)?;
@@ -316,7 +317,7 @@ impl<S> App<S> {
         agent_id: Uuid,
         filename: String,
         catalog_uuid: Uuid,
-    ) -> Result<Uuid, AppError>
+    ) -> Result<(Uuid, Catalog), AppError>
     where
         S: GraphStore<Uuid, G = DAG> + Clone,
         S::load(..): Send,
@@ -330,7 +331,7 @@ impl<S> App<S> {
             .exec(&mut tx)
             .await?
             .ok_or(AppError::JobNotFound(job_id))?;
-        Self::validate_output_job(&job, agent_id)?;
+        Self::validate_job_claim(&job, agent_id)?;
         let node_run = job.node_run.get();
         self.validate_output_filename(node_run, &filename).await?;
         let (key, _) = self.output_location(node_run, &filename)?;
@@ -343,19 +344,25 @@ impl<S> App<S> {
                 "output catalog does not match the job output".into(),
             ));
         }
-        tx.update_catalog(
-            catalog_uuid,
-            CatalogOptionalData {
-                uploaded: Some(true),
-                ..Default::default()
-            },
-        )
-        .await?;
+        if !catalog.uploaded {
+            tx.update_catalog(
+                catalog_uuid,
+                CatalogOptionalData {
+                    uploaded: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
         let file = tx
             .upsert_file(&FileInput::new(node_run.uuid, filename, catalog_uuid))
             .await?;
+        let catalog = tx
+            .get_catalog(catalog_uuid)
+            .await?
+            .ok_or_else(|| AppError::ArtifactNotFound(catalog_uuid.to_string()))?;
         tx.commit().await?;
-        Ok(file)
+        Ok((file, catalog))
     }
 
     pub async fn presign_input(
@@ -377,7 +384,7 @@ impl<S> App<S> {
             .exec(&mut db)
             .await?
             .ok_or(AppError::JobNotFound(job_id))?;
-        Self::validate_output_job(&job, agent_id)?;
+        Self::validate_job_claim(&job, agent_id)?;
         let node_run = job.node_run.get();
         let graph = self
             .read_graph(node_run.graph_id, Some(node_run.version))
