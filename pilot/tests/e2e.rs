@@ -245,6 +245,7 @@ fn workflow(image: &str) -> DAG {
                 resource: Resource {
                     cpu_cores: 1,
                     memory_bytes: MEMORY,
+                    gpu_memory_bytes: None,
                 },
                 timeout: Duration::from_secs(120),
                 overrides: Default::default(),

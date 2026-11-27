@@ -7,7 +7,7 @@ use std::{
 };
 
 use config::{Config as Builder, Environment, File};
-use scheduler::ResourceCapacity;
+use scheduler::{GpuDevice, ResourceCapacity, validate_gpu_devices};
 use serde::Deserialize;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use uuid::Uuid;
@@ -48,7 +48,11 @@ pub struct Settings {
     /// Byte budget for cached assets. In-use assets can exceed this budget.
     #[serde(default = "default_asset_cache_max_bytes")]
     pub asset_cache_max_bytes: u64,
+    /// Total CPU and RAM budget.
     pub resources: ResourceCapacity,
+    /// GPU inventory with a separate memory budget for each qualified CDI name.
+    #[serde(default)]
+    pub gpu_devices: Vec<GpuDevice>,
     pub batch: usize,
     #[serde(with = "jiff::fmt::serde::unsigned_duration::required")]
     pub poll_interval: Duration,
@@ -70,6 +74,7 @@ impl std::fmt::Debug for Settings {
             .field("asset_source_dir", &self.asset_source_dir)
             .field("asset_cache_max_bytes", &self.asset_cache_max_bytes)
             .field("resources", &self.resources)
+            .field("gpu_devices", &self.gpu_devices)
             .field("batch", &self.batch)
             .field("poll_interval", &self.poll_interval)
             .field("request_timeout", &self.request_timeout)
@@ -149,6 +154,7 @@ impl Settings {
             asset_cache_max_bytes: DEFAULT_ASSET_CACHE_MAX_BYTES,
             workdir,
             resources,
+            gpu_devices: Vec::new(),
             batch: 64,
             poll_interval: Duration::from_secs(1),
             request_timeout: Duration::from_secs(60),
@@ -188,6 +194,7 @@ impl Settings {
         if self.resources.cpu_cores == 0 || self.resources.memory_bytes == 0 {
             return Err(Error::Settings("CPU and memory capacity must be positive"));
         }
+        validate_gpu_devices(&self.gpu_devices).map_err(Error::Settings)?;
         if self.workdir.as_os_str().is_empty() {
             return Err(Error::Settings("workdir must not be empty"));
         }
@@ -297,6 +304,8 @@ fn load_or_create_agent_id(workdir: &Path) -> Result<Uuid, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::PollRequest;
+    use serde_json::json;
 
     fn valid_settings() -> Settings {
         Settings::new(
@@ -313,6 +322,57 @@ mod tests {
     #[test]
     fn accepts_valid_settings() {
         assert!(valid_settings().validate().is_ok());
+    }
+
+    #[test]
+    fn polls_with_per_device_gpu_budgets() {
+        let mut settings = valid_settings();
+        let request =
+            serde_json::to_value(PollRequest::from_settings(&settings, Vec::new())).unwrap();
+        assert!(request.get("gpu_devices").is_none());
+        assert_eq!(
+            request["resources"],
+            json!({"cpu_cores": 2, "memory_bytes": 1024})
+        );
+
+        let config = Builder::builder()
+            .add_source(File::from_str(
+                "gpu_devices:\n  - cdi_device: vendor.example/gpu=0\n    memory_bytes: 4096\n  - cdi_device: vendor.example/gpu=1\n    memory_bytes: 8192\n",
+                config::FileFormat::Yaml,
+            ))
+            .build()
+            .unwrap();
+        settings.gpu_devices = config.get("gpu_devices").unwrap();
+        assert!(settings.validate().is_ok());
+        let request =
+            serde_json::to_value(PollRequest::from_settings(&settings, Vec::new())).unwrap();
+        assert_eq!(
+            request["resources"],
+            json!({"cpu_cores": 2, "memory_bytes": 1024})
+        );
+        assert_eq!(
+            request["gpu_devices"],
+            json!([
+                { "cdi_device": "vendor.example/gpu=0", "memory_bytes": 4096 },
+                { "cdi_device": "vendor.example/gpu=1", "memory_bytes": 8192 }
+            ])
+        );
+
+        settings.gpu_devices[1].cdi_device = settings.gpu_devices[0].cdi_device.clone();
+        assert!(matches!(settings.validate(), Err(Error::Settings(_))));
+
+        settings.gpu_devices.truncate(1);
+        assert!(settings.validate().is_ok());
+        let request =
+            serde_json::to_value(PollRequest::from_settings(&settings, Vec::new())).unwrap();
+        assert_eq!(
+            request["resources"],
+            json!({"cpu_cores": 2, "memory_bytes": 1024})
+        );
+        assert_eq!(
+            request["gpu_devices"],
+            json!([{ "cdi_device": "vendor.example/gpu=0", "memory_bytes": 4096 }])
+        );
     }
 
     #[tokio::test]

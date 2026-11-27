@@ -153,6 +153,9 @@ impl<S> App<S> {
                     .lease(settings.timeout_ms())
                     .required_cpu_cores(settings.resource.cpu_cores)
                     .required_memory_bytes(settings.resource.memory_bytes)
+                    .required_gpu_memory_bytes(
+                        settings.resource.gpu_memory_bytes.unwrap_or_default(),
+                    )
                     .created_at(graph.created_at)
                     .updated_at(graph.updated_at)
                     .created_by(actor.to_owned())

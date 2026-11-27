@@ -10,7 +10,7 @@ use std::{
 };
 
 use agent::{
-    JobManager, JobOutcome, JobResult, JobUsage, StopReason, Usage, UsagePercentiles,
+    Agentic, JobManager, JobOutcome, JobResult, JobUsage, StopReason, Usage, UsagePercentiles,
     client::Client,
     containerd::{
         Container, ContainerEvent, ContainerFile, ContainerState, Containerd, ExitStatus,
@@ -19,6 +19,7 @@ use agent::{
     errors::Error,
     settings::Settings,
 };
+use axum::{Json, Router, routing::post};
 use event::task::Task;
 use futures_util::{FutureExt, Stream, StreamExt, stream};
 use graph::{
@@ -28,13 +29,18 @@ use graph::{
 use jiff::Timestamp;
 use runtime::command::{NodeRun, Run};
 use scheduler::{
-    Job, ResourceCapacity,
+    GpuDevice, Job, ResourceCapacity,
     actuator::{NodeConfig, Status},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
-use tokio::{fs, sync::Notify, time::timeout};
+use tokio::{
+    fs,
+    net::TcpListener,
+    sync::{Notify, mpsc, oneshot},
+    time::timeout,
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -156,6 +162,7 @@ impl Workflow {
             lease: Some(30_000),
             required_cpu_cores: 1,
             required_memory_bytes: 64 * 1024 * 1024,
+            required_gpu_memory_bytes: 0,
             created_at: now,
             updated_at: now,
             created_by: "test".into(),
@@ -175,6 +182,7 @@ impl Workflow {
         job.expired_at = Some(now.checked_add(config.job_lease().unwrap()).unwrap());
         job.required_cpu_cores = config.required_cpu_cores;
         job.required_memory_bytes = config.required_memory_bytes;
+        job.required_gpu_memory_bytes = config.required_gpu_memory_bytes;
         job.run = self.run.clone().into();
         job.node_run = self.node_run.clone().into();
         job.node_config = Some(config).into();
@@ -452,6 +460,91 @@ async fn recover_job<C: Containerd>(manager: &JobManager<C, Graphs>, job_id: Uui
 }
 
 #[tokio::test]
+async fn confirms_gpu_offers_immediately_and_starts_only_committed_jobs() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut workflow = Workflow::new(false);
+    workflow.settings.server_url = format!("http://{}", listener.local_addr().unwrap());
+    workflow.settings.batch = 2;
+    workflow.settings.poll_interval = Duration::from_secs(60);
+    workflow.settings.gpu_devices = vec![
+        GpuDevice {
+            cdi_device: "vendor.example/gpu=0".into(),
+            memory_bytes: 1024,
+        },
+        GpuDevice {
+            cdi_device: "vendor.example/gpu=1".into(),
+            memory_bytes: 2048,
+        },
+    ];
+    let (requests, mut received) = mpsc::channel(1);
+    let router = Router::new().route(
+        "/api/v1/jobs/poll",
+        post(move |Json(request): Json<Value>| {
+            let requests = requests.clone();
+            async move {
+                let (reply, body) = oneshot::channel::<Value>();
+                requests.send((request, reply)).await.unwrap();
+                Json(body.await.unwrap())
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let provider = FakeProvider::default();
+    provider.0.lock().unwrap().usage = Some(example_usage());
+    let manager = workflow.open(provider.clone()).await;
+    let agent = Agentic::with_manager(manager);
+    let mut job = workflow.claim("fixture-image", "true");
+    job.required_gpu_memory_bytes = 1536;
+    job.assigned_gpu_cdi_device = Some("vendor.example/gpu=1".into());
+    let unconfirmed = Uuid::new_v4();
+
+    timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = agent.start() => panic!("agent stopped early: {result:?}"),
+            () = async {
+                let (initial, reply) = received.recv().await.unwrap();
+                assert!(initial.get("gpu_choices").is_none());
+                assert!(initial.get("wait_ms").is_none());
+                assert_eq!(initial["gpu_devices"], json!(workflow.settings.gpu_devices));
+                reply.send(json!({
+                    "jobs": [],
+                    "gpu_offers": {
+                        "jobs": [
+                            {"job_id": job.uuid, "required_gpu_memory_bytes": 1536},
+                            {"job_id": unconfirmed, "required_gpu_memory_bytes": 1024}
+                        ],
+                        "devices": workflow.settings.gpu_devices
+                    }
+                })).unwrap();
+
+                let (confirmation, reply) = received.recv().await.unwrap();
+                assert_eq!(confirmation["active_jobs"], json!([]));
+                assert_eq!(confirmation["wait_ms"], 0);
+                assert_eq!(
+                    confirmation["gpu_choices"],
+                    json!([
+                        {"job_id": job.uuid, "cdi_device": "vendor.example/gpu=1"},
+                        {"job_id": unconfirmed, "cdi_device": "vendor.example/gpu=0"}
+                    ])
+                );
+                assert_eq!(provider.0.lock().unwrap().creates, 0);
+                assert!(!workflow.job_dir(job.uuid).exists());
+                reply.send(json!({"jobs": [job]})).unwrap();
+
+                wait_for_file(&workflow.job_dir(job.uuid).join("usage/checkpoint.jsonl")).await;
+                let state = provider.0.lock().unwrap();
+                assert_eq!(state.starts, 1);
+                assert_eq!(state.prepared[0].assigned_gpu_cdi_device, job.assigned_gpu_cdi_device);
+                assert!(!workflow.job_dir(unconfirmed).exists());
+            } => {}
+        }
+    })
+    .await
+    .expect("agent did not confirm and start the GPU job immediately");
+    server.abort();
+}
+
+#[tokio::test]
 async fn mounts_job_asset_links_read_only_from_the_configured_root() {
     let mut workflow = Workflow::new(false);
     workflow.settings.asset_dir = workflow._root.path().join("asset-volume");
@@ -599,12 +692,22 @@ async fn yield_and_resume_isolate_job_data_and_keep_unarchived_files() {
 
 #[tokio::test]
 async fn restarting_during_execution_preserves_container_and_recovers_failure() {
-    let workflow = Workflow::new(false);
+    let mut workflow = Workflow::new(false);
+    let gpu_cdi_device = "vendor.example/gpu=1";
+    workflow.settings.gpu_devices = ["vendor.example/gpu=0", gpu_cdi_device]
+        .into_iter()
+        .map(|device| GpuDevice {
+            cdi_device: device.into(),
+            memory_bytes: 1024,
+        })
+        .collect();
     let provider = FakeProvider::default();
     let usage = example_usage();
     provider.0.lock().unwrap().usage = Some(usage.clone());
     let manager = workflow.open(provider.clone()).await;
-    let job = workflow.claim("fixture-image", "exit 7");
+    let mut job = workflow.claim("fixture-image", "exit 7");
+    job.required_gpu_memory_bytes = 1024;
+    job.assigned_gpu_cdi_device = Some(gpu_cdi_device.into());
     let dir = workflow.job_dir(job.uuid);
     let output = workflow.data_dir(job.uuid).join("outputs/checkpoint.txt");
 
@@ -616,11 +719,15 @@ async fn restarting_during_execution_preserves_container_and_recovers_failure() 
     let manager = workflow.open(provider.clone()).await;
     let recovered = recover_job(&manager, job.uuid).await;
     assert_eq!(recovered.expired_at, job.expired_at);
-    let start = manager.start(recovered);
-    assert_eq!(manager.active_job_ids(), vec![job.uuid]);
+    assert_eq!(
+        recovered.assigned_gpu_cdi_device,
+        job.assigned_gpu_cdi_device
+    );
     let mut redelivery = job.clone();
     redelivery.expired_at = Some(Timestamp::now());
-    tokio::join!(start, manager.start(redelivery));
+    let start = manager.start(redelivery);
+    assert_eq!(manager.active_job_ids(), vec![job.uuid]);
+    tokio::join!(start, manager.start(recovered));
     assert_eq!(provider.0.lock().unwrap().starts, 1);
 
     let sample_started = Arc::new(Notify::new());
@@ -634,7 +741,12 @@ async fn restarting_during_execution_preserves_container_and_recovers_failure() 
     drop(manager);
 
     let manager = workflow.open(provider).await;
-    manager.start(recover_job(&manager, job.uuid).await).await;
+    let recovered = recover_job(&manager, job.uuid).await;
+    assert_eq!(
+        recovered.assigned_gpu_cdi_device.as_deref(),
+        Some(gpu_cdi_device)
+    );
+    manager.start(recovered).await;
     let result = manager.result(job.uuid).await.unwrap().unwrap();
     assert_outcome(&result, JobOutcome::Failed);
     assert_eq!(result.exit_code, 7);

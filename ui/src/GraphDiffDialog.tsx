@@ -16,7 +16,7 @@ type OverrideDiff = { name: string; before: AnnotationMatchNodeSettings | null; 
 type SettingsDiff =
   | FieldDiff<'config', unknown>
   | FieldDiff<'timeout', string>
-  | { field: 'resource'; change: FieldDiff<'cpu_cores' | 'memory_bytes', number>[] }
+  | { field: 'resource'; change: FieldDiff<'cpu_cores' | 'memory_bytes' | 'gpu_memory_bytes'>[] }
   | { field: 'overrides'; change: OverrideDiff[] };
 type NodeDiff =
   | FieldDiff<'id' | 'name' | 'node_type'>
@@ -49,7 +49,7 @@ const nodeFields: Record<string, string> = {
   id: 'Node ID', name: 'Name', node_type: 'Node type', file_name: 'File name',
   source: 'Source', required: 'Required', format: 'Format', kind: 'Kind',
   asset_id: 'Asset ID',
-  cpu_cores: 'CPU cores', memory_bytes: 'Memory (bytes)',
+  cpu_cores: 'CPU cores', memory_bytes: 'Memory (bytes)', gpu_memory_bytes: 'GPU memory (bytes)',
 };
 
 function versionKey(graph: GraphVersion) {

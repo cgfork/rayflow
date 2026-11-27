@@ -108,6 +108,8 @@ pub enum WorkflowValidationError {
     InvalidResources { node: String },
     #[error("{node}: memory exceeds the supported limit")]
     MemoryLimit { node: String },
+    #[error("{node}: GPU memory must be positive when specified")]
+    InvalidGpuMemory { node: String },
     #[error("{node}: timeout must be positive whole milliseconds within timestamp range")]
     InvalidTimeout { node: String },
     #[error("{node}: Docker image is required")]
@@ -273,6 +275,9 @@ fn validate_node_settings(
     if settings.resource.memory_bytes > i64::MAX as u64 {
         return Err(WorkflowValidationError::MemoryLimit { node: label() });
     }
+    if settings.resource.gpu_memory_bytes == Some(0) {
+        return Err(WorkflowValidationError::InvalidGpuMemory { node: label() });
+    }
     if settings.timeout_ms().is_none() {
         return Err(WorkflowValidationError::InvalidTimeout { node: label() });
     }
@@ -346,7 +351,7 @@ pub fn unreferenced_outputs(graph: &DAG) -> Vec<UnreferencedOutput<'_>> {
 }
 
 #[cfg(test)]
-mod asset_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -376,6 +381,35 @@ mod asset_tests {
         assert!(matches!(
             validate_assets(&node),
             Err(WorkflowValidationError::InvalidAssetPath { .. }),
+        ));
+    }
+
+    #[test]
+    fn gpu_memory_must_be_positive_and_old_device_selectors_are_ignored() {
+        let mut node: Node = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(), "name": "task", "node_type": "docker",
+            "settings": {
+                "config": {"image": "alpine"},
+                "resource": {"cpu_cores": 1, "memory_bytes": 1024, "gpu_cdi_device": "nvidia.com/gpu=1"},
+                "timeout": "30s",
+            },
+            "inputs": [], "outputs": [],
+        }))
+        .unwrap();
+        let validate = |node: &Node| {
+            validate_node_settings(node, &node.settings.named_settings().next().unwrap())
+        };
+        validate(&node).unwrap();
+        node.settings.resource.gpu_memory_bytes = Some(4096);
+        validate(&node).unwrap();
+        assert_eq!(
+            serde_json::to_value(&node).unwrap()["settings"]["resource"],
+            serde_json::json!({"cpu_cores": 1, "memory_bytes": 1024, "gpu_memory_bytes": 4096})
+        );
+        node.settings.resource.gpu_memory_bytes = Some(0);
+        assert!(matches!(
+            validate(&node),
+            Err(WorkflowValidationError::InvalidGpuMemory { .. }),
         ));
     }
 }

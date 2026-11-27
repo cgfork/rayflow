@@ -9,8 +9,9 @@ pub mod scheduler;
 
 pub use actuator::{Actuator, Job, JobRead, JobWrite, Step, models};
 pub use agent::{
-    AgentRef, AgentScheduler, JobPoll, ResourceCapacity, cancel_job, fail_expired_in, fail_job,
-    succeed_job, terminate_job, yield_job,
+    AgentRef, AgentScheduler, GpuChoice, GpuDevice, GpuOffer, GpuOffers, JobPoll, ResourceCapacity,
+    cancel_job, fail_expired_in, fail_job, succeed_job, terminate_job, validate_gpu_devices,
+    yield_job,
 };
 pub use agent_registry::{Error as AgentRegistryError, Instance as AgentInstance};
 pub use event::task_event::{TaskEvent, TaskEventEntry};

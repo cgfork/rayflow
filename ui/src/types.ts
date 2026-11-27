@@ -1,6 +1,6 @@
 export interface Input { file_name: string; source: string; required: boolean; format: string | null }
 export interface Output { file_name: string; kind: 'File' | 'Directory' }
-interface NodeResource { cpu_cores: number; memory_bytes: number }
+interface NodeResource { cpu_cores: number; memory_bytes: number; gpu_memory_bytes?: number | null }
 export interface NodeSettings {
   config: Record<string, unknown>;
   resource: NodeResource;
@@ -86,6 +86,7 @@ export interface AssetTransfer extends CatalogDownload { asset_id: string; sha25
 export type RunFileTransfer = CatalogDownload;
 export interface RunArchiveTransfer extends PresignedUrl<'download'> { catalog: Catalog }
 export type JobStatus = 'Scheduled' | 'Polled' | 'Yielded' | 'Succeeded' | 'Failed' | 'Terminated';
-export interface Job { id: number; uuid: string; task_id: string; run_id: string; node_run_id: number; status: JobStatus; required_cpu_cores: number; required_memory_bytes: number; agent_id: string | null; polled_at: string | null; expired_at: string | null; created_at: string; updated_at: string }
-export interface Agent { id: number; uuid: string; cpu_cores: number; memory_bytes: number; active_jobs: number; first_seen_at: string; last_seen_at: string; online_until: string; online: boolean }
+export interface Job { id: number; uuid: string; task_id: string; run_id: string; node_run_id: number; status: JobStatus; required_cpu_cores: number; required_memory_bytes: number; required_gpu_memory_bytes?: number; assigned_gpu_cdi_device?: string | null; agent_id: string | null; polled_at: string | null; expired_at: string | null; created_at: string; updated_at: string }
+interface GpuDevice { cdi_device: string; memory_bytes: number }
+export interface Agent { id: number; uuid: string; cpu_cores: number; memory_bytes: number; gpu_memory_bytes?: number; gpu_devices?: GpuDevice[] | null; active_jobs: number; first_seen_at: string; last_seen_at: string; online_until: string; online: boolean }
 export type Section = 'orchestration' | 'assets' | 'runtime' | 'schedule' | 'agents';

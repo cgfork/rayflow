@@ -8,7 +8,7 @@ import { DockerConfigFields, DockerConfigInput, parseDockerConfig } from './Dock
 import FlowCanvas from './FlowCanvas';
 import GraphDiffDialog from './GraphDiffDialog';
 import NodeOverrides from './NodeOverrides';
-import { createGraph, createNode, disconnectEdges, isJsonObject, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
+import { bytesPerMiB, createGraph, createNode, disconnectEdges, isJsonObject, isOptionalGpuMemory, normalizeGraph, outputChoices, removeNodes, updateGraphNode, upstreamIds, validateGraph } from './graph';
 import { copyUuid } from './uuid';
 import type { User } from './Auth';
 import type { Graph, GraphNode } from './types';
@@ -334,11 +334,19 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
       <h3>Node settings</h3>
       <div className="settings-resources">
         <label className="field">CPU cores<input aria-label="CPU cores" type="number" min="1" max="4294967295" step="1" value={node.settings.resource.cpu_cores} onChange={(event) => update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, cpu_cores: Number(event.target.value) } } })} /></label>
-        <label className="field">Memory (MiB)<input aria-label="Memory (MiB)" type="number" min="1" step="1" value={node.settings.resource.memory_bytes / 1048576} onChange={(event) => update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, memory_bytes: Math.round(Number(event.target.value) * 1048576) } } })} /></label>
+        <label className="field">Memory (MiB)<input aria-label="Memory (MiB)" type="number" min="1" step="1" value={node.settings.resource.memory_bytes / bytesPerMiB} onChange={(event) => update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, memory_bytes: Math.round(Number(event.target.value) * bytesPerMiB) } } })} /></label>
       </div>
+      {node.node_type === 'docker' && <label className="field">GPU memory (MiB)<input
+        type="number" min={1 / bytesPerMiB} step="any" placeholder="Optional"
+        value={node.settings.resource.gpu_memory_bytes == null ? '' : node.settings.resource.gpu_memory_bytes / bytesPerMiB}
+        onChange={(event) => {
+          const gpu_memory_bytes = event.target.value === '' ? undefined : Math.round(event.target.valueAsNumber * bytesPerMiB);
+          update({ ...node, settings: { ...node.settings, resource: { ...node.settings.resource, gpu_memory_bytes } } });
+        }}
+      /></label>}
       <label className="field">Timeout<input aria-label="Timeout" placeholder="10s" value={node.settings.timeout} onChange={(event) => update({ ...node, settings: { ...node.settings, timeout: event.target.value } })} /></label>
     </div>
-    <NodeOverrides settings={node.settings} update={(overrides) => update({ ...node, settings: { ...node.settings, overrides: Object.keys(overrides).length ? overrides : undefined } })} />
+    <NodeOverrides settings={node.settings} allowGpuMemory={node.node_type === 'docker'} update={(overrides) => update({ ...node, settings: { ...node.settings, overrides: Object.keys(overrides).length ? overrides : undefined } })} />
     <div className="field-section"><h3>Inputs <button type="button" className="icon-button" aria-label="Add input" onClick={() => update({ ...node, inputs: [...node.inputs, { file_name: '', source: '', required: true, format: null }] })}><Plus size={15} /></button></h3>{node.inputs.length === 0 && <p className="muted small-text">No inputs.</p>}{node.inputs.map((input, index) => <div className="port-form" key={index}><div className="actions"><input aria-label={`Input ${index + 1} file name`} placeholder="File name" value={input.file_name} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, file_name: event.target.value } : item) })} /><button type="button" className="icon-button" aria-label={`Remove input ${index + 1}`} onClick={() => update({ ...node, inputs: node.inputs.filter((_, offset) => offset !== index) })}><X size={14} /></button></div><select aria-label={`Input ${index + 1} source`} value={input.source} onChange={(event) => selectOutput(index, event.target.value)}><option value="">Select output</option>{input.source && !choices.some((choice) => choice.source === input.source) && <option value={input.source} disabled>{input.source} (unavailable)</option>}{choices.map((choice) => <option key={choice.source} value={choice.source}>{choice.source}</option>)}</select><input aria-label={`Input ${index + 1} format`} placeholder="Format (optional)" value={input.format ?? ''} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, format: event.target.value || null } : item) })} /><label className="checkbox"><input type="checkbox" checked={input.required} onChange={(event) => update({ ...node, inputs: node.inputs.map((item, offset) => offset === index ? { ...item, required: event.target.checked } : item) })} />Required</label></div>)}</div>
     <div className="field-section">
       <h3>Outputs <button type="button" className="icon-button" aria-label="Add output" onClick={() => update({ ...node, outputs: [...node.outputs, { file_name: '', kind: 'File' }] })}><Plus size={15} /></button></h3>
@@ -380,7 +388,8 @@ function isDraftResource(value: unknown): boolean {
   if (!isJsonObject(value)) return false;
   const { cpu_cores, memory_bytes } = value;
   return typeof cpu_cores === 'number' && Number.isInteger(cpu_cores) && cpu_cores >= 0 && cpu_cores <= 4294967295
-    && typeof memory_bytes === 'number' && Number.isSafeInteger(memory_bytes) && memory_bytes >= 0;
+    && typeof memory_bytes === 'number' && Number.isSafeInteger(memory_bytes) && memory_bytes >= 0
+    && isOptionalGpuMemory(value.gpu_memory_bytes);
 }
 
 function isDraftOverride(value: unknown): boolean {
@@ -403,7 +412,7 @@ function JsonEditor({ value, close, apply, graphId }: { value: string; close: ()
         if (!uuid.test(node.id) || typeof node.name !== 'string' || typeof node.node_type !== 'string' || !Array.isArray(node.inputs) || !Array.isArray(node.outputs)) throw new Error('Each node needs a UUID, name, node_type, inputs, and outputs.');
         if (node.settings !== undefined) {
           const settings = node.settings;
-          if (!settings || !isJsonObject(settings.config) || !isDraftResource(settings.resource) || typeof settings.timeout !== 'string') throw new Error('Node settings need a JSON config object, resource.cpu_cores, resource.memory_bytes, and a duration-string timeout.');
+          if (!settings || !isJsonObject(settings.config) || !isDraftResource(settings.resource) || typeof settings.timeout !== 'string') throw new Error('Node settings need a JSON config object, resource.cpu_cores, resource.memory_bytes, and a duration-string timeout. GPU memory must be positive whole bytes when specified.');
           if (settings.overrides !== undefined && (!isJsonObject(settings.overrides) || !Object.values(settings.overrides).every(isDraftOverride))) throw new Error('Node overrides must be an object keyed by override name. Each override can specify annotation_match, config, resource, and timeout.');
         }
         if (node.inputs.some((input) => !input || typeof input.file_name !== 'string' || typeof input.source !== 'string' || typeof input.required !== 'boolean' || !(input.format === null || typeof input.format === 'string'))) throw new Error('Inputs need file_name, source, required, and format (string or null).');

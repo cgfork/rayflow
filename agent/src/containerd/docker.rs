@@ -6,14 +6,15 @@ use bollard::{
     Docker,
     errors::Error as DockerError,
     models::{
-        ContainerCreateBody, ContainerStateStatusEnum, ContainerStatsResponse, HostConfig, Mount,
-        MountType,
+        ContainerCreateBody, ContainerStateStatusEnum, ContainerStatsResponse, DeviceRequest,
+        HostConfig, Mount, MountType,
     },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
     },
 };
 use futures_util::{Stream, StreamExt};
+use graph::gpu::is_qualified_cdi_device;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,6 +50,11 @@ pub struct DockerSpec {
     pub cpu_cores: u32,
     /// Memory limit in bytes; zero leaves the Docker memory limit unset.
     pub memory_bytes: u64,
+    /// GPU memory reserved by the scheduler, in bytes.
+    #[serde(default)]
+    pub gpu_memory_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_gpu_cdi_device: Option<String>,
 }
 
 impl TryFrom<&scheduler::Job> for DockerSpec {
@@ -86,15 +92,34 @@ impl TryFrom<&scheduler::Job> for DockerSpec {
                 .transpose()?,
             cpu_cores: job.required_cpu_cores,
             memory_bytes: job.required_memory_bytes,
+            gpu_memory_bytes: job.required_gpu_memory_bytes,
+            assigned_gpu_cdi_device: job.assigned_gpu_cdi_device.clone(),
         })
     }
 }
 
 impl DockerSpec {
-    fn create_body(&self) -> Result<ContainerCreateBody, Error> {
+    fn create_body(&self, gpu_cdi_devices: &[String]) -> Result<ContainerCreateBody, Error> {
         let memory = i64::try_from(self.memory_bytes).map_err(|error| {
             Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
         })?;
+        let device_requests = if self.gpu_memory_bytes > 0 {
+            let device = self.assigned_gpu_cdi_device.as_deref().ok_or_else(|| {
+                Error::Provider("GPU job requires a CDI device assignment on this agent".into())
+            })?;
+            if !gpu_cdi_devices.iter().any(|name| name == device) {
+                return Err(Error::Provider(format!(
+                    "assigned GPU CDI device {device:?} is unavailable on this agent"
+                )));
+            }
+            Some(vec![DeviceRequest {
+                driver: Some("cdi".into()),
+                device_ids: Some(vec![device.into()]),
+                ..Default::default()
+            }])
+        } else {
+            None
+        };
         let mut env = self.env.clone();
         for (key, value) in self.files.iter().flat_map(|file| &file.env) {
             let env = env.get_or_insert_with(Vec::new);
@@ -123,6 +148,7 @@ impl DockerSpec {
                 nano_cpus: (self.cpu_cores > 0)
                     .then_some(i64::from(self.cpu_cores) * 1_000_000_000),
                 memory: (memory > 0).then_some(memory),
+                device_requests,
                 ..Default::default()
             }),
             ..Default::default()
@@ -138,6 +164,7 @@ fn container_name(job_id: Uuid) -> String {
 #[derive(Clone, Debug)]
 pub struct DockerContainerd {
     docker: Docker,
+    gpu_cdi_devices: Vec<String>,
 }
 
 /// A reconnectable handle for one Docker container.
@@ -154,7 +181,28 @@ pub struct DockerContainer {
 impl DockerContainerd {
     /// Creates a provider connection from an existing Bollard client.
     pub fn new(docker: Docker) -> Self {
-        Self { docker }
+        Self {
+            docker,
+            gpu_cdi_devices: Vec::new(),
+        }
+    }
+
+    /// Configures the qualified CDI names available for GPU assignments.
+    pub fn with_gpu_cdi_devices(
+        mut self,
+        devices: impl IntoIterator<Item = String>,
+    ) -> Result<Self, Error> {
+        let devices = devices.into_iter().collect::<Vec<_>>();
+        if devices
+            .iter()
+            .any(|device| !is_qualified_cdi_device(device))
+        {
+            return Err(Error::Settings(
+                "gpu_devices must contain qualified CDI device names",
+            ));
+        }
+        self.gpu_cdi_devices = devices;
+        Ok(self)
     }
 
     /// Connects to Docker using Bollard's standard local environment.
@@ -384,7 +432,7 @@ impl Containerd for DockerContainerd {
     }
 
     async fn create(&self, spec: Self::Spec<'_>) -> Result<Self::Container, Error> {
-        let body = spec.create_body()?;
+        let body = spec.create_body(&self.gpu_cdi_devices)?;
         let options = CreateContainerOptionsBuilder::new()
             .name(&spec.name)
             .build();
@@ -467,7 +515,9 @@ mod tests {
             ]
         }))
         .unwrap();
-        let body = spec.create_body().unwrap();
+        let body = spec
+            .create_body(&["nvidia.com/gpu=0".into(), "nvidia.com/gpu=1".into()])
+            .unwrap();
         assert_eq!(
             body.env.unwrap(),
             [
@@ -476,7 +526,9 @@ mod tests {
                 "SCRIPT_FILE=/shared/script.lua"
             ],
         );
-        let mounts = body.host_config.unwrap().mounts.unwrap();
+        let host_config = body.host_config.unwrap();
+        assert!(host_config.device_requests.is_none());
+        let mounts = host_config.mounts.unwrap();
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].typ, Some(MountType::BIND));
         assert_eq!(mounts[0].source.as_deref(), Some("/host/artifact"));
@@ -484,6 +536,71 @@ mod tests {
         assert_eq!(mounts[0].read_only, Some(true));
         assert_eq!(mounts[1].target.as_deref(), Some("/result"));
         assert_eq!(mounts[1].read_only, Some(false));
+    }
+
+    #[test]
+    fn requests_only_the_assigned_cdi_gpu_for_each_job() {
+        let task = event::task::Task::new(Uuid::nil(), Uuid::nil(), Uuid::nil(), 1);
+        let mut job = scheduler::Job::new(&task, Uuid::nil(), Uuid::nil(), Uuid::nil());
+        let now = Timestamp::now();
+        let gpu_memory_bytes = 8 * 1024 * 1024 * 1024;
+        job.required_cpu_cores = 1;
+        job.required_memory_bytes = 64 * 1024 * 1024;
+        job.required_gpu_memory_bytes = gpu_memory_bytes;
+        job.node_config = Some(scheduler::actuator::NodeConfig {
+            id: 1,
+            uuid: Uuid::nil(),
+            node_id: Uuid::nil(),
+            version: 1,
+            name: "default".into(),
+            annotation_match: String::new(),
+            config: json!({ "image": "fixture" }),
+            lease: Some(30_000),
+            required_cpu_cores: job.required_cpu_cores,
+            required_memory_bytes: job.required_memory_bytes,
+            required_gpu_memory_bytes: gpu_memory_bytes,
+            created_at: now,
+            updated_at: now,
+            created_by: "test".into(),
+            updated_by: "test".into(),
+        })
+        .into();
+
+        let devices = [
+            String::from("vendor.example/gpu=GPU-00:01"),
+            String::from("vendor.example/gpu=1"),
+        ];
+        for device in &devices {
+            job.assigned_gpu_cdi_device = Some(device.clone());
+            let spec = DockerSpec::try_from(&job).unwrap();
+            let host_config = spec.create_body(&devices).unwrap().host_config.unwrap();
+            assert_eq!(host_config.memory, Some(64 * 1024 * 1024));
+            assert!(host_config.devices.is_none());
+            assert_eq!(
+                serde_json::to_value(host_config).unwrap()["DeviceRequests"],
+                json!([{ "Driver": "cdi", "DeviceIDs": [device] }]),
+            );
+        }
+
+        job.assigned_gpu_cdi_device = Some("vendor.example/gpu=unconfigured".into());
+        let spec = DockerSpec::try_from(&job).unwrap();
+        assert!(matches!(
+            spec.create_body(&devices),
+            Err(Error::Provider(_))
+        ));
+
+        job.assigned_gpu_cdi_device = None;
+        let spec = DockerSpec::try_from(&job).unwrap();
+        assert_eq!(spec.gpu_memory_bytes, gpu_memory_bytes);
+        assert!(matches!(
+            spec.create_body(&devices),
+            Err(Error::Provider(_))
+        ));
+        assert!(matches!(spec.create_body(&[]), Err(Error::Provider(_))));
+        assert!(matches!(
+            spec.create_body(&devices[..1]),
+            Err(Error::Provider(_))
+        ));
     }
 
     #[test]
