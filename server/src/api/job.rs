@@ -11,19 +11,21 @@ use axum::{
 use catalog::{PresignedUrl, model::Catalog};
 use event::task_event::TaskEvent;
 use graph::{GraphStore, types::DAG};
-use scheduler::{AgentRef, JobArtifactName, ResourceCapacity};
+use scheduler::{AgentRef, GpuDevice, JobArtifactName, ResourceCapacity};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
 
-/// Claim jobs with aggregate requirements that fit this agent's total budget.
+/// Claim jobs within this agent's CPU, memory, and per-device GPU budgets.
 /// Existing claims reserve part of that budget. Poll once at a time per agent ID.
 #[derive(Debug, Deserialize)]
 pub struct PollJobsRequest {
     pub agent_id: Uuid,
     pub batch: usize,
     pub resources: ResourceCapacity,
+    #[serde(default)]
+    pub gpu_devices: Vec<GpuDevice>,
     #[serde(default)]
     pub active_jobs: Vec<Uuid>,
     /// Idle wait in milliseconds; defaults to a random half-to-full configured timeout.
@@ -446,16 +448,14 @@ async fn poll<S>(
         )));
     }
     let deadline = Instant::now() + request.wait(app.config.poll_timeout);
+    let agent = AgentRef::new(request.agent_id, request.resources, request.active_jobs)
+        .with_gpu_devices(request.gpu_devices)
+        .map_err(|error| AppError::InvalidRequest(error.into()))?;
     loop {
-        let mut agent = AgentRef::new(
-            request.agent_id,
-            request.resources,
-            request.active_jobs.clone(),
-        );
-        let jobs = app.poll(&mut agent, request.batch).await?;
+        let jobs = app.poll(&mut agent.clone(), request.batch).await?;
         let response = PollJobsResponse { jobs };
         if !response.jobs.is_empty()
-            || !request.active_jobs.is_empty()
+            || !agent.active_jobs().is_empty()
             || Instant::now() >= deadline
         {
             return Ok(Json(response));

@@ -102,6 +102,8 @@ async fn assert_migrated(db: &mut Db) {
     assert_eq!(run_config.annotation.0["label"], "original");
     assert_eq!(node_config.config["image"], "example");
     assert_eq!(node_config.name, "default");
+    assert_eq!(node_config.required_gpu_memory_bytes, 0);
+    assert_eq!(node_config.required_gpu_cdi_device, None);
     assert_eq!(run_config.created_by, "creator");
     assert_eq!(run_config.updated_by, "updater");
     assert_eq!(node_config.created_by, "creator");
@@ -112,6 +114,9 @@ async fn assert_migrated(db: &mut Db) {
     assert_eq!(job.node_config_id, node_config.uuid);
     assert_eq!(job.run_config_id, run_config.uuid);
     assert_eq!(job.status, Status::Succeeded);
+    assert_eq!(job.required_gpu_memory_bytes, 0);
+    assert_eq!(job.required_gpu_cdi_device, None);
+    assert_eq!(job.assigned_gpu_cdi_device, None);
     assert!(sql::query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'job' AND COLUMN_NAME IN ('node_run_uuid', 'node_config_uuid', 'run_config_uuid')")
         .exec(&mut *db).await.unwrap().is_empty());
     let indexes = sql::query("SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'job' AND INDEX_NAME IN ('idx_job_node_run_id', 'idx_job_node_config_id', 'idx_job_run_config_id')")

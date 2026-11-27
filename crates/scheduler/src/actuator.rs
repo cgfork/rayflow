@@ -233,6 +233,13 @@ pub struct NodeConfig {
     pub required_cpu_cores: u32,
     /// Minimum available memory required by jobs created from this config.
     pub required_memory_bytes: u64,
+    /// Minimum available GPU memory in bytes required by jobs created from this config.
+    #[default(0)]
+    #[serde(default)]
+    pub required_gpu_memory_bytes: u64,
+    #[column(type = varchar(255))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_gpu_cdi_device: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     #[column(type = varchar(64))]
@@ -300,6 +307,17 @@ pub struct Job {
     pub required_cpu_cores: u32,
     /// Minimum memory capacity required to run this job.
     pub required_memory_bytes: u64,
+    /// Minimum GPU memory capacity in bytes required to run this job.
+    #[default(0)]
+    #[serde(default)]
+    pub required_gpu_memory_bytes: u64,
+    #[column(type = varchar(255))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_gpu_cdi_device: Option<String>,
+    /// Device selected when the agent claimed this job.
+    #[column(type = varchar(255))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_gpu_cdi_device: Option<String>,
     /// Agent currently holding the polling lease, if any.
     #[index]
     #[column(type = "CHAR(36)")]
@@ -376,6 +394,9 @@ impl Job {
             status: Status::Scheduled,
             required_cpu_cores: 0,
             required_memory_bytes: 0,
+            required_gpu_memory_bytes: 0,
+            required_gpu_cdi_device: None,
+            assigned_gpu_cdi_device: None,
             agent_id: None,
             polled_at: None,
             expired_at: None,
@@ -430,6 +451,8 @@ impl Job {
         entry.node_run_id = node_run.uuid;
         entry.required_cpu_cores = node_config.required_cpu_cores;
         entry.required_memory_bytes = node_config.required_memory_bytes;
+        entry.required_gpu_memory_bytes = node_config.required_gpu_memory_bytes;
+        entry.required_gpu_cdi_device = node_config.required_gpu_cdi_device.clone();
         entry.write(backend).await?;
         Ok(Self::filter_by_uuid(entry.uuid).get(backend).await?)
     }
@@ -472,6 +495,9 @@ where
             .status(self.status)
             .required_cpu_cores(self.required_cpu_cores)
             .required_memory_bytes(self.required_memory_bytes)
+            .required_gpu_memory_bytes(self.required_gpu_memory_bytes)
+            .required_gpu_cdi_device(self.required_gpu_cdi_device.clone())
+            .assigned_gpu_cdi_device(self.assigned_gpu_cdi_device.clone())
             .agent_id(self.agent_id)
             .polled_at(self.polled_at)
             .expired_at(self.expired_at)

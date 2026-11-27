@@ -4,6 +4,7 @@ use std::fmt;
 use uuid::Uuid;
 
 use crate::annotation_match::AnnotationMatch;
+use crate::gpu::is_qualified_cdi_device;
 use crate::types::{AssetRef, DAG, DEFAULT_NODE_CONFIG_NAME, NamedNodeSettings, Node, Output};
 use crate::{Graph, Id};
 
@@ -108,6 +109,10 @@ pub enum WorkflowValidationError {
     InvalidResources { node: String },
     #[error("{node}: memory exceeds the supported limit")]
     MemoryLimit { node: String },
+    #[error("{node}: GPU memory must be positive when specified")]
+    InvalidGpuMemory { node: String },
+    #[error("{node}: a qualified GPU CDI device requires positive GPU memory")]
+    InvalidGpuCdiDevice { node: String },
     #[error("{node}: timeout must be positive whole milliseconds within timestamp range")]
     InvalidTimeout { node: String },
     #[error("{node}: Docker image is required")]
@@ -273,6 +278,14 @@ fn validate_node_settings(
     if settings.resource.memory_bytes > i64::MAX as u64 {
         return Err(WorkflowValidationError::MemoryLimit { node: label() });
     }
+    if settings.resource.gpu_memory_bytes == Some(0) {
+        return Err(WorkflowValidationError::InvalidGpuMemory { node: label() });
+    }
+    if let Some(device) = &settings.resource.gpu_cdi_device
+        && (settings.resource.gpu_memory_bytes.is_none() || !is_qualified_cdi_device(device))
+    {
+        return Err(WorkflowValidationError::InvalidGpuCdiDevice { node: label() });
+    }
     if settings.timeout_ms().is_none() {
         return Err(WorkflowValidationError::InvalidTimeout { node: label() });
     }
@@ -346,7 +359,7 @@ pub fn unreferenced_outputs(graph: &DAG) -> Vec<UnreferencedOutput<'_>> {
 }
 
 #[cfg(test)]
-mod asset_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -376,6 +389,34 @@ mod asset_tests {
         assert!(matches!(
             validate_assets(&node),
             Err(WorkflowValidationError::InvalidAssetPath { .. }),
+        ));
+    }
+
+    #[test]
+    fn gpu_selector_requires_positive_memory_and_a_qualified_name() {
+        let mut node: Node = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(), "name": "task", "node_type": "docker",
+            "settings": {
+                "config": {"image": "alpine"},
+                "resource": {"cpu_cores": 1, "memory_bytes": 1024, "gpu_cdi_device": "nvidia.com/gpu=1"},
+                "timeout": "30s",
+            },
+            "inputs": [], "outputs": [],
+        }))
+        .unwrap();
+        let validate = |node: &Node| {
+            validate_node_settings(node, &node.settings.named_settings().next().unwrap())
+        };
+        assert!(matches!(
+            validate(&node),
+            Err(WorkflowValidationError::InvalidGpuCdiDevice { .. }),
+        ));
+        node.settings.resource.gpu_memory_bytes = Some(4096);
+        validate(&node).unwrap();
+        node.settings.resource.gpu_cdi_device = Some("/dev/nvidia1".into());
+        assert!(matches!(
+            validate(&node),
+            Err(WorkflowValidationError::InvalidGpuCdiDevice { .. }),
         ));
     }
 }

@@ -28,7 +28,7 @@ use graph::{
 use jiff::Timestamp;
 use runtime::command::{NodeRun, Run};
 use scheduler::{
-    Job, ResourceCapacity,
+    GpuDevice, Job, ResourceCapacity,
     actuator::{NodeConfig, Status},
 };
 use serde_json::json;
@@ -156,6 +156,8 @@ impl Workflow {
             lease: Some(30_000),
             required_cpu_cores: 1,
             required_memory_bytes: 64 * 1024 * 1024,
+            required_gpu_memory_bytes: 0,
+            required_gpu_cdi_device: None,
             created_at: now,
             updated_at: now,
             created_by: "test".into(),
@@ -175,6 +177,7 @@ impl Workflow {
         job.expired_at = Some(now.checked_add(config.job_lease().unwrap()).unwrap());
         job.required_cpu_cores = config.required_cpu_cores;
         job.required_memory_bytes = config.required_memory_bytes;
+        job.required_gpu_memory_bytes = config.required_gpu_memory_bytes;
         job.run = self.run.clone().into();
         job.node_run = self.node_run.clone().into();
         job.node_config = Some(config).into();
@@ -599,12 +602,22 @@ async fn yield_and_resume_isolate_job_data_and_keep_unarchived_files() {
 
 #[tokio::test]
 async fn restarting_during_execution_preserves_container_and_recovers_failure() {
-    let workflow = Workflow::new(false);
+    let mut workflow = Workflow::new(false);
+    let gpu_cdi_device = "vendor.example/gpu=1";
+    workflow.settings.gpu_devices = ["vendor.example/gpu=0", gpu_cdi_device]
+        .into_iter()
+        .map(|device| GpuDevice {
+            cdi_device: device.into(),
+            memory_bytes: 1024,
+        })
+        .collect();
     let provider = FakeProvider::default();
     let usage = example_usage();
     provider.0.lock().unwrap().usage = Some(usage.clone());
     let manager = workflow.open(provider.clone()).await;
-    let job = workflow.claim("fixture-image", "exit 7");
+    let mut job = workflow.claim("fixture-image", "exit 7");
+    job.required_gpu_memory_bytes = 1024;
+    job.assigned_gpu_cdi_device = Some(gpu_cdi_device.into());
     let dir = workflow.job_dir(job.uuid);
     let output = workflow.data_dir(job.uuid).join("outputs/checkpoint.txt");
 
@@ -616,11 +629,15 @@ async fn restarting_during_execution_preserves_container_and_recovers_failure() 
     let manager = workflow.open(provider.clone()).await;
     let recovered = recover_job(&manager, job.uuid).await;
     assert_eq!(recovered.expired_at, job.expired_at);
-    let start = manager.start(recovered);
-    assert_eq!(manager.active_job_ids(), vec![job.uuid]);
+    assert_eq!(
+        recovered.assigned_gpu_cdi_device,
+        job.assigned_gpu_cdi_device
+    );
     let mut redelivery = job.clone();
     redelivery.expired_at = Some(Timestamp::now());
-    tokio::join!(start, manager.start(redelivery));
+    let start = manager.start(redelivery);
+    assert_eq!(manager.active_job_ids(), vec![job.uuid]);
+    tokio::join!(start, manager.start(recovered));
     assert_eq!(provider.0.lock().unwrap().starts, 1);
 
     let sample_started = Arc::new(Notify::new());
@@ -634,7 +651,12 @@ async fn restarting_during_execution_preserves_container_and_recovers_failure() 
     drop(manager);
 
     let manager = workflow.open(provider).await;
-    manager.start(recover_job(&manager, job.uuid).await).await;
+    let recovered = recover_job(&manager, job.uuid).await;
+    assert_eq!(
+        recovered.assigned_gpu_cdi_device.as_deref(),
+        Some(gpu_cdi_device)
+    );
+    manager.start(recovered).await;
     let result = manager.result(job.uuid).await.unwrap().unwrap();
     assert_outcome(&result, JobOutcome::Failed);
     assert_eq!(result.exit_code, 7);

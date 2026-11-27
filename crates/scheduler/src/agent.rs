@@ -7,13 +7,41 @@ use event::{
     task_event::{TaskEvent, TaskEventEntry},
 };
 use jiff::Timestamp;
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 use toasty::{Executor, schema::Model, stmt::IntoStatement};
 use uuid::Uuid;
 
 const JOB_PAGE_SIZE: usize = 128;
 
-/// Total resource budget for this agent's jobs, including existing claims.
+/// A single CDI device and its usable GPU memory budget in bytes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GpuDevice {
+    pub cdi_device: String,
+    pub memory_bytes: u64,
+}
+
+/// Validates the advertised inventory and returns its total GPU memory budget.
+pub fn validate_gpu_devices(devices: &[GpuDevice]) -> Result<u64, &'static str> {
+    let mut names = HashSet::with_capacity(devices.len());
+    let mut total = 0_u64;
+    for device in devices {
+        if !graph::gpu::is_qualified_cdi_device(&device.cdi_device) {
+            return Err("gpu_devices must contain qualified CDI device names");
+        }
+        if !names.insert(device.cdi_device.as_str()) {
+            return Err("gpu_devices must have unique CDI device names");
+        }
+        if device.memory_bytes == 0 {
+            return Err("gpu_devices must have positive memory budgets");
+        }
+        total = total
+            .checked_add(device.memory_bytes)
+            .ok_or("total GPU memory exceeds the supported limit")?;
+    }
+    Ok(total)
+}
+
+/// Total CPU and RAM budget for this agent's jobs, including existing claims.
 /// Each agent identity must poll sequentially to avoid overlapping budgets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceCapacity {
@@ -24,6 +52,15 @@ pub struct ResourceCapacity {
 impl ResourceCapacity {
     fn exhausted(self) -> bool {
         self.cpu_cores == 0 || self.memory_bytes == 0
+    }
+
+    fn fits(self, job: &Job) -> bool {
+        job.required_cpu_cores <= self.cpu_cores && job.required_memory_bytes <= self.memory_bytes
+    }
+
+    fn reserve(&mut self, job: &Job) {
+        self.cpu_cores = self.cpu_cores.saturating_sub(job.required_cpu_cores);
+        self.memory_bytes = self.memory_bytes.saturating_sub(job.required_memory_bytes);
     }
 }
 
@@ -54,6 +91,7 @@ pub struct AgentRef {
     id: Uuid,
     active_jobs: Vec<Uuid>,
     resource: ResourceCapacity,
+    gpu_devices: Vec<GpuDevice>,
 }
 
 impl AgentRef {
@@ -62,7 +100,15 @@ impl AgentRef {
             id,
             active_jobs,
             resource,
+            gpu_devices: Vec::new(),
         }
+    }
+
+    /// Configures the named device budgets reported by this agent.
+    pub fn with_gpu_devices(mut self, gpu_devices: Vec<GpuDevice>) -> Result<Self, &'static str> {
+        validate_gpu_devices(&gpu_devices)?;
+        self.gpu_devices = gpu_devices;
+        Ok(self)
     }
 
     pub fn id(&self) -> Uuid {
@@ -75,6 +121,93 @@ impl AgentRef {
 
     pub fn active_jobs(&self) -> &[Uuid] {
         &self.active_jobs
+    }
+
+    pub fn gpu_devices(&self) -> &[GpuDevice] {
+        &self.gpu_devices
+    }
+
+    /// Total remaining GPU budget across the named devices.
+    pub fn gpu_memory_bytes(&self) -> u64 {
+        self.gpu_devices
+            .iter()
+            .map(|device| device.memory_bytes)
+            .sum()
+    }
+
+    fn max_gpu_memory_bytes(&self) -> u64 {
+        self.gpu_devices
+            .iter()
+            .map(|device| device.memory_bytes)
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// SQL prefilters by the largest available single device. Exact name and
+    /// placement checks run before claiming individual candidates.
+    fn fitting_jobs(&self) -> toasty::stmt::Expr<bool> {
+        Job::fields()
+            .required_cpu_cores()
+            .le(self.resource.cpu_cores)
+            .and(
+                Job::fields()
+                    .required_memory_bytes()
+                    .le(self.resource.memory_bytes),
+            )
+            .and(
+                Job::fields()
+                    .required_gpu_memory_bytes()
+                    .le(self.max_gpu_memory_bytes()),
+            )
+    }
+
+    fn fitting_gpu_devices<'a>(&'a self, job: &'a Job) -> impl Iterator<Item = &'a GpuDevice> {
+        self.gpu_devices.iter().filter(move |device| {
+            device.memory_bytes >= job.required_gpu_memory_bytes
+                && job
+                    .required_gpu_cdi_device
+                    .as_ref()
+                    .is_none_or(|name| name == &device.cdi_device)
+        })
+    }
+
+    /// Returns a fitting device for a GPU job, or a device-free assignment
+    /// for an eligible CPU job.
+    fn gpu_assignment(&self, job: &Job) -> Option<Option<String>> {
+        if !self.resource.fits(job) {
+            return None;
+        }
+        if job.required_gpu_memory_bytes == 0 {
+            return job.required_gpu_cdi_device.is_none().then_some(None);
+        }
+        self.fitting_gpu_devices(job)
+            .min_by_key(|device| (device.memory_bytes, &device.cdi_device))
+            .map(|device| Some(device.cdi_device.clone()))
+    }
+
+    fn can_redeliver(&self, job: &Job) -> bool {
+        self.resource.fits(job)
+            && match (job.required_gpu_memory_bytes, &job.assigned_gpu_cdi_device) {
+                (0, None) => job.required_gpu_cdi_device.is_none(),
+                (1.., Some(assigned)) => self
+                    .fitting_gpu_devices(job)
+                    .any(|device| assigned == &device.cdi_device),
+                _ => false,
+            }
+    }
+
+    fn reserve(&mut self, job: &Job) {
+        self.resource.reserve(job);
+        if let Some(name) = &job.assigned_gpu_cdi_device
+            && let Some(device) = self
+                .gpu_devices
+                .iter_mut()
+                .find(|device| name == &device.cdi_device)
+        {
+            device.memory_bytes = device
+                .memory_bytes
+                .saturating_sub(job.required_gpu_memory_bytes);
+        }
     }
 
     /// Redelivers inactive Polled jobs and resets their lifetime on delivery.
@@ -93,16 +226,7 @@ impl AgentRef {
                 .filter(Job::fields().status().eq(Status::Polled))
                 .filter(Job::fields().expired_at().gt(Some(now)))
                 .filter(Job::fields().uuid().in_list(self.active_jobs.clone()).not())
-                .filter(
-                    Job::fields()
-                        .required_cpu_cores()
-                        .le(self.resource.cpu_cores),
-                )
-                .filter(
-                    Job::fields()
-                        .required_memory_bytes()
-                        .le(self.resource.memory_bytes),
-                )
+                .filter(self.fitting_jobs())
                 .filter(Job::fields().id().gt(after_id))
                 .include(Job::fields().task())
                 .include(Job::fields().run())
@@ -116,9 +240,7 @@ impl AgentRef {
             let page_ended = candidates.len() < page_size;
             for mut job in candidates {
                 after_id = job.id;
-                if job.required_cpu_cores > self.resource.cpu_cores
-                    || job.required_memory_bytes > self.resource.memory_bytes
-                {
+                if !self.can_redeliver(&job) {
                     continue;
                 }
                 let lifetime = job.job_lease()?;
@@ -136,7 +258,13 @@ impl AgentRef {
                         .status()
                         .eq(Status::Polled)
                         .and(Job::fields().agent_id().eq(Some(self.id)))
-                        .and(Job::fields().expired_at().eq(job.expired_at)),
+                        .and(Job::fields().expired_at().eq(job.expired_at))
+                        .and(
+                            Job::fields()
+                                .assigned_gpu_cdi_device()
+                                .eq(job.assigned_gpu_cdi_device.clone()),
+                        )
+                        .and(self.fitting_jobs()),
                 )
                 .await?;
                 if !updated {
@@ -145,8 +273,7 @@ impl AgentRef {
                 job.polled_at = Some(now);
                 job.expired_at = Some(expired_at);
                 job.updated_at = now;
-                self.resource.cpu_cores -= job.required_cpu_cores;
-                self.resource.memory_bytes -= job.required_memory_bytes;
+                self.reserve(&job);
                 claimed.push(job);
                 if claimed.len() == maximum || self.resource.exhausted() {
                     break;
@@ -178,14 +305,7 @@ impl AgentRef {
             let page_ended = active.len() < JOB_PAGE_SIZE;
             for job in active {
                 after_id = job.id;
-                self.resource.cpu_cores = self
-                    .resource
-                    .cpu_cores
-                    .saturating_sub(job.required_cpu_cores);
-                self.resource.memory_bytes = self
-                    .resource
-                    .memory_bytes
-                    .saturating_sub(job.required_memory_bytes);
+                self.reserve(&job);
             }
             if page_ended {
                 break;
@@ -219,11 +339,13 @@ impl AgentRef {
             let ids: Vec<u64> = toasty::sql::query(format!(
                 "SELECT id FROM `{table}` WHERE status = 'Scheduled' AND id > ? \
                  AND required_cpu_cores <= ? AND required_memory_bytes <= ? \
+                 AND required_gpu_memory_bytes <= ? \
                  ORDER BY id ASC LIMIT ? FOR UPDATE SKIP LOCKED",
             ))
             .bind(after_id)
             .bind(self.resource.cpu_cores)
             .bind(self.resource.memory_bytes)
+            .bind(self.max_gpu_memory_bytes())
             .bind(page_size as u64)
             .column_types([toasty::stmt::Type::U64])
             .exec(&mut *backend)
@@ -248,11 +370,9 @@ impl AgentRef {
                 .exec(&mut *backend)
                 .await?;
             for mut job in candidates {
-                if job.required_cpu_cores > self.resource.cpu_cores
-                    || job.required_memory_bytes > self.resource.memory_bytes
-                {
+                let Some(assigned_device) = self.gpu_assignment(&job) else {
                     continue;
-                }
+                };
                 let lifetime = job.job_lease()?;
                 let expired_at = now
                     .checked_add(lifetime)
@@ -265,20 +385,12 @@ impl AgentRef {
                         .agent_id(Some(self.id))
                         .polled_at(Some(now))
                         .expired_at(Some(expired_at))
+                        .assigned_gpu_cdi_device(assigned_device.clone())
                         .updated_at(now),
                     Job::fields()
                         .status()
                         .eq(Status::Scheduled)
-                        .and(
-                            Job::fields()
-                                .required_cpu_cores()
-                                .le(self.resource.cpu_cores),
-                        )
-                        .and(
-                            Job::fields()
-                                .required_memory_bytes()
-                                .le(self.resource.memory_bytes),
-                        ),
+                        .and(self.fitting_jobs()),
                 )
                 .await?;
                 if updated {
@@ -287,8 +399,8 @@ impl AgentRef {
                     job.polled_at = Some(now);
                     job.expired_at = Some(expired_at);
                     job.updated_at = now;
-                    self.resource.cpu_cores -= job.required_cpu_cores;
-                    self.resource.memory_bytes -= job.required_memory_bytes;
+                    job.assigned_gpu_cdi_device = assigned_device;
+                    self.reserve(&job);
                     claimed.push(job);
                     if claimed.len() == maximum || self.resource.exhausted() {
                         break;
@@ -352,6 +464,7 @@ impl<B: Executor> JobPoll<B> for AgentRef {
         }
         tx.commit().await?;
         self.resource = agent.resource;
+        self.gpu_devices = agent.gpu_devices;
         Ok(claimed.into_iter())
     }
 }
@@ -556,5 +669,120 @@ async fn update_if<B: Executor>(
         Ok(()) => Ok(true),
         Err(error) if error.is_condition_failed() || error.is_record_not_found() => Ok(false),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GPU_0: &str = "nvidia.com/gpu=0";
+    const GPU_1: &str = "nvidia.com/gpu=1";
+
+    fn gpu(cdi_device: &str, memory_bytes: u64) -> GpuDevice {
+        GpuDevice {
+            cdi_device: cdi_device.into(),
+            memory_bytes,
+        }
+    }
+
+    fn gpu_agent(devices: Vec<GpuDevice>) -> AgentRef {
+        AgentRef::new(
+            Uuid::nil(),
+            ResourceCapacity {
+                cpu_cores: 8,
+                memory_bytes: 8192,
+            },
+            Vec::new(),
+        )
+        .with_gpu_devices(devices)
+        .unwrap()
+    }
+
+    fn job(gpu_memory: u64) -> Job {
+        let task = Task::new(Uuid::nil(), Uuid::nil(), Uuid::nil(), 0);
+        let mut job = Job::new(&task, Uuid::nil(), Uuid::nil(), Uuid::nil());
+        job.required_cpu_cores = 1;
+        job.required_memory_bytes = 1024;
+        job.required_gpu_memory_bytes = gpu_memory;
+        job
+    }
+
+    #[test]
+    fn inventory_requires_qualified_unique_devices_and_positive_budgets() {
+        assert_eq!(
+            validate_gpu_devices(&[gpu(GPU_0, 4), gpu(GPU_1, 8)]),
+            Ok(12)
+        );
+        assert!(validate_gpu_devices(&[gpu("/dev/nvidia0", 4)]).is_err());
+        assert!(validate_gpu_devices(&[gpu(GPU_0, 0)]).is_err());
+        assert!(validate_gpu_devices(&[gpu(GPU_0, 4), gpu(GPU_0, 8)]).is_err());
+        assert!(validate_gpu_devices(&[gpu(GPU_0, u64::MAX), gpu(GPU_1, 1)]).is_err());
+    }
+
+    #[test]
+    fn packs_on_a_single_device_with_a_stable_tie_break() {
+        let mut agent = gpu_agent(vec![gpu(GPU_1, 8192), gpu(GPU_0, 8192)]);
+        let mut placed = job(4096);
+        assert_eq!(agent.gpu_memory_bytes(), 16384);
+        assert_eq!(agent.max_gpu_memory_bytes(), 8192);
+        assert_eq!(agent.gpu_assignment(&job(8193)), None);
+        placed.assigned_gpu_cdi_device = agent.gpu_assignment(&placed).unwrap();
+        assert_eq!(placed.assigned_gpu_cdi_device.as_deref(), Some(GPU_0));
+        agent.reserve(&placed);
+        assert_eq!(agent.gpu_assignment(&job(4096)), Some(Some(GPU_0.into())));
+        assert_eq!(agent.gpu_assignment(&job(4097)), Some(Some(GPU_1.into())));
+        agent.reserve(&placed);
+        assert_eq!(agent.gpu_assignment(&job(4096)), Some(Some(GPU_1.into())));
+    }
+
+    #[test]
+    fn pins_requested_and_redelivered_devices() {
+        let mut agent = gpu_agent(vec![gpu(GPU_0, 4096), gpu(GPU_1, 8192)]);
+        let mut pinned = job(4096);
+        pinned.required_gpu_cdi_device = Some(GPU_1.into());
+        assert_eq!(agent.gpu_assignment(&pinned), Some(Some(GPU_1.into())));
+        let mut claim = job(4096);
+        claim.status = Status::Polled;
+        claim.assigned_gpu_cdi_device = Some(GPU_1.into());
+        assert!(agent.can_redeliver(&claim));
+        agent.reserve(&claim);
+        pinned.required_gpu_memory_bytes = 4097;
+        assert_eq!(agent.gpu_assignment(&pinned), None);
+        claim.assigned_gpu_cdi_device = Some("nvidia.com/gpu=2".into());
+        assert!(!agent.can_redeliver(&claim));
+    }
+
+    #[test]
+    fn gpu_redelivery_requires_an_existing_assignment() {
+        let mut claim = job(4096);
+        claim.status = Status::Polled;
+        let agent = gpu_agent(vec![gpu(GPU_0, 8192)]);
+        assert!(!agent.can_redeliver(&claim));
+
+        claim.assigned_gpu_cdi_device = Some(GPU_0.into());
+        assert!(agent.can_redeliver(&claim));
+        claim.required_gpu_cdi_device = Some(GPU_1.into());
+        assert!(!agent.can_redeliver(&claim));
+    }
+
+    #[test]
+    fn reserves_gpu_memory_without_exhausting_capacity_for_cpu_jobs() {
+        let cpu_job = job(0);
+        let mut gpu_job = job(4096);
+
+        let cpu_agent = gpu_agent(Vec::new());
+        assert_eq!(cpu_agent.max_gpu_memory_bytes(), 0);
+        assert_eq!(cpu_agent.gpu_assignment(&cpu_job), Some(None));
+        assert_eq!(cpu_agent.gpu_assignment(&gpu_job), None);
+        assert!(cpu_agent.can_redeliver(&cpu_job));
+        assert!(!cpu_agent.can_redeliver(&gpu_job));
+
+        let mut agent = gpu_agent(vec![gpu(GPU_0, 4096)]);
+        gpu_job.assigned_gpu_cdi_device = agent.gpu_assignment(&gpu_job).unwrap();
+        agent.reserve(&gpu_job);
+        assert_eq!(agent.gpu_memory_bytes(), 0);
+        assert_eq!(agent.gpu_assignment(&gpu_job), None);
+        assert_eq!(agent.gpu_assignment(&cpu_job), Some(None));
     }
 }

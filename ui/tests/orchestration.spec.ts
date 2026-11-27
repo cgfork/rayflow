@@ -166,11 +166,19 @@ test('CEL annotation overrides can be added, edited, saved, and removed before p
 
   await page.goto(home);
   await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+  const gpuMemory = page.getByRole('spinbutton', { name: 'GPU memory (MiB)', exact: true });
+  const gpuDevice = page.getByRole('textbox', { name: 'GPU CDI device', exact: true });
+  await expect(gpuMemory).toHaveValue('');
+  await gpuDevice.fill('nvidia.com/gpu=0');
+  await expect(page.getByRole('button', { name: 'Publish', exact: true })).toBeDisabled();
+  await gpuMemory.fill('0');
+  await expect(page.getByRole('button', { name: 'Publish', exact: true })).toBeDisabled();
+  await gpuMemory.fill('2048');
   await page.getByRole('button', { name: 'Edit override legacy' }).click();
   const edit = page.getByRole('dialog', { name: 'Edit annotation override' });
   await expect(edit.getByLabel('Annotation match (CEL)')).toHaveValue(existing.annotation_match);
   await expect(edit.getByRole('textbox', { name: 'Docker configuration JSON' })).toHaveText('');
-  await expect(edit.getByLabel('Override CPU and memory')).not.toBeChecked();
+  await expect(edit.getByLabel('Override resources')).not.toBeChecked();
   await expect(edit.getByLabel('Timeout')).toHaveValue(existing.timeout);
   await edit.getByLabel('Override name').fill('dataset');
   await edit.getByLabel('Timeout').clear();
@@ -189,22 +197,31 @@ test('CEL annotation overrides can be added, edited, saved, and removed before p
   await add.getByLabel('Override name').fill('priority');
   await add.getByLabel('Annotation match (CEL)').fill(annotationMatch);
   await add.getByLabel('Timeout').fill('45s');
-  await add.getByLabel('Override CPU and memory').check();
+  await add.getByLabel('Override resources').check();
   await add.getByLabel('CPU cores').fill('2');
-  await add.getByLabel('Memory (MiB)').fill('64');
+  await add.getByLabel('Memory (MiB)', { exact: true }).fill('64');
+  await add.getByLabel('GPU memory (MiB)').fill('4096');
+  await add.getByLabel('GPU CDI device').fill('nvidia.com/gpu=1');
   await add.getByRole('textbox', { name: 'Docker configuration JSON' }).fill(JSON.stringify(config, null, 2));
   await apply.click();
   await expect(add).toBeHidden();
 
   await page.getByRole('button', { name: 'Save draft', exact: true }).click();
   await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
-  const priority = { annotation_match: annotationMatch, config, resource: { cpu_cores: 2, memory_bytes: 64 * 1048576 }, timeout: '45s' };
-  expect(draft.nodes[0].settings).toEqual({ ...node.settings, overrides: { dataset: { annotation_match: existing.annotation_match }, priority } });
+  const priority = { annotation_match: annotationMatch, config, resource: { cpu_cores: 2, memory_bytes: 64 * 1048576, gpu_memory_bytes: 4096 * 1048576, gpu_cdi_device: 'nvidia.com/gpu=1' }, timeout: '45s' };
+  expect(draft.nodes[0].settings).toEqual({
+    ...node.settings,
+    resource: { ...node.settings.resource, gpu_memory_bytes: 2048 * 1048576, gpu_cdi_device: 'nvidia.com/gpu=0' },
+    overrides: { dataset: { annotation_match: existing.annotation_match }, priority },
+  });
 
+  await gpuDevice.clear();
+  await gpuMemory.clear();
   await page.getByRole('button', { name: 'Remove override dataset' }).click();
   await page.getByRole('button', { name: 'Publish', exact: true }).click();
   await page.getByRole('dialog', { name: 'Publish workflow' }).getByRole('button', { name: 'Publish version' }).click();
   await expect(page.getByText(`Published ${report.name} · v1.`, { exact: true })).toBeVisible();
+  expect(published?.nodes[0].settings.resource).toEqual(node.settings.resource);
   expect(published?.nodes[0].settings.overrides).toEqual({ priority });
 });
 
@@ -731,7 +748,7 @@ test('Diff shows node and connection changes on the canvas and their before and 
   const afterPlan: GraphNode = {
     ...beforePlan,
     name: 'Plan cleanup',
-    settings: { config: { image: 'alpine', command: ['run'] }, resource: { cpu_cores: 2, memory_bytes: 1024 }, timeout: '20s' },
+    settings: { config: { image: 'alpine', command: ['run'] }, resource: { cpu_cores: 2, memory_bytes: 1024, gpu_memory_bytes: 4294967296, gpu_cdi_device: 'nvidia.com/gpu=1' }, timeout: '20s' },
     inputs: [{ ...beforePlan.inputs[0], required: false }],
     outputs: [{ file_name: 'summary.txt', kind: 'File' }],
   };
@@ -764,6 +781,8 @@ test('Diff shows node and connection changes on the canvas and their before and 
               { field: 'resource', change: [
                 { field: 'cpu_cores', change: [1, 2] },
                 { field: 'memory_bytes', change: [512, 1024] },
+                { field: 'gpu_memory_bytes', change: [null, 4294967296] },
+                { field: 'gpu_cdi_device', change: [null, 'nvidia.com/gpu=1'] },
               ] },
               { field: 'timeout', change: ['10s', '20s'] },
               { field: 'overrides', change: [
@@ -829,6 +848,8 @@ test('Diff shows node and connection changes on the canvas and their before and 
   await expect(config.last()).toContainText('"command":');
   await expect(nodeChanges.getByRole('row', { name: /Settings · CPU cores/ }).getByRole('cell')).toHaveText(['1', '2']);
   await expect(nodeChanges.getByRole('row', { name: /Settings · Memory/ }).getByRole('cell')).toHaveText(['512', '1024']);
+  await expect(nodeChanges.getByRole('row', { name: /Settings · GPU memory/ }).getByRole('cell')).toHaveText(['—', '4294967296']);
+  await expect(nodeChanges.getByRole('row', { name: /Settings · GPU CDI device/ }).getByRole('cell')).toHaveText(['—', 'nvidia.com/gpu=1']);
   await expect(nodeChanges.getByRole('row', { name: /Settings · Timeout/ }).getByRole('cell')).toHaveText(['10s', '20s']);
   const override = nodeChanges.getByRole('row', { name: /Settings · Override · fast/ }).getByRole('cell');
   await expect(override.first()).toContainText('"timeout": "5s"');

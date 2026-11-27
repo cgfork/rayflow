@@ -3,6 +3,8 @@ import type { Graph, GraphNode, NodeSettings, Output } from './types';
 
 const utf8 = new TextEncoder();
 
+export const bytesPerMiB = 1048576;
+
 export function isJsonObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -18,6 +20,18 @@ export function isAssetPath(path: string): boolean {
 
 export function isOverrideNameValid(name: string): boolean {
   return name !== 'default' && !name.endsWith(' ') && utf8.encode(name).length <= 255;
+}
+
+export function isOptionalGpuMemory(bytes: unknown): boolean {
+  return bytes == null || (typeof bytes === 'number' && Number.isSafeInteger(bytes) && bytes > 0);
+}
+
+export function isOptionalGpuCdiDevice(device: unknown, memory: unknown): boolean {
+  return device == null || (typeof device === 'string'
+    && device.length <= 255
+    && /^[A-Za-z](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?\/[A-Za-z](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?=[A-Za-z0-9](?:[A-Za-z0-9_.:-]*[A-Za-z0-9])?$/.test(device)
+    && typeof memory === 'number'
+    && isOptionalGpuMemory(memory));
 }
 
 export function createGraph(name: string): Graph {
@@ -102,6 +116,8 @@ function validateNodeSettings(label: string, settings: NodeSettings | undefined,
   const memory = resource?.memory_bytes ?? 0;
   if (!Number.isInteger(cpu) || cpu < 1 || cpu > 4294967295) errors.push(`${label}: CPU cores must be a positive integer.`);
   if (!Number.isSafeInteger(memory) || memory < 1) errors.push(`${label}: Memory must be positive whole bytes within the supported range.`);
+  if (!isOptionalGpuMemory(resource?.gpu_memory_bytes)) errors.push(`${label}: GPU memory must be positive whole bytes within the supported range when specified.`);
+  if (!isOptionalGpuCdiDevice(resource?.gpu_cdi_device, resource?.gpu_memory_bytes)) errors.push(`${label}: Specify a qualified GPU CDI device name and positive GPU memory.`);
   const milliseconds = typeof timeout === 'string' ? durationMilliseconds(timeout) : NaN;
   if (!Number.isSafeInteger(milliseconds) || milliseconds < 1) errors.push(`${label}: Timeout must be a positive duration such as 10s or 250ms.`);
 }

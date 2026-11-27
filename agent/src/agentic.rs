@@ -34,12 +34,14 @@ impl Agentic {
     /// Opens the configured workdir with Docker and HTTP connections.
     pub async fn new(settings: Settings) -> Result<Self, Error> {
         let client = Client::new(settings)?;
-        let manager = JobManager::open(
-            DockerContainerd::connect_with_defaults()?,
-            client.clone(),
-            client,
-        )
-        .await?;
+        let docker = DockerContainerd::connect_with_defaults()?.with_gpu_cdi_devices(
+            client
+                .settings()
+                .gpu_devices
+                .iter()
+                .map(|device| device.cdi_device.clone()),
+        )?;
+        let manager = JobManager::open(docker, client.clone(), client).await?;
         Ok(Self::with_manager(manager))
     }
 }
@@ -106,12 +108,10 @@ where
         let settings = self.manager.settings();
         self.manager
             .client()
-            .poll(&PollRequest {
-                agent_id: settings.id,
-                batch: settings.batch,
-                resources: settings.resources,
-                active_jobs: self.manager.active_job_ids(),
-            })
+            .poll(&PollRequest::from_settings(
+                settings,
+                self.manager.active_job_ids(),
+            ))
             .await
     }
 

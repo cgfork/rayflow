@@ -1,7 +1,7 @@
 use catalog::model::Catalog;
 use graph::GraphStore;
 use graph::types::DAG;
-use scheduler::{Job, JobArtifactName, ResourceCapacity};
+use scheduler::{GpuDevice, Job, JobArtifactName, ResourceCapacity};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -68,7 +68,21 @@ pub struct PollRequest {
     pub agent_id: Uuid,
     pub batch: usize,
     pub resources: ResourceCapacity,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gpu_devices: Vec<GpuDevice>,
     pub active_jobs: Vec<Uuid>,
+}
+
+impl PollRequest {
+    pub(crate) fn from_settings(settings: &Settings, active_jobs: Vec<Uuid>) -> Self {
+        Self {
+            agent_id: settings.id,
+            batch: settings.batch,
+            resources: settings.resources,
+            gpu_devices: settings.gpu_devices.clone(),
+            active_jobs,
+        }
+    }
 }
 
 #[derive(Deserialize)]

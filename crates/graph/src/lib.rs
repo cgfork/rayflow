@@ -1,6 +1,7 @@
 pub mod annotation_match;
 pub mod diff;
 mod fork_point;
+pub mod gpu;
 pub mod pagination;
 pub mod store;
 pub mod types;

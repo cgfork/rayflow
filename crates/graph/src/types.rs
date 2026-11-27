@@ -151,6 +151,12 @@ impl Diff for AssetRef {
 pub struct Resource {
     pub cpu_cores: u32,
     pub memory_bytes: u64,
+    /// Minimum GPU memory in bytes, when the job requests a GPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_bytes: Option<u64>,
+    /// Exact qualified CDI device required by the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_cdi_device: Option<String>,
 }
 
 /// A changed resource field and its before and after values.
@@ -159,6 +165,8 @@ pub struct Resource {
 pub enum ResourceDiff {
     CpuCores((u32, u32)),
     MemoryBytes((u64, u64)),
+    GpuMemoryBytes((Option<u64>, Option<u64>)),
+    GpuCdiDevice((Option<String>, Option<String>)),
 }
 
 impl Diff for Resource {
@@ -168,6 +176,9 @@ impl Diff for Resource {
         field_diffs([
             value_diff(&self.cpu_cores, &other.cpu_cores).map(ResourceDiff::CpuCores),
             value_diff(&self.memory_bytes, &other.memory_bytes).map(ResourceDiff::MemoryBytes),
+            value_diff(&self.gpu_memory_bytes, &other.gpu_memory_bytes)
+                .map(ResourceDiff::GpuMemoryBytes),
+            value_diff(&self.gpu_cdi_device, &other.gpu_cdi_device).map(ResourceDiff::GpuCdiDevice),
         ])
     }
 }
@@ -672,20 +683,35 @@ mod tests {
     }
 
     #[test]
-    fn resource_diff_reports_both_changed_limits() {
+    fn resource_diff_reports_changed_requirements() {
         let before = Resource {
             cpu_cores: 1,
             memory_bytes: 512,
+            gpu_memory_bytes: None,
+            gpu_cdi_device: None,
         };
         let after = Resource {
             cpu_cores: 2,
             memory_bytes: 1024,
+            gpu_memory_bytes: Some(4096),
+            gpu_cdi_device: Some("nvidia.com/gpu=1".into()),
         };
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            json!({"cpu_cores": 1, "memory_bytes": 512})
+        );
+        assert_eq!(
+            serde_json::from_value::<Resource>(json!({"cpu_cores": 1, "memory_bytes": 512}))
+                .unwrap(),
+            before
+        );
         assert_eq!(
             before.diff(&after),
             Some(vec![
                 ResourceDiff::CpuCores((1, 2)),
                 ResourceDiff::MemoryBytes((512, 1024)),
+                ResourceDiff::GpuMemoryBytes((None, Some(4096))),
+                ResourceDiff::GpuCdiDevice((None, Some("nvidia.com/gpu=1".into()))),
             ])
         );
     }

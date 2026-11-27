@@ -201,6 +201,8 @@ fn graph(asset_id: Uuid) -> DAG {
                 resource: Resource {
                     cpu_cores: 1,
                     memory_bytes: 1024,
+                    gpu_memory_bytes: None,
+                    gpu_cdi_device: None,
                 },
                 timeout: Duration::from_secs(60),
                 ..Default::default()

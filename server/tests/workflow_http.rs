@@ -24,7 +24,7 @@ use runtime::{
     command::{CommandResult, NodeRun, Run, RunConfig},
 };
 use scheduler::{
-    Actuator, Job,
+    Actuator, GpuDevice, Job,
     actuator::{NodeConfig, Status},
 };
 use serde_json::{Value, json};
@@ -139,6 +139,8 @@ fn workflow() -> DAG {
                 resource: Resource {
                     cpu_cores: 1,
                     memory_bytes: 512,
+                    gpu_memory_bytes: None,
+                    gpu_cdi_device: None,
                 },
                 timeout: Duration::from_secs(120),
                 overrides: Default::default(),
@@ -552,6 +554,229 @@ async fn workflow_yields_resumes_presigns_artifacts_and_stops_at_failure() {
     support::with_test_database(run_workflow).await;
 }
 
+const GPU_MEMORY_BYTES: u64 = 4096;
+const GPU_0_CDI: &str = "nvidia.com/gpu=0";
+const GPU_1_CDI: &str = "nvidia.com/gpu=1";
+
+async fn start_gpu_workflows(db: &toasty::Db, devices: &[&str]) -> Router {
+    let app = router(App::new(db.clone(), Config::default(), db.clone()));
+    let mut actuator = Actuator::new(Backend::new(db.clone(), db.clone()), 64);
+    let mut graph = workflow();
+    let graph_id = graph.id;
+    let node = &mut graph.nodes[0];
+    node.node_type = "docker".into();
+    node.settings.config = json!({"image": "example"});
+    for (name, gpu_cdi_device) in [("gpu", None), ("gpu-pinned", Some(GPU_0_CDI.into()))] {
+        node.settings.overrides.insert(
+            name.into(),
+            AnnotationMatchNodeSettings {
+                annotation_match: Some(format!("annotations.device == '{name}'")),
+                resource: Some(Resource {
+                    gpu_memory_bytes: Some(GPU_MEMORY_BYTES),
+                    gpu_cdi_device,
+                    ..node.settings.resource.clone()
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    request(
+        &app,
+        Method::PUT,
+        &format!("/graphs/{graph_id}/draft"),
+        json!({"graph": graph}),
+        StatusCode::OK,
+    )
+    .await;
+    post(
+        &app,
+        &format!("/graphs/{graph_id}/publish"),
+        json!({}),
+        StatusCode::CREATED,
+    )
+    .await;
+    for device in devices {
+        post(
+            &app,
+            "/runs/start",
+            json!({"data_id": Uuid::new_v4(), "graph_id": graph_id, "annotations": {"device": device}}),
+            StatusCode::ACCEPTED,
+        )
+        .await;
+    }
+    assert_eq!(actuator.tick().await.unwrap().tasks, devices.len());
+    app
+}
+
+async fn poll_gpu(
+    app: &Router,
+    agent_id: Uuid,
+    devices: &[GpuDevice],
+    active_jobs: &[Uuid],
+) -> Vec<Job> {
+    let response: PollJobsResponse = serde_json::from_value(
+        post(
+            app,
+            "/jobs/poll",
+            json!({
+                "agent_id": agent_id,
+                "batch": 8,
+                "resources": {"cpu_cores": 8, "memory_bytes": 4096},
+                "gpu_devices": devices,
+                "active_jobs": active_jobs,
+                "wait_ms": 0
+            }),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    response.jobs
+}
+
+fn gpu_device(cdi_device: &str, memory_bytes: u64) -> GpuDevice {
+    GpuDevice {
+        cdi_device: cdi_device.into(),
+        memory_bytes,
+    }
+}
+
+#[tokio::test]
+async fn gpu_device_budgets_are_individual_and_inventory_is_reported() {
+    support::with_test_database(|mut db| async move {
+        let app = start_gpu_workflows(&db, &["gpu-pinned"]).await;
+        let job = Job::all().first().exec(&mut db).await.unwrap().unwrap();
+        let config = NodeConfig::filter_by_uuid(job.node_config_id)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(config.required_gpu_cdi_device.as_deref(), Some(GPU_0_CDI));
+        assert_eq!(job.required_gpu_cdi_device.as_deref(), Some(GPU_0_CDI));
+        assert_eq!(job.assigned_gpu_cdi_device, None);
+
+        let agent_id = Uuid::new_v4();
+        let devices = [
+            gpu_device(GPU_0_CDI, GPU_MEMORY_BYTES - 1),
+            gpu_device(GPU_1_CDI, GPU_MEMORY_BYTES - 1),
+        ];
+        assert!(poll_gpu(&app, agent_id, &devices, &[]).await.is_empty());
+        let inventory = scheduler::AgentInstance::filter_by_uuid(agent_id)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(inventory.gpu_memory_bytes, 2 * (GPU_MEMORY_BYTES - 1));
+        assert_eq!(inventory.gpu_devices.unwrap().0, devices);
+        let job = Job::filter_by_uuid(job.uuid).get(&mut db).await.unwrap();
+        assert_eq!(job.status, Status::Scheduled);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn gpu_jobs_claim_and_redeliver_on_their_assigned_devices() {
+    support::with_test_database(|mut db| async move {
+        let app = start_gpu_workflows(&db, &["gpu", "gpu-pinned", "gpu"]).await;
+        let agent_id = Uuid::new_v4();
+        let devices = [
+            gpu_device(GPU_0_CDI, 2 * GPU_MEMORY_BYTES),
+            gpu_device(GPU_1_CDI, GPU_MEMORY_BYTES),
+        ];
+        let jobs = poll_gpu(&app, agent_id, &devices, &[]).await;
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].assigned_gpu_cdi_device.as_deref(), Some(GPU_1_CDI));
+        assert_eq!(jobs[1].required_gpu_cdi_device.as_deref(), Some(GPU_0_CDI));
+        for job in &jobs[1..] {
+            assert_eq!(job.assigned_gpu_cdi_device.as_deref(), Some(GPU_0_CDI));
+        }
+        let job = Job::filter_by_uuid(jobs[0].uuid)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(job.assigned_gpu_cdi_device.as_deref(), Some(GPU_1_CDI));
+
+        let active = [jobs[1].uuid, jobs[2].uuid];
+        let without_original = [gpu_device(GPU_0_CDI, 3 * GPU_MEMORY_BYTES)];
+        assert!(
+            poll_gpu(&app, agent_id, &without_original, &active)
+                .await
+                .is_empty()
+        );
+        let redelivered = poll_gpu(&app, agent_id, &devices, &active).await;
+        assert_eq!(redelivered.len(), 1);
+        assert_eq!(redelivered[0].uuid, job.uuid);
+        assert_eq!(
+            redelivered[0].assigned_gpu_cdi_device.as_deref(),
+            Some(GPU_1_CDI)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn scalar_gpu_memory_does_not_create_device_capacity() {
+    support::with_test_database(|mut db| async move {
+        let app = start_gpu_workflows(&db, &["gpu"]).await;
+        let job = Job::all().first().exec(&mut db).await.unwrap().unwrap();
+        let config = NodeConfig::filter_by_uuid(job.node_config_id)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(config.name, "gpu");
+        assert_eq!(config.required_gpu_memory_bytes, GPU_MEMORY_BYTES);
+        assert_eq!(job.required_gpu_memory_bytes, GPU_MEMORY_BYTES);
+
+        let agent_id = Uuid::new_v4();
+        assert!(poll(&app, agent_id).await.is_empty());
+        let response = post(
+            &app,
+            "/jobs/poll",
+            json!({
+                "agent_id": agent_id,
+                "batch": 8,
+                "resources": {"cpu_cores": 8, "memory_bytes": 4096, "gpu_memory_bytes": GPU_MEMORY_BYTES},
+                "wait_ms": 0
+            }),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(response["jobs"], json!([]));
+        let inventory = scheduler::AgentInstance::filter_by_uuid(agent_id)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(inventory.gpu_memory_bytes, 0);
+        assert!(inventory.gpu_devices.is_none());
+        let job = Job::filter_by_uuid(job.uuid).get(&mut db).await.unwrap();
+        assert_eq!(job.status, Status::Scheduled);
+        assert_eq!(job.agent_id, None);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn gpu_jobs_are_claimed_by_agents_with_a_named_device() {
+    support::with_test_database(|db| async move {
+        let app = start_gpu_workflows(&db, &["gpu", "cpu"]).await;
+
+        let cpu_only = poll_gpu(&app, Uuid::new_v4(), &[], &[]).await;
+        assert_eq!(cpu_only.len(), 1);
+        assert_eq!(cpu_only[0].required_gpu_memory_bytes, 0);
+        assert_eq!(cpu_only[0].assigned_gpu_cdi_device, None);
+
+        let agent_id = Uuid::new_v4();
+        let devices = [gpu_device(GPU_0_CDI, GPU_MEMORY_BYTES)];
+        let gpu_jobs = poll_gpu(&app, agent_id, &devices, &[]).await;
+        assert_eq!(gpu_jobs.len(), 1);
+        let job = &gpu_jobs[0];
+        let config = job.node_config.get().as_ref().unwrap();
+        assert_eq!(config.name, "gpu");
+        assert_eq!(config.required_gpu_memory_bytes, GPU_MEMORY_BYTES);
+        assert_eq!(job.required_gpu_memory_bytes, GPU_MEMORY_BYTES);
+        assert_eq!(job.assigned_gpu_cdi_device.as_deref(), Some(GPU_0_CDI));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn job_config_matching_and_fallback_use_the_node_run_version() {
     support::with_test_database(|mut db| async move {
@@ -743,6 +968,10 @@ async fn invalid_node_overrides_leave_the_graph_unpublished() {
             ),
             ("unknown", json!({"annotation_match": "priority == 'high'"})),
             ("jsonpath", json!({"annotation_match": "$.priority"})),
+            (
+                "zero_gpu",
+                json!({"resource": {"cpu_cores": 1, "memory_bytes": 512, "gpu_memory_bytes": 0}}),
+            ),
         ] {
             graph["nodes"][0]["settings"]["overrides"] = json!({(name): value});
             request(
