@@ -5,12 +5,12 @@
 //! under the job's data directory.
 
 use crate::client::Transfer as CatalogTransfer;
-use catalog::PresignOperation;
 use catalog::directory::{
     DIRECTORY_FORMAT, DIRECTORY_MANIFEST, DirectoryEntry, DirectoryManifest, EntryKind,
     MAX_MANIFEST_BYTES,
 };
 use catalog::path::validate_relative_path;
+use catalog::{PresignOperation, PresignedUrl};
 use graph::types::{Kind, Node};
 use scheduler::{Job, JobArtifactName};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,8 @@ use uuid::Uuid;
 use crate::{client::Client, errors::Error, read_json, write_json};
 
 mod assets;
+
+use assets::AssetDownload;
 
 pub(crate) const ASSET_DIR: &str = "asset";
 
@@ -573,15 +575,20 @@ impl JobTransfer {
         let _ = request.send().await;
     }
 
-    async fn response(&self, transfer: &CatalogTransfer) -> Result<reqwest::Response, Error> {
-        if transfer.presigned.operation != PresignOperation::Download {
-            return Err(artifact("server returned the wrong download operation"));
-        }
-        let mut request = self.objects.get(&transfer.presigned.url);
-        for (name, value) in &transfer.presigned.headers {
+    fn object_get(&self, presigned: &PresignedUrl) -> reqwest::RequestBuilder {
+        let mut request = self.objects.get(&presigned.url);
+        for (name, value) in &presigned.headers {
             request = request.header(name, value);
         }
-        Ok(request
+        request
+    }
+
+    async fn response(&self, presigned: &PresignedUrl) -> Result<reqwest::Response, Error> {
+        if presigned.operation != PresignOperation::Download {
+            return Err(artifact("server returned the wrong download operation"));
+        }
+        Ok(self
+            .object_get(presigned)
             .send()
             .await
             .map_err(reqwest::Error::without_url)?
@@ -593,7 +600,7 @@ impl JobTransfer {
         if transfer.catalog.size > MAX_MANIFEST_BYTES {
             return Err(artifact("directory manifest is too large"));
         }
-        let mut response = self.response(transfer).await?;
+        let mut response = self.response(&transfer.presigned).await?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -624,12 +631,12 @@ impl JobTransfer {
         &self,
         transfer: &CatalogTransfer,
         destination: &Path,
-        expected_sha256: Option<&str>,
+        asset: Option<&AssetDownload<'_>>,
     ) -> Result<(), Error> {
         if transfer.multipart && transfer.catalog.size > self.client.settings().multipart_threshold
         {
             return self
-                .download_file_ranges(transfer, destination, expected_sha256)
+                .download_file_ranges(transfer, destination, asset)
                 .await;
         }
         let parent = destination
@@ -643,8 +650,17 @@ impl JobTransfer {
             .open(&temporary)
             .await?;
         let result = async {
-            let mut response = self.response(transfer).await?;
+            let mut response = match (self.response(&transfer.presigned).await, asset) {
+                (Err(Error::Http(error)), Some(asset))
+                    if error.status() == Some(reqwest::StatusCode::FORBIDDEN) =>
+                {
+                    let refreshed = self.refresh_asset_download(asset, transfer).await?;
+                    self.response(&refreshed).await?
+                }
+                (response, _) => response?,
+            };
             let mut size = 0u64;
+            let expected_sha256 = asset.map(|asset| asset.sha256);
             let mut digest = expected_sha256.map(|_| Sha256::new());
             while let Some(chunk) = response
                 .chunk()
@@ -681,7 +697,7 @@ impl JobTransfer {
         &self,
         transfer: &CatalogTransfer,
         destination: &Path,
-        expected_sha256: Option<&str>,
+        asset: Option<&AssetDownload<'_>>,
     ) -> Result<(), Error> {
         let parent = destination
             .parent()
@@ -697,20 +713,34 @@ impl JobTransfer {
             file.set_len(transfer.catalog.size).await?;
             let mut offset = 0u64;
             let mut etag = None::<String>;
+            let expected_sha256 = asset.map(|asset| asset.sha256);
             let mut digest = expected_sha256.map(|_| Sha256::new());
+            let mut refreshed = None;
             while offset < transfer.catalog.size {
                 let end = (offset + MULTIPART_PART_SIZE)
                     .min(transfer.catalog.size)
                     .saturating_sub(1);
-                let mut request = self
-                    .objects
-                    .get(&transfer.presigned.url)
-                    .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
-                for (name, value) in &transfer.presigned.headers {
-                    request = request.header(name, value);
-                }
-                let response = request.send().await.map_err(reqwest::Error::without_url)?;
-                if expected_sha256.is_some() {
+                let mut can_refresh = true;
+                let response = loop {
+                    let presigned = refreshed.as_ref().unwrap_or(&transfer.presigned);
+                    let response = self
+                        .object_get(presigned)
+                        .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
+                        .send()
+                        .await
+                        .map_err(reqwest::Error::without_url)?;
+                    if let Some(asset) = asset
+                        && can_refresh
+                        && response.status() == reqwest::StatusCode::FORBIDDEN
+                    {
+                        // A new grant retries this range on the same file and digest state.
+                        refreshed = Some(self.refresh_asset_download(asset, transfer).await?);
+                        can_refresh = false;
+                        continue;
+                    }
+                    break response;
+                };
+                if asset.is_some() {
                     response
                         .error_for_status_ref()
                         .map_err(reqwest::Error::without_url)?;

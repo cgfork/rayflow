@@ -349,7 +349,9 @@ update the console origins and include any rules other clients still need.
 ## Shared assets
 
 Migration 27 adds one `asset` row per named version. A ready row points to a
-verified, private object through `catalog_uuid`. Nodes pin the asset version
+verified, private object through `catalog_uuid`. Migration 28 tracks private
+copies while publication is in progress so the server can clean up unused
+copies after a failed commit or restart. Nodes pin the asset version
 UUID in `assets` and choose a relative mount filename:
 
 ```json
@@ -370,16 +372,20 @@ so editing a draft to use another version affects jobs on the new graph.
 | `GET /api/v1/assets/{asset_id}` | Read an exact published version. |
 | `POST /api/v1/assets/prepare` | Reserve an upload with `name`, `version`, `size`, `format`, and hex `sha256`. |
 | `POST /api/v1/assets/{asset_id}/commit` | Verify and publish the staged object selected by `upload_id`. |
+| `POST /api/v1/assets/{name}/versions/{version}/cancel` | Discard a pending version reserved by the calling user. |
 | `POST /api/v1/assets/{name}/versions/{version}/import` | Publish an existing object using `source_key`, `format`, and hex `sha256`. |
-| `POST /api/v1/assets/{asset_id}/download` | Presign a download of the published object. |
+| `POST /api/v1/assets/{asset_id}/download` | Presign a named attachment for the published object. |
 | `POST /api/v1/job/asset/presign` | Presign a job asset selected by `job_id`, `agent_id`, and declared `filename`. |
 
 The browser sends `PUT` directly to the URL from a pending prepare response
-using the returned headers. Configure the bucket according to the
-[S3 CORS requirements](#s3-cors-requirements). On commit Rayflow copies the
-staging object to a private key and verifies its size and SHA-256 before publishing.
-The managed object remains separate from the upload key. Matching retries
-reuse the reservation or return the published version. Configure storage
+using the returned headers and the selected file as the body. The signature
+binds the declared file size to the browser's `Content-Length`. Configure the
+bucket according to the [S3 CORS requirements](#s3-cors-requirements). On commit
+Rayflow checks the staging object's size, copies it to a private key, and
+verifies the copied size and SHA-256 before publishing. Matching retries reuse
+the reservation or return the published version. After an upload attempt,
+**Discard pending upload** releases the calling user's reservation and lets
+them publish different bytes for that version. Configure storage
 lifecycle expiry for objects under the `asset-staging` prefix and retain
 published objects for reruns.
 

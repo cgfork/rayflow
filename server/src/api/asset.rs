@@ -4,6 +4,7 @@ use ::graph::{GraphStore, types::DAG};
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
 };
 use catalog::{PresignedUrl, model::Catalog};
@@ -28,6 +29,10 @@ where
         .route("/assets/{asset_id}", get(read::<S>))
         .route("/assets/{asset_id}/commit", post(commit::<S>))
         .route("/assets/{asset_id}/download", post(download::<S>))
+        .route(
+            "/assets/{name}/versions/{version}/cancel",
+            post(cancel::<S>),
+        )
         .route(
             "/assets/{name}/versions/{version}/import",
             post(import::<S>),
@@ -136,6 +141,15 @@ async fn commit<S>(
     app.commit_asset(asset_id, request.upload_id, actor(&user))
         .await
         .map(Json)
+}
+
+async fn cancel<S>(
+    State(app): State<App<S>>,
+    Path((name, version)): Path<(String, u64)>,
+    user: Option<Extension<User>>,
+) -> Result<StatusCode, AppError> {
+    app.cancel_asset(&name, version, actor(&user)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn download<S>(

@@ -165,6 +165,22 @@ pub struct Asset {
     pub published_at: Option<Timestamp>,
 }
 
+/// A private object copy awaiting publication or removal.
+#[derive(Clone, Debug, toasty::Model)]
+#[table = "asset_promotion"]
+pub struct AssetPromotion {
+    #[key]
+    #[auto]
+    pub id: u64,
+    #[unique]
+    pub uuid: Uuid,
+    #[column(type = varchar(750))]
+    pub url: String,
+    // NULL fences this copy against publication while deletion is retried.
+    #[index]
+    pub expires_at: Option<Timestamp>,
+}
+
 pub fn models() -> toasty::ModelSet {
-    toasty::models!(Catalog, File, Asset)
+    toasty::models!(Catalog, File, Asset, AssetPromotion)
 }

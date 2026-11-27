@@ -16,7 +16,8 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
     routing::{get, post, put},
 };
 use catalog::{
@@ -291,7 +292,7 @@ async fn commit_output(
 }
 
 #[tokio::test]
-async fn verifies_asset_bytes_before_checkpoint_and_restages_missing_files() {
+async fn verifies_asset_bytes_before_checkpoint_and_on_cache_reuse() {
     let root = tempdir().unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let settings = Settings::new(
@@ -370,13 +371,162 @@ async fn verifies_asset_bytes_before_checkpoint_and_restages_missing_files() {
         .unwrap();
     assert_eq!(fs::read(&staged).await.unwrap(), SOURCE);
     assert_eq!(fixture.traffic.lock().unwrap().calls.len(), 4);
-    fs::remove_file(&staged).await.unwrap();
+    // Same length and name, different bytes.
+    fs::write(&staged, b"wrong bytes\0\xff").await.unwrap();
     transfer
         .prepare_assets(&fixture.job, &data, &node)
         .await
         .unwrap();
     assert_eq!(fs::read(&staged).await.unwrap(), SOURCE);
     assert_eq!(fixture.traffic.lock().unwrap().calls.len(), 6);
+
+    fs::remove_file(&staged).await.unwrap();
+    transfer
+        .prepare_assets(&fixture.job, &data, &node)
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&staged).await.unwrap(), SOURCE);
+    assert_eq!(fixture.traffic.lock().unwrap().calls.len(), 8);
+
+    // Checkpoints created by older agents lack evidence of verified bytes.
+    fs::write(
+        data.join(".rayflow")
+            .join(fixture.job.uuid.to_string())
+            .join("assets-ready.json"),
+        serde_json::to_vec(&node.assets).unwrap(),
+    )
+    .await
+    .unwrap();
+    transfer
+        .prepare_assets(&fixture.job, &data, &node)
+        .await
+        .unwrap();
+    assert_eq!(fixture.traffic.lock().unwrap().calls.len(), 10);
+    server.abort();
+}
+
+#[tokio::test]
+async fn refreshes_asset_grants_without_restarting_completed_ranges() {
+    const PART_SIZE: usize = 8 * 1024 * 1024;
+    const SIZE: usize = 2 * PART_SIZE + 1;
+
+    let root = tempdir().unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut settings = Settings::new(
+        Uuid::new_v4(),
+        format!("http://{}", listener.local_addr().unwrap()),
+        root.path().join("jobs"),
+        ResourceCapacity {
+            cpu_cores: 1,
+            memory_bytes: 1,
+        },
+    );
+    settings.multipart_threshold = 1;
+    let fixture = Arc::new(Fixture::new(settings.server_url.clone(), settings.id));
+    let asset_id = Uuid::new_v4();
+    let catalog_id = Uuid::new_v4();
+    let mut node = fixture.graph.nodes[1].clone();
+    node.assets.push(AssetRef {
+        asset_id,
+        file_name: "asset.bin".into(),
+    });
+    let mut bytes = vec![1; SIZE];
+    bytes[PART_SIZE..2 * PART_SIZE].fill(2);
+    bytes[SIZE - 1] = 3;
+    let bytes = Bytes::from(bytes);
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let object = bytes.clone();
+
+    let routes = Router::new()
+        .route(
+            "/api/v1/job/asset/presign",
+            post(
+                move |State(fixture): State<Arc<Fixture>>, Json(claim): Json<Claim>| async move {
+                    fixture.verify_claim(&claim);
+                    assert_eq!(claim.filename, "asset.bin");
+                    let grant = {
+                        let mut traffic = fixture.traffic.lock().unwrap();
+                        let grant = 1 + traffic
+                            .calls
+                            .iter()
+                            .filter(|call| call.starts_with("grant "))
+                            .count();
+                        traffic.calls.push(format!("grant {grant}"));
+                        grant
+                    };
+                    let mut transfer = fixture.transfer(
+                        catalog_id,
+                        "asset",
+                        SIZE as u64,
+                        "application/octet-stream",
+                        PresignOperation::Download,
+                        "ranged-asset",
+                    );
+                    transfer.multipart = true;
+                    transfer
+                        .presigned
+                        .headers
+                        .insert(SIGNATURE.into(), grant.to_string());
+                    let mut body = serde_json::to_value(transfer).unwrap();
+                    body["asset_id"] = json!(asset_id);
+                    body["sha256"] = json!(sha256);
+                    Json(body)
+                },
+            ),
+        )
+        .route(
+            "/objects/ranged-asset",
+            get(
+                move |State(fixture): State<Arc<Fixture>>, headers: HeaderMap| async move {
+                    let grant: usize = headers[SIGNATURE].to_str().unwrap().parse().unwrap();
+                    let range = headers[header::RANGE].to_str().unwrap();
+                    let (start, end) = range
+                        .strip_prefix("bytes=")
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let start: usize = start.parse().unwrap();
+                    let end: usize = end.parse().unwrap();
+                    fixture.record(format!("range {start} with grant {grant}"));
+                    // Each grant expires before the next range begins.
+                    if grant != 1 + start / PART_SIZE {
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        [
+                            (header::CONTENT_RANGE, format!("bytes {start}-{end}/{SIZE}")),
+                            (header::ETAG, "\"pinned\"".into()),
+                        ],
+                        object.slice(start..=end),
+                    )
+                        .into_response()
+                },
+            ),
+        )
+        .with_state(fixture.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let data = root.path().join("job-data");
+    fs::create_dir(&data).await.unwrap();
+    let transfer = JobTransfer::new(Client::new(settings).unwrap()).unwrap();
+    transfer
+        .prepare_assets(&fixture.job, &data, &node)
+        .await
+        .unwrap();
+    assert_eq!(fs::read(data.join("asset/asset.bin")).await.unwrap(), bytes);
+    assert_eq!(
+        fixture.traffic.lock().unwrap().calls,
+        [
+            "grant 1".into(),
+            "range 0 with grant 1".into(),
+            format!("range {PART_SIZE} with grant 1"),
+            "grant 2".into(),
+            format!("range {PART_SIZE} with grant 2"),
+            format!("range {} with grant 2", 2 * PART_SIZE),
+            "grant 3".into(),
+            format!("range {} with grant 3", 2 * PART_SIZE),
+        ]
+    );
     server.abort();
 }
 

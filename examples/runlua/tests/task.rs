@@ -84,6 +84,26 @@ fn runs_a_pinned_script_asset_and_copies_binary_artifacts() {
         [0, 128, 255]
     );
 
+    for prefix in [
+        b"#!/usr/bin/env lua\n".as_slice(),
+        b"\xef\xbb\xbf",
+        b"\xef\xbb\xbf#!/usr/bin/env lua\r\n",
+    ] {
+        fs::write(&script, [prefix, b"print('ok')\n"].concat()).unwrap();
+        let result = run_task(root, &script);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"ok\n");
+    }
+
+    fs::write(&script, b"#!/usr/bin/env lua\nlocal = 1\n").unwrap();
+    let invalid_script = run_task(root, &script);
+    assert!(!invalid_script.status.success());
+    assert!(String::from_utf8_lossy(&invalid_script.stderr).contains("task.lua:2:"));
+
     fs::write(root.join("job.json"), serde_json::to_vec(&job(4)).unwrap()).unwrap();
     let failure = run_task(root, &script);
     assert!(!failure.status.success());

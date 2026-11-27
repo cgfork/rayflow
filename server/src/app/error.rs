@@ -215,6 +215,9 @@ fn storage_error(error: &(dyn std::error::Error + 'static)) -> (StatusCode, &'st
         Error::FileSystem(error) => catalog_error(error),
         Error::CatalogNotFound(_) => (Status::NOT_FOUND, "RAYFLOW_CATALOG_NOT_FOUND"),
         Error::InvalidObjectUrl => (Status::BAD_REQUEST, "RAYFLOW_INVALID_OBJECT_URL"),
+        Error::InvalidAttachmentFilename => {
+            (Status::BAD_REQUEST, "RAYFLOW_INVALID_ATTACHMENT_FILENAME")
+        }
         Error::InvalidExpiry => (Status::BAD_REQUEST, "RAYFLOW_INVALID_PRESIGN_EXPIRY"),
         Error::InvalidMultipart => (Status::BAD_REQUEST, "RAYFLOW_INVALID_MULTIPART_OPERATION"),
         Error::ExpiredCredentials => (

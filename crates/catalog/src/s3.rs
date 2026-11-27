@@ -24,12 +24,12 @@ use crate::{
 
 const MAX_EXPIRES_SECONDS: u64 = 604_800;
 
-const KEY_ENCODING: &AsciiSet = &NON_ALPHANUMERIC
+const PARAM_ENCODING: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
-    .remove(b'~')
-    .remove(b'/');
+    .remove(b'~');
+const KEY_ENCODING: &AsciiSet = &PARAM_ENCODING.remove(b'/');
 
 /// Connection details for an S3-compatible endpoint supporting path-style URLs.
 #[derive(Clone, Debug)]
@@ -115,6 +115,8 @@ pub enum Error<E> {
     InvalidObjectUrl,
     #[error("invalid multipart upload ID or part number")]
     InvalidMultipart,
+    #[error("invalid attachment filename")]
+    InvalidAttachmentFilename,
     #[error("presign lifetime must be a whole number of seconds from 1 to 604800")]
     InvalidExpiry,
     #[error("credentials have expired or have less than one signing second remaining")]
@@ -161,9 +163,23 @@ fn request_uri<E>(
     operation: &PresignOperation,
 ) -> Result<String, Error<E>> {
     if !operation.is_valid() {
+        if matches!(operation, PresignOperation::DownloadAttachment { .. }) {
+            return Err(Error::InvalidAttachmentFilename);
+        }
         return Err(Error::InvalidMultipart);
     }
     let uri = object_uri(endpoint, location)?;
+    if let PresignOperation::DownloadAttachment { filename } = operation {
+        let disposition = if filename.is_ascii() && !filename.contains(['"', '%']) {
+            format!("attachment; filename=\"{filename}\"")
+        } else {
+            let filename = percent_encode(filename.as_bytes(), PARAM_ENCODING);
+            format!("attachment; filename=\"asset\"; filename*=UTF-8''{filename}")
+        };
+        // Append the encoded parameter without parsing the object path again.
+        let disposition = percent_encode(disposition.as_bytes(), PARAM_ENCODING);
+        return Ok(format!("{uri}?response-content-disposition={disposition}"));
+    }
     if !operation.is_multipart() {
         return Ok(uri);
     }
@@ -443,12 +459,18 @@ fn sign_request<E>(
         .build()?
         .into();
     let mut headers = std::collections::BTreeMap::new();
-    if let PresignOperation::Copy { source } = &operation {
-        let source_uri = object_uri(&config.endpoint, source)?;
-        let path = source_uri
-            .strip_prefix(&config.endpoint)
-            .ok_or(Error::InvalidObjectUrl)?;
-        headers.insert("x-amz-copy-source".to_owned(), path.to_owned());
+    match &operation {
+        PresignOperation::UploadSized { size } => {
+            headers.insert("content-length".to_owned(), size.to_string());
+        }
+        PresignOperation::Copy { source } => {
+            let source_uri = object_uri(&config.endpoint, source)?;
+            let path = source_uri
+                .strip_prefix(&config.endpoint)
+                .ok_or(Error::InvalidObjectUrl)?;
+            headers.insert("x-amz-copy-source".to_owned(), path.to_owned());
+        }
+        _ => {}
     }
     let signable = SignableRequest::new(
         operation.method(),
@@ -479,25 +501,34 @@ fn sign_request<E>(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, convert::Infallible};
+
     use super::*;
 
-    #[test]
-    fn copy_signs_the_encoded_source_header_on_the_destination() {
+    fn sign_fixture(uri: &str, operation: PresignOperation) -> PresignedUrl {
         let config = Config::new(
             "https://objects.example",
             Credentials::new("access", "secret", None, None, "test"),
         );
-        let operation = PresignOperation::Copy {
-            source: "s3://fixtures/shared/a%20b.lua".into(),
-        };
-        let signed = sign_request::<std::convert::Infallible>(
+        sign_request::<Infallible>(
             &config,
-            "https://objects.example/fixtures/assets/copy.lua",
+            uri,
             operation,
             Duration::from_secs(60),
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn copy_signs_the_encoded_source_header_on_the_destination() {
+        let operation = PresignOperation::Copy {
+            source: "s3://fixtures/shared/a%20b.lua".into(),
+        };
+        let signed = sign_fixture(
+            "https://objects.example/fixtures/assets/copy.lua",
+            operation,
+        );
         assert_eq!(
             signed.headers["x-amz-copy-source"],
             "/fixtures/shared/a%20b.lua"
@@ -507,5 +538,71 @@ mod tests {
         assert!(url.query_pairs().any(
             |(key, value)| key == "X-Amz-SignedHeaders" && value.contains("x-amz-copy-source")
         ));
+    }
+
+    #[test]
+    fn sized_upload_binds_the_exact_content_length_including_zero() {
+        let uri = "https://objects.example/fixtures/staging/asset.lua";
+        let [empty, nonempty] = [0, 123_456].map(|size| {
+            let operation = PresignOperation::UploadSized { size };
+            assert_eq!(operation.method(), "PUT");
+            let signed = sign_fixture(uri, operation);
+            assert_eq!(signed.headers["content-length"], size.to_string());
+            let url = url::Url::parse(&signed.url).unwrap();
+            let query: BTreeMap<_, _> = url.query_pairs().collect();
+            assert_eq!(query["X-Amz-SignedHeaders"], "content-length;host");
+            query["X-Amz-Signature"].to_string()
+        });
+        assert_ne!(empty, nonempty);
+        let unrestricted = sign_fixture(uri, PresignOperation::Upload);
+        assert!(!unrestricted.headers.contains_key("content-length"));
+    }
+
+    #[test]
+    fn attachment_signs_an_encoded_disposition_and_preserves_the_object_path() {
+        let endpoint = "https://objects.example";
+        let location = "s3://fixtures/dir/../a%20b.lua";
+        let mut signatures = Vec::new();
+        for (filename, disposition) in [
+            ("a b&+.lua", "attachment; filename=\"a b&+.lua\""),
+            (
+                "日本語.lua",
+                "attachment; filename=\"asset\"; filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E.lua",
+            ),
+        ] {
+            let operation = PresignOperation::DownloadAttachment {
+                filename: filename.into(),
+            };
+            assert_eq!(operation.method(), "GET");
+            let uri = request_uri::<Infallible>(endpoint, location, &operation).unwrap();
+            let signed = sign_fixture(&uri, operation);
+            let uri = signed.url.parse::<http::Uri>().unwrap();
+            assert_eq!(uri.path(), "/fixtures/dir/../a%20b.lua");
+            let query: BTreeMap<_, _> =
+                url::form_urlencoded::parse(uri.query().unwrap().as_bytes()).collect();
+            assert_eq!(query["response-content-disposition"], disposition);
+            signatures.push(query["X-Amz-Signature"].to_string());
+        }
+        assert_ne!(signatures[0], signatures[1]);
+    }
+
+    #[test]
+    fn attachment_rejects_path_segments_and_control_characters() {
+        for filename in [
+            "../asset.lua",
+            "dir\\asset.lua",
+            "asset.lua\r\nX-Test: value",
+            "..",
+        ] {
+            let operation = PresignOperation::DownloadAttachment {
+                filename: filename.into(),
+            };
+            let uri = request_uri::<Infallible>(
+                "https://objects.example",
+                "s3://fixtures/assets/asset.lua",
+                &operation,
+            );
+            assert!(matches!(uri, Err(Error::InvalidAttachmentFilename)));
+        }
     }
 }

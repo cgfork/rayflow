@@ -1,5 +1,7 @@
 //! Rayflow API server.
 
+use std::time::Duration;
+
 use server::{App, Config};
 
 /// Runs the API server.
@@ -24,6 +26,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = App::new(db.clone(), config.clone(), db).with_auth(auth);
 
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
+    if config.storage.is_some() {
+        let cleanup = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(error) = cleanup.reap_asset_promotions().await {
+                    tracing::warn!(%error, "could not reconcile private asset copies");
+                }
+            }
+        });
+    }
     tracing::info!(address = %config.addr, "rayflow server listening");
     axum::serve(listener, server::router(state)).await?;
     Ok(())

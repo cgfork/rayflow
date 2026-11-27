@@ -85,6 +85,19 @@ fn read(path: &Path) -> mlua::Result<Vec<u8>> {
     fs::read(path).map_err(|error| mlua::Error::runtime(format!("{}: {error}", path.display())))
 }
 
+fn lua_file_source(bytes: &[u8]) -> &[u8] {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    if bytes.starts_with(b"#") {
+        // Lua skips the first line of executable scripts. Keep the newline
+        // so parser errors still refer to the original file's line numbers.
+        return bytes
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(&[], |newline| &bytes[newline..]);
+    }
+    bytes
+}
+
 fn metadata(path: &Path) -> mlua::Result<serde_json::Value> {
     serde_json::from_slice(&read(path)?)
         .map_err(|error| mlua::Error::runtime(format!("{}: {error}", path.display())))
@@ -252,7 +265,7 @@ fn run(
         chunk_args.push_back(Value::String(value));
     }
     lua.globals().set("arg", args)?;
-    lua.load(&script_bytes)
+    lua.load(lua_file_source(&script_bytes))
         .set_name(format!("@{}", script.display()))
         .set_mode(ChunkMode::Text)
         .call::<()>(chunk_args)

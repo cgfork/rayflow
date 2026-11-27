@@ -333,6 +333,8 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
   };
   const uploadId = 'aa000000-0000-4000-8000-000000000002';
   const uploadUrl = 'https://rustfs.example.test/bucket/asset-staging/upload?signature=fixture';
+  const downloadUrl = 'https://rustfs.example.test/bucket/assets/published?signature=attachment';
+  let abandoned = true;
   let committed = false;
   let uploaded = false;
   let draft = report;
@@ -344,10 +346,17 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
     expect(route.request().postDataJSON()).toEqual({
       name: asset.name, version: asset.version, size: asset.size, format: asset.format, sha256: asset.sha256,
     });
+    if (abandoned) return route.fulfill({ status: 409, json: { error: 'The asset version is already reserved.' } });
     return route.fulfill({ json: {
       state: 'pending', asset_id: asset.asset_id, upload_id: uploadId,
       upload: { operation: 'upload', url: uploadUrl, headers: { 'x-upload-marker': 'staging' } },
     } });
+  });
+  await page.route(`**${api}/assets/${asset.name}/versions/${asset.version}/cancel`, (route) => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().postDataJSON()).toEqual({});
+    abandoned = false;
+    return route.fulfill({ status: 204 });
   });
   await page.route(uploadUrl, (route) => {
     const request = route.request();
@@ -367,6 +376,13 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
     committed = true;
     return route.fulfill({ json: asset });
   });
+  await page.route(`**${api}/assets/${asset.asset_id}/download`, (route) => route.fulfill({
+    json: { presigned: { operation: 'download', url: downloadUrl, headers: {} } },
+  }));
+  await page.context().route(downloadUrl, (route) => route.fulfill({
+    headers: { 'content-type': 'text/html', 'content-disposition': `attachment; filename="${asset.name}"` },
+    body: script,
+  }));
   await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
     if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
     return route.fulfill({ json: draft });
@@ -381,7 +397,16 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
   await assetName.fill(asset.name);
   await upload.getByLabel('File').setInputFiles({ name: 'script.lua', mimeType: asset.format, buffer: script });
   await upload.getByRole('button', { name: 'Publish asset' }).click();
+  await expect(upload.getByRole('alert')).toContainText('The asset version is already reserved.');
+  await upload.getByRole('button', { name: 'Discard pending upload' }).click();
+  await expect(page.getByText('Pending upload discarded.', { exact: true })).toBeVisible();
+  await upload.getByRole('button', { name: 'Publish asset' }).click();
   await expect(page.getByRole('table', { name: 'Published assets' })).toContainText(asset.name);
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: `Download ${asset.name} v${asset.version}` }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe(asset.name);
 
   await page.getByRole('link', { name: /^Orchestration/ }).click();
   await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();

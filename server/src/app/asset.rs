@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, sync::LazyLock, time::Duration};
 use catalog::{
     CatalogOptionalData, CatalogSystem, ObjectStorage, PresignOperation, PresignedUrl,
     directory::DIRECTORY_FORMAT,
-    model::{Asset, Catalog},
+    model::{Asset, AssetPromotion, Catalog},
     path::validate_relative_path,
 };
 use futures_util::StreamExt;
@@ -14,7 +14,7 @@ use jiff::Timestamp;
 use runtime::command::NodeRun;
 use scheduler::Job;
 use sha2::{Digest, Sha256};
-use toasty::{Executor, schema::Model};
+use toasty::{Executor, Transaction, schema::Model};
 use uuid::Uuid;
 
 use super::{App, AppError, Page, PageQuery};
@@ -28,11 +28,12 @@ use crate::{
 
 // Single-request S3 copy supports objects up to five gigabytes.
 const MAX_ASSET_BYTES: u64 = 5_000_000_000;
+const OBJECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 static OBJECTS: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
+        .timeout(OBJECT_REQUEST_TIMEOUT)
         .build()
         .expect("asset storage client")
 });
@@ -46,22 +47,7 @@ struct AssetVersion {
 
 impl AssetVersion {
     fn new(name: String, version: u64, sha256: String, format: String) -> Result<Self, AppError> {
-        if name.is_empty()
-            || name.len() > 255
-            || !name.as_bytes()[0].is_ascii_alphanumeric()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-        {
-            return Err(AppError::InvalidRequest(
-                "asset name must start with an ASCII letter or digit and contain at most 255 ASCII letters, digits, dots, underscores, or hyphens".into(),
-            ));
-        }
-        if version == 0 {
-            return Err(AppError::InvalidRequest(
-                "asset version must be positive".into(),
-            ));
-        }
+        validate_version(&name, version)?;
         if format.is_empty()
             || format.len() > 255
             || !format.bytes().all(|byte| matches!(byte, b' '..=b'~'))
@@ -87,6 +73,26 @@ impl AssetVersion {
         }
         Ok(())
     }
+}
+
+fn validate_version(name: &str, version: u64) -> Result<(), AppError> {
+    if name.is_empty()
+        || name.len() > 255
+        || !name.as_bytes()[0].is_ascii_alphanumeric()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(AppError::InvalidRequest(
+            "asset name must start with an ASCII letter or digit and contain at most 255 ASCII letters, digits, dots, underscores, or hyphens".into(),
+        ));
+    }
+    if version == 0 {
+        return Err(AppError::InvalidRequest(
+            "asset version must be positive".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn decode_digest(digest: &str) -> Option<Vec<u8>> {
@@ -141,6 +147,30 @@ async fn load_asset(db: &mut impl Executor, asset_id: Uuid) -> Result<Asset, App
         .exec(db)
         .await?
         .ok_or(AppError::AssetNotFound(asset_id))
+}
+
+async fn lock_promotion(
+    tx: &mut Transaction<'_>,
+    uuid: Uuid,
+) -> Result<Option<AssetPromotion>, AppError> {
+    let table = tx
+        .schema()
+        .table_for(AssetPromotion::id())
+        .name
+        .replace('`', "``");
+    // Lock the record across the publication or reclamation decision. Toasty
+    // does not expose SELECT FOR UPDATE on model queries.
+    toasty::sql::query(format!(
+        "SELECT id FROM `{table}` WHERE uuid = ? FOR UPDATE"
+    ))
+    .bind(uuid)
+    .column_types([toasty::stmt::Type::U64])
+    .exec(&mut *tx)
+    .await?;
+    Ok(AssetPromotion::filter_by_uuid(uuid)
+        .first()
+        .exec(tx)
+        .await?)
 }
 
 async fn published_catalog(db: &mut impl Executor, asset: &Asset) -> Result<Catalog, AppError> {
@@ -240,15 +270,19 @@ impl<S> App<S> {
         verify_upload_owner(&asset, actor)?;
         let upload_id = asset.upload_id.ok_or(AppError::AssetConflict)?;
         let object = Catalog::new(asset.uuid, "", &asset.source_url, asset.size, &asset.format);
+        let mut upload = self.sign_asset(
+            config,
+            &object,
+            PresignOperation::UploadSized { size: asset.size },
+            config.presign_ttl,
+        )?;
+        upload.operation = PresignOperation::Upload;
+        // Fetch derives the signed Content-Length from the selected File.
+        upload.headers.remove("content-length");
         Ok(PrepareAssetResponse::Pending {
             asset_id: asset.uuid,
             upload_id,
-            upload: self.sign_asset(
-                config,
-                &object,
-                PresignOperation::Upload,
-                config.presign_ttl,
-            )?,
+            upload,
         })
     }
 
@@ -267,6 +301,46 @@ impl<S> App<S> {
             return asset_descriptor(asset);
         }
         self.finalize_asset(asset).await
+    }
+
+    pub(crate) async fn cancel_asset(
+        &self,
+        name: &str,
+        version: u64,
+        actor: &str,
+    ) -> Result<(), AppError> {
+        validate_version(name, version)?;
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        let table = tx.schema().table_for(Asset::id()).name.replace('`', "``");
+        // Serialize cancellation with both reservation and publication.
+        toasty::sql::query(format!(
+            "SELECT id FROM `{table}` WHERE name = ? AND version = ? FOR UPDATE"
+        ))
+        .bind(name)
+        .bind(version)
+        .column_types([toasty::stmt::Type::U64])
+        .exec(&mut tx)
+        .await?;
+        let asset = Asset::filter_by_name_and_version(name, version)
+            .first()
+            .exec(&mut tx)
+            .await?;
+        if let Some(asset) = &asset {
+            if asset.published_at.is_some() {
+                return Err(AppError::AssetConflict);
+            }
+            verify_upload_owner(asset, actor)?;
+            Asset::filter_by_id(asset.id).delete().exec(&mut tx).await?;
+        }
+        tx.commit().await?;
+
+        if let Some((asset, config)) = asset.zip(self.config.storage.as_ref())
+            && asset.upload_id.is_some()
+        {
+            self.remove_staged_upload(config, &asset).await;
+        }
+        Ok(())
     }
 
     pub(crate) async fn import_asset(
@@ -300,15 +374,7 @@ impl<S> App<S> {
             asset
         } else {
             let mut source = Catalog::new(Uuid::nil(), &key, &source_url, 0, &version.format);
-            let signed =
-                self.sign_asset(config, &source, PresignOperation::Head, config.presign_ttl)?;
-            let response = asset_storage_request(signed).await?;
-            let size = response
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or(AppError::AssetIntegrity)?;
+            let size = self.asset_object_length(config, &source).await?;
             validate_size(size)?;
             // Import requests identify expected bytes, but do not declare their size.
             // Verify the source before reserving a length for subsequent retries.
@@ -340,7 +406,10 @@ impl<S> App<S> {
         let asset = load_asset(&mut db, asset_id).await?;
         let catalog = published_catalog(&mut db, &asset).await?;
         let config = self.asset_storage()?;
-        self.asset_transfer(config, asset, catalog, config.presign_ttl)
+        let operation = PresignOperation::DownloadAttachment {
+            filename: asset.name.clone(),
+        };
+        self.asset_transfer(config, asset, catalog, operation, config.presign_ttl)
     }
 
     pub(crate) async fn presign_job_asset(
@@ -391,20 +460,16 @@ impl<S> App<S> {
             .await?
             .ok_or(AppError::JobNotFound(job_id))?;
         Self::validate_job_claim(&current, agent_id)?;
-        let remaining = current.expired_at.map_or(0, |expiry| {
-            expiry
-                .as_second()
-                .saturating_sub(Timestamp::now().as_second())
-        });
-        let ttl = u64::try_from(remaining).map_err(|_| AppError::JobConflict(job_id))?;
-        if ttl == 0 {
-            return Err(AppError::JobConflict(job_id));
-        }
+        let ttl = current
+            .expired_at
+            .and_then(|expiry| active_grant_ttl(Timestamp::now(), expiry))
+            .ok_or(AppError::JobConflict(job_id))?;
         self.asset_transfer(
             config,
             asset,
             catalog,
-            Duration::from_secs(ttl).min(config.presign_ttl),
+            PresignOperation::Download,
+            ttl.min(config.presign_ttl),
         )
     }
 
@@ -453,15 +518,46 @@ impl<S> App<S> {
 
     async fn finalize_asset(&self, asset: Asset) -> Result<AssetDescriptor, AppError> {
         let config = self.asset_storage()?;
+        if asset.upload_id.is_some() {
+            let staging =
+                Catalog::new(asset.uuid, "", &asset.source_url, asset.size, &asset.format);
+            let error = match self.asset_object_length(config, &staging).await {
+                Ok(size) if size == asset.size => None,
+                Ok(_) => Some(AppError::AssetIntegrity),
+                Err(error) => Some(error),
+            };
+            if let Some(error) = error {
+                return self.published_or_error(asset.uuid, error).await;
+            }
+        }
+
         // Commit attempts own separate object keys. A racing copy can never
         // overwrite a candidate that another request has checked or published.
-        let key = asset_key(config, &format!("assets/{}/{}", asset.uuid, Uuid::new_v4()));
+        let candidate_id = Uuid::new_v4();
+        let key = asset_key(config, &format!("assets/{}/{candidate_id}", asset.uuid));
         let url = config.object_url(&key)?;
-        let candidate = Catalog::new(Uuid::new_v4(), &key, &url, asset.size, &asset.format);
+        let candidate = Catalog::new(candidate_id, &key, &url, asset.size, &asset.format);
         let operation = PresignOperation::Copy {
             source: asset.source_url.clone(),
         };
-        let signed = self.sign_asset(config, &candidate, operation, config.presign_ttl)?;
+        let signed = self.sign_asset(
+            config,
+            &candidate,
+            operation,
+            config.presign_ttl.min(OBJECT_REQUEST_TIMEOUT),
+        )?;
+        // Account for a copy started at the end of the signature lifetime and
+        // a subsequent verification GET before allowing cleanup to take over.
+        let expires_at = signed
+            .expires_at
+            .checked_add(OBJECT_REQUEST_TIMEOUT * 2)
+            .map_err(|error| AppError::Storage(Box::new(error)))?;
+        AssetPromotion::create()
+            .uuid(candidate_id)
+            .url(&url)
+            .expires_at(Some(expires_at))
+            .exec(&mut self.db.clone())
+            .await?;
         let copy = async {
             let response = asset_storage_request(signed).await?;
             // CopyObject can send HTTP 200 before completing the copy and
@@ -470,23 +566,29 @@ impl<S> App<S> {
             if !body.trim_end().ends_with("</CopyObjectResult>") {
                 return Err(AppError::StorageUnavailable);
             }
-            self.verify_asset_object(config, &candidate, &asset.sha256)
-                .await
+            Ok(())
         };
         if let Err(error) = copy.await {
-            self.delete_asset_object(config, &candidate).await;
-            let current = load_asset(&mut self.db.clone(), asset.uuid).await?;
-            if current.published_at.is_some() {
-                return asset_descriptor(current);
-            }
-            return Err(error);
+            // The provider could have started the copy before the response was
+            // lost. Leave its record for the delayed sweep.
+            return self.published_or_error(asset.uuid, error).await;
+        }
+        if let Err(error) = self
+            .verify_asset_object(config, &candidate, &asset.sha256)
+            .await
+        {
+            self.discard_promotion(config, &candidate).await;
+            return self.published_or_error(asset.uuid, error).await;
         }
 
+        // The promotion record stays durable after every SQL error. If COMMIT
+        // succeeds but its response is lost, the record was removed in the
+        // same transaction that made the copy canonical.
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let table = tx.schema().table_for(Asset::id()).name.replace('`', "``");
         // Toasty cannot currently lock a selected record. Serialize the final
-        // catalog link without holding a database lock during object-store I/O.
+        // catalog link before any snapshot reads in this transaction.
         toasty::sql::query(format!(
             "SELECT id FROM `{table}` WHERE uuid = ? FOR UPDATE"
         ))
@@ -494,11 +596,29 @@ impl<S> App<S> {
         .column_types([toasty::stmt::Type::U64])
         .exec(&mut tx)
         .await?;
-        let current = load_asset(&mut tx, asset.uuid).await?;
-        if current.published_at.is_some() {
-            tx.commit().await?;
-            self.delete_asset_object(config, &candidate).await;
-            return asset_descriptor(current);
+        let promotion = lock_promotion(&mut tx, candidate_id).await?;
+        let current = Asset::filter_by_uuid(asset.uuid)
+            .first()
+            .exec(&mut tx)
+            .await?;
+        match current {
+            Some(current) if current.published_at.is_some() => {
+                tx.commit().await?;
+                self.discard_promotion(config, &candidate).await;
+                return asset_descriptor(current);
+            }
+            None => {
+                tx.commit().await?;
+                self.discard_promotion(config, &candidate).await;
+                return Err(AppError::AssetNotFound(asset.uuid));
+            }
+            Some(_) => {}
+        }
+        if promotion
+            .and_then(|row| row.expires_at)
+            .is_none_or(|expires_at| expires_at <= Timestamp::now())
+        {
+            return Err(AppError::AssetUploadIncomplete);
         }
         let catalog_id = tx
             .upsert_catalog(CatalogOptionalData {
@@ -516,13 +636,42 @@ impl<S> App<S> {
             .exec(&mut tx)
             .await?;
         let published = load_asset(&mut tx, asset.uuid).await?;
+        AssetPromotion::filter_by_uuid(candidate_id)
+            .delete()
+            .exec(&mut tx)
+            .await?;
         tx.commit().await?;
         if asset.upload_id.is_some() {
-            let staging =
-                Catalog::new(asset.uuid, "", &asset.source_url, asset.size, &asset.format);
-            self.delete_asset_object(config, &staging).await;
+            self.remove_staged_upload(config, &asset).await;
         }
         asset_descriptor(published)
+    }
+
+    async fn published_or_error(
+        &self,
+        uuid: Uuid,
+        error: AppError,
+    ) -> Result<AssetDescriptor, AppError> {
+        let current = load_asset(&mut self.db.clone(), uuid).await?;
+        if current.published_at.is_some() {
+            return asset_descriptor(current);
+        }
+        Err(error)
+    }
+
+    async fn asset_object_length(
+        &self,
+        config: &StorageConfig,
+        object: &Catalog,
+    ) -> Result<u64, AppError> {
+        let signed = self.sign_asset(config, object, PresignOperation::Head, config.presign_ttl)?;
+        let response = asset_storage_request(signed).await?;
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+            .ok_or(AppError::AssetIntegrity)
     }
 
     async fn verify_asset_object(
@@ -561,14 +710,87 @@ impl<S> App<S> {
         Ok(())
     }
 
-    async fn delete_asset_object(&self, config: &StorageConfig, object: &Catalog) {
-        let signed = self.sign_asset(config, object, PresignOperation::Delete, config.presign_ttl);
-        let result = match signed {
-            Ok(signed) => asset_storage_request(signed).await.map(|_| ()),
+    async fn delete_asset_object(
+        &self,
+        config: &StorageConfig,
+        object: &Catalog,
+    ) -> Result<(), AppError> {
+        let signed =
+            self.sign_asset(config, object, PresignOperation::Delete, config.presign_ttl)?;
+        match asset_storage_request(signed).await {
+            Ok(_) | Err(AppError::AssetUploadIncomplete) => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    async fn remove_staged_upload(&self, config: &StorageConfig, asset: &Asset) {
+        let staging = Catalog::new(asset.uuid, "", &asset.source_url, asset.size, &asset.format);
+        if let Err(error) = self.delete_asset_object(config, &staging).await {
+            tracing::warn!(%error, "could not remove staged asset upload");
+        }
+    }
+
+    async fn discard_promotion(&self, config: &StorageConfig, candidate: &Catalog) {
+        let result = async {
+            self.delete_asset_object(config, candidate).await?;
+            AssetPromotion::filter_by_uuid(candidate.uuid)
+                .delete()
+                .exec(&mut self.db.clone())
+                .await?;
+            Ok::<(), AppError>(())
         };
-        if let Err(error) = result {
-            tracing::warn!(%error, "could not remove unused asset object");
+        if let Err(error) = result.await {
+            tracing::warn!(%error, "could not remove unpublished asset copy");
+        }
+    }
+
+    /// Reconciles expired private copies against ongoing publication transactions.
+    pub async fn reap_asset_promotions(&self) -> Result<(), AppError> {
+        let Some(config) = &self.config.storage else {
+            return Ok(());
+        };
+        let mut db = self.db.clone();
+        let cutoff = Timestamp::now();
+        let mut after = 0;
+        loop {
+            let fields = AssetPromotion::fields();
+            let page = AssetPromotion::filter(
+                fields
+                    .expires_at()
+                    .le(Some(cutoff))
+                    .or(fields.expires_at().is_none()),
+            )
+            .filter(fields.id().gt(after))
+            .order_by(fields.id().asc())
+            .limit(64)
+            .exec(&mut db)
+            .await?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            for candidate in page {
+                after = candidate.id;
+                let mut tx = db.transaction().await?;
+                let Some(row) = lock_promotion(&mut tx, candidate.uuid)
+                    .await?
+                    .filter(|row| row.expires_at.is_none_or(|expires_at| expires_at <= cutoff))
+                else {
+                    tx.commit().await?;
+                    continue;
+                };
+                // Publication removes the record atomically. Clearing the
+                // expiration under lock fences surviving records on every server.
+                if row.expires_at.is_some() {
+                    AssetPromotion::filter_by_uuid(row.uuid)
+                        .update()
+                        .expires_at(None)
+                        .exec(&mut tx)
+                        .await?;
+                }
+                tx.commit().await?;
+                let object = Catalog::new(row.uuid, "", row.url, 0, "application/octet-stream");
+                self.discard_promotion(config, &object).await;
+            }
         }
     }
 
@@ -597,12 +819,14 @@ impl<S> App<S> {
         config: &StorageConfig,
         asset: Asset,
         catalog: Catalog,
+        operation: PresignOperation,
         ttl: Duration,
     ) -> Result<AssetTransfer, AppError> {
         let storage = config.object_storage(self.db.clone())?;
-        let presigned = storage
-            .presign_catalog(&catalog, PresignOperation::Download, ttl)
+        let mut presigned = storage
+            .presign_catalog(&catalog, operation, ttl)
             .map_err(|error| AppError::Storage(Box::new(error)))?;
+        presigned.operation = PresignOperation::Download;
         Ok(AssetTransfer {
             asset_id: asset.uuid,
             sha256: digest_string(&asset.sha256),
@@ -618,6 +842,17 @@ fn verify_upload_owner(asset: &Asset, actor: &str) -> Result<(), AppError> {
         return Err(AppError::AssetUploadForbidden);
     }
     Ok(())
+}
+
+fn active_grant_ttl(now: Timestamp, expiry: Timestamp) -> Option<Duration> {
+    let remaining = expiry.duration_since(now);
+    if !remaining.is_positive() {
+        return None;
+    }
+    // S3 only accepts whole seconds. An active claim in its final fraction
+    // of a second still gets one signing second.
+    let seconds = remaining.as_secs() as u64 + u64::from(remaining.subsec_nanos() != 0);
+    Some(Duration::from_secs(seconds))
 }
 
 fn asset_key(config: &StorageConfig, relative: &str) -> String {
@@ -648,4 +883,18 @@ async fn asset_storage_request(signature: PresignedUrl) -> Result<reqwest::Respo
 fn storage_transport_error(error: reqwest::Error) -> AppError {
     tracing::warn!(error = %error.without_url(), "asset storage request failed");
     AppError::StorageUnavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_claims_get_a_grant_even_with_a_fraction_of_a_second_remaining() {
+        let now: Timestamp = "2026-11-27T10:00:00.100Z".parse().unwrap();
+        let expiry = now.checked_add(Duration::from_millis(250)).unwrap();
+        assert_eq!(active_grant_ttl(now, expiry), Some(Duration::from_secs(1)));
+        assert_eq!(active_grant_ttl(expiry, expiry), None);
+        assert_eq!(active_grant_ttl(expiry, now), None);
+    }
 }

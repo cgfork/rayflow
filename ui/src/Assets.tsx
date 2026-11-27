@@ -27,6 +27,7 @@ export default function Assets({ notify }: { notify: (message: string) => void }
       if (presigned.operation !== 'download' || !isHttpDownloadUrl(presigned.url)) throw new Error('The server returned an invalid download URL.');
       const link = document.createElement('a');
       link.href = presigned.url;
+      link.download = asset.name;
       link.target = '_blank';
       link.rel = 'noopener noreferrer';
       link.click();
@@ -55,7 +56,7 @@ export default function Assets({ notify }: { notify: (message: string) => void }
         </div>}
       {(versions.page > 1 || versions.data?.next_cursor != null) && <AssetPagination versions={versions} />}
     </section>
-    {uploading && <UploadAsset close={() => setUploading(false)} published={(asset) => {
+    {uploading && <UploadAsset close={() => setUploading(false)} notify={notify} published={(asset) => {
       setUploading(false);
       versions.refresh();
       notify(`Published ${asset.name} v${asset.version}.`);
@@ -70,12 +71,30 @@ function AssetPagination({ versions }: { versions: AssetPage }) {
     previous={versions.previous} next={versions.next} />;
 }
 
-function UploadAsset({ close, published }: { close: () => void; published: (asset: AssetVersion) => void }) {
+function UploadAsset({ close, notify, published }: { close: () => void; notify: (message: string) => void; published: (asset: AssetVersion) => void }) {
   const [name, setName] = useState('');
   const [version, setVersion] = useState('1');
   const [file, setFile] = useState<File>();
   const [status, setStatus] = useState('');
   const [error, setError] = useState<string>();
+  const [attemptedVersion, setAttemptedVersion] = useState<{ name: string; version: number }>();
+  const reservation = attemptedVersion?.name === name && attemptedVersion.version === Number(version)
+    ? attemptedVersion : undefined;
+
+  async function discard() {
+    if (!reservation || status) return;
+    setError(undefined);
+    setStatus('Discarding pending upload…');
+    try {
+      await send<void>(`/assets/${encodeURIComponent(reservation.name)}/versions/${reservation.version}/cancel`, {});
+      setAttemptedVersion(undefined);
+      notify('Pending upload discarded.');
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : 'Could not discard the pending upload.');
+    } finally {
+      setStatus('');
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -100,6 +119,7 @@ function UploadAsset({ close, published }: { close: () => void; published: (asse
       } finally {
         stream.releaseLock();
       }
+      setAttemptedVersion({ name, version: number });
       const result = await send<PreparedAsset>('/assets/prepare', {
         name, version: number, size: file.size, format: file.type || 'application/octet-stream',
         sha256: bytesToHex(hash.digest()),
@@ -132,6 +152,7 @@ function UploadAsset({ close, published }: { close: () => void; published: (asse
       <label className="field">Version<input required type="number" min="1" step="1" value={version} onChange={(event) => setVersion(event.target.value)} disabled={Boolean(status)} /></label>
       <label className="field">File<input required type="file" onChange={(event) => setFile(event.target.files?.[0])} disabled={Boolean(status)} /></label>
       {status && <p role="status" className="muted">{status}</p>}
+      {reservation && <button type="button" className="button" disabled={Boolean(status)} onClick={() => void discard()}>Discard pending upload</button>}
       <div className="modal-actions">
         <button type="button" className="button" onClick={close} disabled={Boolean(status)}>Cancel</button>
         <button type="submit" className="button primary" disabled={Boolean(status) || !file}><Upload size={15} />Publish asset</button>

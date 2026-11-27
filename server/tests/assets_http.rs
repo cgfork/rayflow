@@ -1,6 +1,13 @@
 mod support;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -9,6 +16,7 @@ use axum::{
     http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use catalog::model::{Asset, AssetPromotion};
 use graph::types::{AssetRef, DAG, Node, NodeSettings, Resource};
 use jiff::Timestamp;
 use runtime::backend::Backend;
@@ -21,15 +29,21 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 type Objects = Arc<Mutex<HashMap<String, Bytes>>>;
+type CopyCount = Arc<AtomicUsize>;
+type DeleteFailures = Arc<Mutex<HashSet<String>>>;
 
 /// In-memory S3-style service. Copy reads the source as it exists at the time
 /// of the request, and a repeated browser upload can overwrite staging bytes.
-async fn object(State(objects): State<Objects>, request: Request) -> Response {
+async fn object(
+    State((objects, copies, delete_failures)): State<(Objects, CopyCount, DeleteFailures)>,
+    request: Request,
+) -> Response {
     let key = request.uri().path().to_owned();
     match *request.method() {
         Method::PUT => {
             let copying = request.headers().contains_key("x-amz-copy-source");
             let body = if let Some(source) = request.headers().get("x-amz-copy-source") {
+                copies.fetch_add(1, Ordering::Relaxed);
                 assert!(request.uri().query().unwrap().contains("x-amz-copy-source"));
                 let Some(bytes) = objects.lock().await.get(source.to_str().unwrap()).cloned()
                 else {
@@ -56,6 +70,9 @@ async fn object(State(objects): State<Objects>, request: Request) -> Response {
             None => StatusCode::NOT_FOUND.into_response(),
         },
         Method::DELETE => {
+            if delete_failures.lock().await.contains(&key) {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             objects.lock().await.remove(&key);
             StatusCode::NO_CONTENT.into_response()
         }
@@ -63,11 +80,17 @@ async fn object(State(objects): State<Objects>, request: Request) -> Response {
     }
 }
 
-async fn fixture(db: toasty::Db) -> (Router, Objects) {
+async fn fixture(db: toasty::Db) -> (App<toasty::Db>, Objects, CopyCount, DeleteFailures) {
     let objects = Objects::default();
+    let copies = CopyCount::default();
+    let delete_failures = DeleteFailures::default();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let storage = Router::new().fallback(object).with_state(objects.clone());
+    let storage = Router::new().fallback(object).with_state((
+        objects.clone(),
+        copies.clone(),
+        delete_failures.clone(),
+    ));
     tokio::spawn(async move { axum::serve(listener, storage).await.unwrap() });
     let config = Config {
         storage: Some(StorageConfig {
@@ -85,7 +108,12 @@ async fn fixture(db: toasty::Db) -> (Router, Objects) {
         }),
         ..Config::default()
     };
-    (router(App::new(db.clone(), config, db)), objects)
+    (
+        App::new(db.clone(), config, db),
+        objects,
+        copies,
+        delete_failures,
+    )
 }
 
 async fn request(
@@ -117,7 +145,11 @@ async fn request(
         "{method} {path}: {}",
         String::from_utf8_lossy(&bytes)
     );
-    serde_json::from_slice(&bytes).unwrap()
+    if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    }
 }
 
 async fn post(app: &Router, path: &str, json: Value, status: StatusCode) -> Value {
@@ -173,7 +205,8 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
     support::with_test_database(|mut db| async move {
         const SCRIPT: &[u8] = b"return 'a'";
         const OTHER: &[u8] = b"return 'b'";
-        let (app, objects) = fixture(db.clone()).await;
+        let (state, objects, copies, _) = fixture(db.clone()).await;
+        let app = router(state.clone());
         let browser = reqwest::Client::builder().no_proxy().build().unwrap();
         let sha256 = format!("{:x}", Sha256::digest(SCRIPT));
         let prepare = json!({
@@ -186,6 +219,11 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
         let pending = post(&app, "/assets/prepare", prepare.clone(), StatusCode::OK).await;
         assert_eq!(pending["state"], "pending");
         assert_eq!(pending["upload"]["operation"], "upload");
+        assert!(pending["upload"]["headers"].get("content-length").is_none());
+        let upload_url = url::Url::parse(pending["upload"]["url"].as_str().unwrap()).unwrap();
+        assert!(upload_url.query_pairs().any(|(key, value)| {
+            key == "X-Amz-SignedHeaders" && value.split(';').any(|part| part == "content-length")
+        }));
         let asset_id: Uuid = serde_json::from_value(pending["asset_id"].clone()).unwrap();
         let commit = format!("/assets/{asset_id}/commit");
         let upload_ref = json!({"upload_id":pending["upload_id"]});
@@ -208,6 +246,20 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
 
         let incomplete = post(&app, &commit, upload_ref.clone(), StatusCode::CONFLICT).await;
         assert_eq!(incomplete["error_code"], "RAYFLOW_ASSET_UPLOAD_INCOMPLETE");
+        // Simulate a legacy or out-of-band staged PUT with the wrong length.
+        objects.lock().await.insert(
+            upload_url.path().into(),
+            Bytes::from_static(b"oversized file"),
+        );
+        let bad = post(
+            &app,
+            &commit,
+            upload_ref.clone(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+        assert_eq!(bad["error_code"], "RAYFLOW_ASSET_INTEGRITY");
+        assert_eq!(copies.load(Ordering::Relaxed), 0);
         upload(&browser, &pending, OTHER).await;
         let bad = post(
             &app,
@@ -243,6 +295,21 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
             StatusCode::OK,
         )
         .await;
+        let download_url = url::Url::parse(download["presigned"]["url"].as_str().unwrap()).unwrap();
+        assert!(download_url.query_pairs().any(|(key, value)| {
+            key == "response-content-disposition" && value == "attachment; filename=\"script.lua\""
+        }));
+        assert_eq!(download["presigned"]["operation"], "download");
+        let canonical = download_url.path();
+        let winner = Uuid::parse_str(canonical.rsplit('/').next().unwrap()).unwrap();
+        assert!(
+            AssetPromotion::filter_by_uuid(winner)
+                .first()
+                .exec(&mut db)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let bytes = browser
             .get(download["presigned"]["url"].as_str().unwrap())
             .send()
@@ -261,6 +328,57 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
         conflicting["sha256"] = json!(format!("{:x}", Sha256::digest(OTHER)));
         let conflict = post(&app, "/assets/prepare", conflicting, StatusCode::CONFLICT).await;
         assert_eq!(conflict["error_code"], "RAYFLOW_ASSET_CONFLICT");
+        post(
+            &app,
+            "/assets/script.lua/versions/1/cancel",
+            json!({}),
+            StatusCode::CONFLICT,
+        )
+        .await;
+
+        let orphan = Uuid::new_v4();
+        let active = Uuid::new_v4();
+        for (candidate, age) in [(orphan, -60), (active, 60)] {
+            let key = format!("artifacts/assets/{asset_id}/{candidate}");
+            AssetPromotion::create()
+                .uuid(candidate)
+                .url(format!("s3://asset-tests/{key}"))
+                .expires_at(Some(
+                    Timestamp::now()
+                        .checked_add(jiff::SignedDuration::from_secs(age))
+                        .unwrap(),
+                ))
+                .exec(&mut db)
+                .await
+                .unwrap();
+            objects
+                .lock()
+                .await
+                .insert(format!("/asset-tests/{key}"), Bytes::from_static(SCRIPT));
+        }
+        state.reap_asset_promotions().await.unwrap();
+        let objects_after_sweep = objects.lock().await;
+        assert!(objects_after_sweep.contains_key(canonical));
+        assert!(
+            !objects_after_sweep
+                .keys()
+                .any(|key| key.ends_with(&orphan.to_string()))
+        );
+        assert!(
+            objects_after_sweep
+                .keys()
+                .any(|key| key.ends_with(&active.to_string()))
+        );
+        drop(objects_after_sweep);
+        assert!(
+            AssetPromotion::filter_by_uuid(orphan)
+                .first()
+                .exec(&mut db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
         let snapshot = post(&app, &publish, json!({}), StatusCode::CREATED).await;
         assert_eq!(snapshot["version"], 1);
         assert_eq!(
@@ -331,7 +449,8 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
 async fn imported_asset_is_bound_to_its_verified_copy() {
     support::with_test_database(|db| async move {
         const BYTES: &[u8] = b"shared data";
-        let (app, objects) = fixture(db).await;
+        let (state, objects, _, _) = fixture(db).await;
+        let app = router(state);
         let source = "/asset-tests/shared-imports/examples/data.json";
         objects
             .lock()
@@ -362,6 +481,154 @@ async fn imported_asset_is_bound_to_its_verified_copy() {
         .await;
         let storage_key = url::Url::parse(download["presigned"]["url"].as_str().unwrap()).unwrap();
         assert_eq!(objects.lock().await[storage_key.path()], BYTES);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancel_releases_only_the_owners_unpublished_version() {
+    support::with_test_database(|mut db| async move {
+        let (state, objects, _, _) = fixture(db.clone()).await;
+        let app = router(state);
+        let request = |bytes: &[u8]| {
+            json!({
+                "name": "script.lua",
+                "version": 1,
+                "size": bytes.len(),
+                "format": "text/x-lua",
+                "sha256": format!("{:x}", Sha256::digest(bytes)),
+            })
+        };
+        let old = post(&app, "/assets/prepare", request(b"old"), StatusCode::OK).await;
+        let old_id = old["asset_id"].as_str().unwrap().parse::<Uuid>().unwrap();
+        let path = "/assets/script.lua/versions/1/cancel";
+        Asset::filter_by_uuid(old_id)
+            .update()
+            .created_by("other")
+            .exec(&mut db)
+            .await
+            .unwrap();
+        post(&app, path, json!({}), StatusCode::FORBIDDEN).await;
+        Asset::filter_by_uuid(old_id)
+            .update()
+            .created_by("local")
+            .exec(&mut db)
+            .await
+            .unwrap();
+        let browser = reqwest::Client::builder().no_proxy().build().unwrap();
+        upload(&browser, &old, b"old").await;
+        post(&app, path, json!({}), StatusCode::NO_CONTENT).await;
+        post(&app, path, json!({}), StatusCode::NO_CONTENT).await;
+        assert!(objects.lock().await.is_empty());
+
+        let replacement = post(
+            &app,
+            "/assets/prepare",
+            request(b"new version"),
+            StatusCode::OK,
+        )
+        .await;
+        assert_ne!(old["asset_id"], replacement["asset_id"]);
+        assert_ne!(old["upload_id"], replacement["upload_id"]);
+        post(
+            &app,
+            &format!("/assets/{old_id}/commit"),
+            json!({"upload_id": old["upload_id"]}),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn publication_failure_keeps_the_copy_durable_for_cleanup() {
+    support::with_test_database(|mut db| async move {
+        const BYTES: &[u8] = b"return true";
+        let (state, objects, _, delete_failures) = fixture(db.clone()).await;
+        let app = router(state.clone());
+        let prepare = json!({
+            "name": "script.lua", "version": 1, "size": BYTES.len(), "format": "text/x-lua",
+            "sha256": format!("{:x}", Sha256::digest(BYTES)),
+        });
+        let pending = post(&app, "/assets/prepare", prepare, StatusCode::OK).await;
+        let asset_id = pending["asset_id"].as_str().unwrap();
+        let commit = format!("/assets/{asset_id}/commit");
+        let request = json!({"upload_id": pending["upload_id"]});
+        let browser = reqwest::Client::builder().no_proxy().build().unwrap();
+        upload(&browser, &pending, BYTES).await;
+
+        toasty::sql::statement(
+            "CREATE TRIGGER fail_asset_publish BEFORE INSERT ON catalog FOR EACH ROW \
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fixture publication failure'",
+        )
+        .exec(&mut db)
+        .await
+        .unwrap();
+        post(
+            &app,
+            &commit,
+            request.clone(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        toasty::sql::statement("DROP TRIGGER fail_asset_publish")
+            .exec(&mut db)
+            .await
+            .unwrap();
+
+        let orphan = AssetPromotion::all()
+            .first()
+            .exec(&mut db)
+            .await
+            .unwrap()
+            .unwrap();
+        post(&app, &commit, request, StatusCode::OK).await;
+        let download = post(
+            &app,
+            &format!("/assets/{asset_id}/download"),
+            json!({}),
+            StatusCode::OK,
+        )
+        .await;
+        let canonical = url::Url::parse(download["presigned"]["url"].as_str().unwrap()).unwrap();
+        let orphan_url = url::Url::parse(&orphan.url).unwrap();
+        let orphan_key = format!("/asset-tests{}", orphan_url.path());
+        assert_ne!(canonical.path(), orphan_key);
+        assert!(objects.lock().await.contains_key(&orphan_key));
+
+        AssetPromotion::filter_by_uuid(orphan.uuid)
+            .update()
+            .expires_at(Some(
+                Timestamp::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap(),
+            ))
+            .exec(&mut db)
+            .await
+            .unwrap();
+        delete_failures.lock().await.insert(orphan_key.clone());
+        state.reap_asset_promotions().await.unwrap();
+        let fenced = AssetPromotion::filter_by_uuid(orphan.uuid)
+            .get(&mut db)
+            .await
+            .unwrap();
+        assert!(fenced.expires_at.is_none());
+        assert!(objects.lock().await.contains_key(&orphan_key));
+
+        delete_failures.lock().await.remove(&orphan_key);
+        state.reap_asset_promotions().await.unwrap();
+        assert!(
+            AssetPromotion::filter_by_uuid(orphan.uuid)
+                .first()
+                .exec(&mut db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let objects = objects.lock().await;
+        assert!(!objects.contains_key(&orphan_key));
+        assert_eq!(objects[canonical.path()], BYTES);
     })
     .await;
 }
