@@ -317,6 +317,48 @@ The feature is disabled by default, so default builds do not include the AWS
 signing dependencies.
 
 
+## Shared assets
+
+Migration 27 adds one `asset` row per named version. A ready row points to a
+verified, private object through `catalog_uuid`. Nodes pin the asset version
+UUID in `assets` and choose a relative mount filename:
+
+```json
+{
+  "assets": [{
+    "asset_id": "f27e2c15-e49b-49bf-85cf-f646ed55cfea",
+    "file_name": "scripts/transform.lua"
+  }]
+}
+```
+
+Asset references can be used on root nodes. A published graph pins the version,
+so editing a draft to use another version affects jobs on the new graph.
+
+| Endpoint | Operation |
+| --- | --- |
+| `GET /api/v1/assets` | List published asset versions. |
+| `GET /api/v1/assets/{asset_id}` | Read an exact published version. |
+| `POST /api/v1/assets/prepare` | Reserve an upload with `name`, `version`, `size`, `format`, and hex `sha256`. |
+| `POST /api/v1/assets/{asset_id}/commit` | Verify and publish the staged object selected by `upload_id`. |
+| `POST /api/v1/assets/{name}/versions/{version}/import` | Publish an existing object using `source_key`, `format`, and hex `sha256`. |
+| `POST /api/v1/assets/{asset_id}/download` | Presign a download of the published object. |
+| `POST /api/v1/job/asset/presign` | Presign a job asset selected by `job_id`, `agent_id`, and declared `filename`. |
+
+The browser sends `PUT` directly to the URL from a pending prepare response
+using the returned headers. RustFS must be reachable from the browser and
+allow the console's origin for uploads. On commit Rayflow copies the staging
+object to a private key and verifies its size and SHA-256 before publishing.
+The managed object remains separate from the upload key. Matching retries
+reuse the reservation or return the published version. Configure storage
+lifecycle expiry for objects under the `asset-staging` prefix and retain
+published objects for reruns.
+
+Imports are available when `storage.asset_import_prefix` is configured.
+The source key is relative to that prefix, which must be disjoint from
+`storage.prefix`. The agent's endpoint checks the active claim and the
+consuming node's pinned graph version before granting a download.
+
 ## Job artifact API
 
 Agents use job-scoped endpoints. The server constructs catalog keys from the
@@ -384,8 +426,10 @@ roots are scoped by the job UUID; artifact data is isolated per job:
 <metadata_dir>/<job_uuid>/runtime/started_at
 <metadata_dir>/<job_uuid>/graph.json
 <data_dir>/<job_uuid>/inputs/<filename>
+<data_dir>/<job_uuid>/asset/<filename>
 <data_dir>/<job_uuid>/outputs/<filename>
 <data_dir>/<job_uuid>/.rayflow/<job_uuid>/inputs-ready.json
+<data_dir>/<job_uuid>/.rayflow/<job_uuid>/assets-ready.json
 <data_dir>/<job_uuid>/.rayflow/<job_uuid>/outputs-uploaded.json
 ```
 
@@ -396,5 +440,7 @@ the pinned `graph.json`; `RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to
 those files. The agent keeps input readiness, output completion, and transfer
 state in the per-job marker directory. Local artifacts stay available until the
 server acknowledges the outcome and both JSON archives have upload receipts.
-Docker mounts inputs read-only at `/data/inputs` and outputs writable at
-`/data/outputs`.
+Docker mounts inputs and assets read-only at `/data/inputs` and `/data/assets`
+and outputs writable at `/data/outputs`. The asset directory is empty for
+nodes with no declared assets. The agent checks asset digests before creation
+and sets `RAYFLOW_ASSET_DIR` to the container path.

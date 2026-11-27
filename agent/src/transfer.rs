@@ -13,6 +13,7 @@ use catalog::directory::{
 use catalog::path::validate_relative_path;
 use graph::types::{Kind, Node};
 use scheduler::{Job, JobArtifactName};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     io,
@@ -26,6 +27,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{client::Client, errors::Error, read_json, write_json};
+
+mod assets;
+
+pub(crate) const ASSET_DIR: &str = "asset";
 
 #[derive(Clone)]
 pub struct JobTransfer {
@@ -611,9 +616,21 @@ impl JobTransfer {
         transfer: &CatalogTransfer,
         destination: &Path,
     ) -> Result<(), Error> {
+        self.download_file_checked(transfer, destination, None)
+            .await
+    }
+
+    async fn download_file_checked(
+        &self,
+        transfer: &CatalogTransfer,
+        destination: &Path,
+        expected_sha256: Option<&str>,
+    ) -> Result<(), Error> {
         if transfer.multipart && transfer.catalog.size > self.client.settings().multipart_threshold
         {
-            return self.download_file_ranges(transfer, destination).await;
+            return self
+                .download_file_ranges(transfer, destination, expected_sha256)
+                .await;
         }
         let parent = destination
             .parent()
@@ -628,6 +645,7 @@ impl JobTransfer {
         let result = async {
             let mut response = self.response(transfer).await?;
             let mut size = 0u64;
+            let mut digest = expected_sha256.map(|_| Sha256::new());
             while let Some(chunk) = response
                 .chunk()
                 .await
@@ -639,11 +657,15 @@ impl JobTransfer {
                 if size > transfer.catalog.size {
                     return Err(artifact("input exceeds catalog size"));
                 }
+                if let Some(digest) = &mut digest {
+                    digest.update(&chunk);
+                }
                 file.write_all(&chunk).await?;
             }
             if size != transfer.catalog.size {
                 return Err(artifact("incomplete input download"));
             }
+            check_digest(digest, expected_sha256)?;
             file.sync_all().await?;
             fs::rename(&temporary, destination).await?;
             Ok(())
@@ -659,6 +681,7 @@ impl JobTransfer {
         &self,
         transfer: &CatalogTransfer,
         destination: &Path,
+        expected_sha256: Option<&str>,
     ) -> Result<(), Error> {
         let parent = destination
             .parent()
@@ -674,6 +697,7 @@ impl JobTransfer {
             file.set_len(transfer.catalog.size).await?;
             let mut offset = 0u64;
             let mut etag = None::<String>;
+            let mut digest = expected_sha256.map(|_| Sha256::new());
             while offset < transfer.catalog.size {
                 let end = (offset + MULTIPART_PART_SIZE)
                     .min(transfer.catalog.size)
@@ -686,6 +710,11 @@ impl JobTransfer {
                     request = request.header(name, value);
                 }
                 let response = request.send().await.map_err(reqwest::Error::without_url)?;
+                if expected_sha256.is_some() {
+                    response
+                        .error_for_status_ref()
+                        .map_err(reqwest::Error::without_url)?;
+                }
                 if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
                     return Err(artifact(format!(
                         "ranged input download returned {}",
@@ -730,6 +759,9 @@ impl JobTransfer {
                     if received > expected {
                         return Err(artifact("ranged input exceeds requested range"));
                     }
+                    if let Some(digest) = &mut digest {
+                        digest.update(&chunk);
+                    }
                     file.write_all(&chunk).await?;
                 }
                 if received != expected {
@@ -737,6 +769,7 @@ impl JobTransfer {
                 }
                 offset = end + 1;
             }
+            check_digest(digest, expected_sha256)?;
             file.sync_all().await?;
             fs::rename(&temporary, destination).await?;
             Ok(())
@@ -747,6 +780,17 @@ impl JobTransfer {
         }
         result
     }
+}
+
+fn check_digest(digest: Option<Sha256>, expected: Option<&str>) -> Result<(), Error> {
+    if let Some((digest, expected)) = digest.zip(expected)
+        && !format!("{:x}", digest.finalize()).eq_ignore_ascii_case(expected)
+    {
+        return Err(artifact(
+            "asset SHA-256 does not match the published version",
+        ));
+    }
+    Ok(())
 }
 
 fn successful_upload_response(response: reqwest::Response) -> Result<reqwest::Response, Error> {

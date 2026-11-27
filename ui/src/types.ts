@@ -13,7 +13,17 @@ export interface AnnotationMatchNodeSettings {
   resource?: NodeResource | null;
   timeout?: string | null;
 }
-export interface GraphNode { id: string; name: string; node_type: string; settings: NodeSettings; inputs: Input[]; outputs: Output[] }
+export interface AssetRef { file_name: string; asset_id: string }
+export interface AssetVersion {
+  asset_id: string;
+  name: string;
+  version: number;
+  size: number;
+  format: string;
+  sha256: string;
+  published_at: string;
+}
+export interface GraphNode { id: string; name: string; node_type: string; settings: NodeSettings; inputs: Input[]; outputs: Output[]; assets: AssetRef[] }
 export interface Graph {
   id: string;
   name: string;
@@ -49,4 +59,4 @@ export interface RunFileTransfer { presigned: PresignedDownload }
 export type JobStatus = 'Scheduled' | 'Polled' | 'Yielded' | 'Succeeded' | 'Failed' | 'Terminated';
 export interface Job { id: number; uuid: string; task_id: string; run_id: string; node_run_id: number; status: JobStatus; required_cpu_cores: number; required_memory_bytes: number; agent_id: string | null; polled_at: string | null; expired_at: string | null; created_at: string; updated_at: string }
 export interface Agent { id: number; uuid: string; cpu_cores: number; memory_bytes: number; active_jobs: number; first_seen_at: string; last_seen_at: string; online_until: string; online: boolean }
-export type Section = 'orchestration' | 'runtime' | 'schedule' | 'agents';
+export type Section = 'orchestration' | 'assets' | 'runtime' | 'schedule' | 'agents';

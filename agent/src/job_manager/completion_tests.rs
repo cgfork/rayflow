@@ -376,6 +376,7 @@ impl Harness {
                 id: node_id,
                 name: "execute".into(),
                 node_type: "test".into(),
+                assets: vec![],
                 settings: NodeSettings::default(),
                 inputs: vec![],
                 outputs: if let Some(filename) = output {

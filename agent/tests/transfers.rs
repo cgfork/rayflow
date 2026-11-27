@@ -27,12 +27,13 @@ use catalog::{
     model::Catalog,
 };
 use event::task::Task;
-use graph::types::{DAG, Input, Kind, Node, NodeSettings, Output};
+use graph::types::{AssetRef, DAG, Input, Kind, Node, NodeSettings, Output};
 use jiff::Timestamp;
 use runtime::command::{NodeRun, Run};
 use scheduler::{Job, ResourceCapacity, actuator::Status};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use tokio::{fs, net::TcpListener};
 use uuid::Uuid;
@@ -69,6 +70,7 @@ impl Fixture {
             id: Uuid::new_v4(),
             name: name.into(),
             node_type: "docker".into(),
+            assets: vec![],
             settings: NodeSettings::default(),
             inputs,
             outputs,
@@ -286,6 +288,96 @@ async fn commit_output(
         .calls
         .push(format!("commit {}", request.claim.filename));
     Json(Uuid::new_v4())
+}
+
+#[tokio::test]
+async fn verifies_asset_bytes_before_checkpoint_and_restages_missing_files() {
+    let root = tempdir().unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let settings = Settings::new(
+        Uuid::new_v4(),
+        format!("http://{}", listener.local_addr().unwrap()),
+        root.path().join("jobs"),
+        ResourceCapacity {
+            cpu_cores: 1,
+            memory_bytes: 1,
+        },
+    );
+    let fixture = Arc::new(Fixture::new(settings.server_url.clone(), settings.id));
+    let asset_id = Uuid::new_v4();
+    let mut node = fixture.graph.nodes[1].clone();
+    node.assets.push(AssetRef {
+        asset_id,
+        file_name: "scripts/test.lua".into(),
+    });
+    let routes = Router::new()
+        .route(
+            "/api/v1/job/asset/presign",
+            post(
+                move |State(fixture): State<Arc<Fixture>>, Json(claim): Json<Claim>| async move {
+                    fixture.verify_claim(&claim);
+                    assert_eq!(claim.filename, "scripts/test.lua");
+                    fixture.record("presign asset");
+                    let transfer = fixture.transfer(
+                        Uuid::new_v4(),
+                        "asset",
+                        SOURCE.len() as u64,
+                        "text/x-lua",
+                        PresignOperation::Download,
+                        "asset",
+                    );
+                    let mut body = serde_json::to_value(transfer).unwrap();
+                    body["asset_id"] = json!(asset_id);
+                    body["sha256"] = json!(format!("{:x}", Sha256::digest(SOURCE)));
+                    Json(body)
+                },
+            ),
+        )
+        .route(
+            "/objects/asset",
+            get(
+                |State(fixture): State<Arc<Fixture>>, headers: HeaderMap| async move {
+                    assert_eq!(headers[SIGNATURE], "fixture");
+                    let mut traffic = fixture.traffic.lock().unwrap();
+                    let first = !traffic.calls.iter().any(|call| call == "download asset");
+                    traffic.calls.push("download asset".into());
+                    if first { b"wrong bytes\0\xff" } else { SOURCE }
+                },
+            ),
+        )
+        .with_state(fixture.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let data = root.path().join("job-data");
+    fs::create_dir(&data).await.unwrap();
+    let transfer = JobTransfer::new(Client::new(settings).unwrap()).unwrap();
+    assert!(
+        transfer
+            .prepare_assets(&fixture.job, &data, &node)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("SHA-256")
+    );
+    let staged = data.join("asset/scripts/test.lua");
+    assert!(!staged.exists());
+    transfer
+        .prepare_assets(&fixture.job, &data, &node)
+        .await
+        .unwrap();
+    transfer
+        .prepare_assets(&fixture.job, &data, &node)
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&staged).await.unwrap(), SOURCE);
+    assert_eq!(fixture.traffic.lock().unwrap().calls.len(), 4);
+    fs::remove_file(&staged).await.unwrap();
+    transfer
+        .prepare_assets(&fixture.job, &data, &node)
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&staged).await.unwrap(), SOURCE);
+    assert_eq!(fixture.traffic.lock().unwrap().calls.len(), 6);
+    server.abort();
 }
 
 #[tokio::test]

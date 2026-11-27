@@ -147,6 +147,10 @@ pub enum StorageConfigError {
     Path(#[from] PathError),
     #[error("storage.prefix is too long")]
     PrefixTooLong,
+    #[error(
+        "storage.asset_import_prefix must be separate from storage.prefix and at most 128 characters"
+    )]
+    InvalidAssetImportPrefix,
     #[error("storage.presign_ttl must be 1..=604800 whole seconds")]
     InvalidPresignTtl,
     #[error("artifact fullpath must start with /")]
@@ -163,6 +167,8 @@ pub struct StorageConfig {
     pub bucket: String,
     #[serde(default = "default_prefix")]
     pub prefix: String,
+    /// Optional separate bucket prefix that operators make available for asset imports.
+    pub asset_import_prefix: Option<String>,
     #[serde(default = "default_region")]
     pub region: String,
     pub access_key: String,
@@ -197,6 +203,7 @@ impl std::fmt::Debug for StorageConfig {
             .field("endpoint", &self.endpoint)
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
+            .field("asset_import_prefix", &self.asset_import_prefix)
             .field("region", &self.region)
             .field("presign_ttl", &self.presign_ttl)
             .field("multipart_enabled", &self.multipart_enabled)
@@ -242,9 +249,25 @@ impl StorageConfig {
         {
             return Err(StorageConfigError::InvalidBucket);
         }
-        validate_relative_path(self.prefix.trim_matches('/'))?;
+        let prefix = self.prefix.trim_matches('/');
+        validate_relative_path(prefix)?;
         if self.prefix.chars().count() > 128 {
             return Err(StorageConfigError::PrefixTooLong);
+        }
+        if let Some(import) = &self.asset_import_prefix {
+            let import = import.trim_matches('/');
+            validate_relative_path(import)?;
+            if import.chars().count() > 128
+                || prefix == import
+                || prefix
+                    .strip_prefix(import)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                || import
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                return Err(StorageConfigError::InvalidAssetImportPrefix);
+            }
         }
         if !(1..=604800).contains(&self.presign_ttl.as_secs())
             || self.presign_ttl.subsec_nanos() != 0

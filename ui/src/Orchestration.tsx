@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, ArrowLeft, Box, CalendarClock, CalendarPlus, Check, Code2, Copy, Download, GitBranch, GitCompare, LayoutGrid, Link2, Pencil, Plus, Rocket, Save, Star, Trash2, UserPen, UserPlus, Workflow, X } from 'lucide-react';
 import { api, dateTime, send, usePaged } from './api';
+import { NodeAssets } from './Assets';
 import { useAuditActorName } from './audit';
 import { Badge, Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination, Refresh, SearchBox, UuidText } from './components';
 import { DockerConfigFields, DockerConfigInput, parseDockerConfig } from './DockerConfigInput';
@@ -272,7 +273,7 @@ function Editor({ initial, isNew, actor, notify, dirtyChanged, close }: { initia
   async function save(publish = false) {
     setBusy(true); setError(undefined);
     try {
-      const savedGraph = await send<Graph>(`/graphs/${graph.id}/draft`, { graph, actor }, 'PUT');
+      const savedGraph = normalizeGraph(await send<Graph>(`/graphs/${graph.id}/draft`, { graph, actor }, 'PUT'));
       setGraph(savedGraph);
       setSaved(JSON.stringify(savedGraph));
       if (publish) {
@@ -353,6 +354,7 @@ function NodeInspector({ node, graph, update, change, remove, disabled }: { node
         </select>
       </div>)}
     </div>
+    <NodeAssets assets={node.assets} change={(assets) => update({ ...node, assets })} />
     <div className="field-section"><h3>Connections <Link2 size={14} /></h3>{graph.edges.filter(([source]) => source === node.id).map(([source, destination]) => <div className="connection" key={destination}><span>→ {graph.nodes.find((item) => item.id === destination)?.name}</span><button type="button" className="icon-button" aria-label="Remove connection" onClick={() => change(disconnectEdges(graph, [[source, destination]]))}><X size={13} /></button></div>)}<div className="actions"><select aria-label="Connect to node" value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Connect to…</option>{graph.nodes.filter((item) => item.id !== node.id && !upstream.has(item.id) && !graph.edges.some(([source, destination]) => source === node.id && destination === item.id)).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button type="button" className="icon-button" disabled={!target} aria-label="Add connection" onClick={() => { change({ ...graph, edges: [...graph.edges, [node.id, target]] }); setTarget(''); }}><Plus size={16} /></button></div></div>
     <button type="button" className="button danger subtle" onClick={remove}><Trash2 size={15} />Delete node</button><UuidText className="mono inspector-id" id={node.id} />
   </fieldset>{configuring && <DockerConfigEditor config={node.settings.config} close={() => setConfiguring(false)} apply={(config) => { updateConfig(config); setConfiguring(false); }} />}</>;
@@ -406,6 +408,7 @@ function JsonEditor({ value, close, apply, graphId }: { value: string; close: ()
         }
         if (node.inputs.some((input) => !input || typeof input.file_name !== 'string' || typeof input.source !== 'string' || typeof input.required !== 'boolean' || !(input.format === null || typeof input.format === 'string'))) throw new Error('Inputs need file_name, source, required, and format (string or null).');
         if (node.outputs.some((output) => !output || typeof output.file_name !== 'string' || !['File', 'Directory'].includes(output.kind))) throw new Error('Outputs need file_name and kind (File or Directory).');
+        if (node.assets !== undefined && (!Array.isArray(node.assets) || node.assets.some((asset) => !asset || typeof asset.file_name !== 'string' || typeof asset.asset_id !== 'string' || !uuid.test(asset.asset_id)))) throw new Error('Assets need file_name and an asset_id UUID.');
       }
       if (graph.edges.some((edge) => !Array.isArray(edge) || edge.length !== 2 || !edge.every((id) => uuid.test(id)))) throw new Error('Edges must be pairs of node UUIDs.');
       apply(normalizeGraph(graph));

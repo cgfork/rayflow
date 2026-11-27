@@ -442,17 +442,28 @@ fn sign_request<E>(
         .settings(settings)
         .build()?
         .into();
+    let mut headers = std::collections::BTreeMap::new();
+    if let PresignOperation::Copy { source } = &operation {
+        let source_uri = object_uri(&config.endpoint, source)?;
+        let path = source_uri
+            .strip_prefix(&config.endpoint)
+            .ok_or(Error::InvalidObjectUrl)?;
+        headers.insert("x-amz-copy-source".to_owned(), path.to_owned());
+    }
     let signable = SignableRequest::new(
         operation.method(),
         uri,
-        std::iter::empty(),
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
         SignableBody::UnsignedPayload,
     )?;
     let (instructions, _) = sign(signable, &params)?.into_parts();
-    let headers = instructions
-        .headers()
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
-        .collect();
+    headers.extend(
+        instructions
+            .headers()
+            .map(|(name, value)| (name.to_owned(), value.to_owned())),
+    );
     let mut request = http::Request::builder()
         .method(operation.method())
         .uri(uri)
@@ -464,4 +475,37 @@ fn sign_request<E>(
         headers,
         expires_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_signs_the_encoded_source_header_on_the_destination() {
+        let config = Config::new(
+            "https://objects.example",
+            Credentials::new("access", "secret", None, None, "test"),
+        );
+        let operation = PresignOperation::Copy {
+            source: "s3://fixtures/shared/a%20b.lua".into(),
+        };
+        let signed = sign_request::<std::convert::Infallible>(
+            &config,
+            "https://objects.example/fixtures/assets/copy.lua",
+            operation,
+            Duration::from_secs(60),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        )
+        .unwrap();
+        assert_eq!(
+            signed.headers["x-amz-copy-source"],
+            "/fixtures/shared/a%20b.lua"
+        );
+        let url = url::Url::parse(&signed.url).unwrap();
+        assert_eq!(url.path(), "/fixtures/assets/copy.lua");
+        assert!(url.query_pairs().any(
+            |(key, value)| key == "X-Amz-SignedHeaders" && value.contains("x-amz-copy-source")
+        ));
+    }
 }

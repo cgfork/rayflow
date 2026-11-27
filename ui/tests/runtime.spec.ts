@@ -20,7 +20,7 @@ function graphNode(id: string, name: string): GraphNode {
   return {
     id, name, node_type: 'script',
     settings: { config: {}, resource: { cpu_cores: 1, memory_bytes: 1024 }, timeout: '10s' },
-    inputs: [], outputs: [],
+    inputs: [], outputs: [], assets: [],
   };
 }
 

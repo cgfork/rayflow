@@ -1,4 +1,5 @@
 mod agent;
+mod asset;
 mod error;
 mod graph;
 mod job;

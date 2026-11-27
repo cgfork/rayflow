@@ -14,6 +14,7 @@ function workflow(id: string, name: string, nodeNames: string[]): Graph {
     node_type: 'docker',
     settings: { config: { image: 'example.invalid/inventory-worker' }, resource: { cpu_cores: 2, memory_bytes: 536870912 }, timeout: '2m' },
     inputs: [],
+    assets: [],
     outputs: [],
   }));
   return {

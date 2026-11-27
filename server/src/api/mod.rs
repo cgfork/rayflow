@@ -41,6 +41,7 @@
 //! and `error` (the human-readable message).
 
 pub mod agent;
+pub mod asset;
 pub mod graph;
 pub mod job;
 pub mod run;
@@ -79,6 +80,7 @@ where
     };
     graph::routes::<S>()
         .merge(agent::routes::<S>())
+        .merge(asset::routes::<S>())
         .merge(run::routes::<S>())
         .merge(job::routes::<S>())
         .merge(user::routes::<S>())

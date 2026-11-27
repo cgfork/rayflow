@@ -297,7 +297,7 @@ Open `http://127.0.0.1:5173`. Vite forwards `/api/v1/*` requests to
 RAYFLOW_API_URL=http://127.0.0.1:8081 npm run dev --prefix ui
 ```
 
-The four sections use the same resource APIs as other clients:
+The console uses the same resource APIs as other clients:
 
 - **Orchestration** lets you create graphs, connect nodes, edit inputs and
   outputs, save drafts, and publish immutable versions. The Drafts table lists
@@ -314,6 +314,9 @@ The four sections use the same resource APIs as other clients:
   cycles and invalid roots and marks unreferenced outputs as informational.
   Publishing also runs the server validator. Node positions are local to the
   open editor.
+- **Assets** publishes versioned files for reuse by nodes. The browser sends
+  file bytes to RustFS using a presigned upload URL. In a draft, add an asset
+  under Node Properties and choose the exact version and mount path.
 - **Runtime:** start runs and inspect every node in a run's pinned graph version.
   Use **Rerun** in the run list or detail header to choose a starting node, or
   select a node on the graph and use **Rerun node**. Ready, succeeded, failed,
@@ -805,6 +808,43 @@ Docker jobs receive the job directory as a read-only `/rayflow` mount. The
 container can read `/rayflow/job.json` and the pinned `/rayflow/graph.json`;
 `RAYFLOW_JOB_FILE` and `RAYFLOW_GRAPH_FILE` point to those paths. Inputs and
 outputs remain mounted separately at `/data/inputs` and `/data/outputs`.
+
+### Run a Lua script from a shared asset
+
+Build the runner image from the repository root and make it available to each
+agent that will execute the task.
+
+```sh
+docker build -f examples/runlua/Dockerfile -t rayflow-runlua:local .
+```
+
+Upload `transform.lua` through **Assets** and add that version to the node as
+an asset with `transform.lua` as its mount path. Set the node's Docker config:
+
+```json
+{
+  "image": "rayflow-runlua:local",
+  "command": ["/data/assets/transform.lua", "daily"]
+}
+```
+
+`runlua` executes the first argument as a Lua 5.4 source file. Remaining
+arguments are available as `arg[1]`, `arg[2]`, and top-level varargs. The
+runner exposes the mounted metadata as `rayflow.job`, `rayflow.graph`, and
+`rayflow.node`. It provides these helpers for declared files:
+
+| Lua function | Behavior |
+| --- | --- |
+| `rayflow.input_path(name[, member])` | Resolve a staged input or a member of a directory input. An absent optional input returns `nil`. |
+| `rayflow.list_input(name)` | Read a directory input's manifest entries. |
+| `rayflow.output_path(name[, member])` | Resolve an output and create any required parent directories. |
+| `rayflow.asset_path(name)` | Resolve a staged shared asset relative to `RAYFLOW_ASSET_DIR`. |
+
+Scripts can open those paths with Lua's `io.open`. Rayflow mounts asset and
+input directories read-only. An uncaught Lua error exits nonzero. The job
+container provides the same runtime isolation as for other Docker tasks.
+
+See [Shared assets](catalog.md#shared-assets) for the upload and download APIs.
 
 Configure the server's S3-compatible storage before running nodes with artifacts.
 See [Catalog and object storage](catalog.md#job-artifact-api) for

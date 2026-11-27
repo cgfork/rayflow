@@ -4,7 +4,7 @@ use std::fmt;
 use uuid::Uuid;
 
 use crate::annotation_match::AnnotationMatch;
-use crate::types::{DAG, DEFAULT_NODE_CONFIG_NAME, NamedNodeSettings, Node, Output};
+use crate::types::{AssetRef, DAG, DEFAULT_NODE_CONFIG_NAME, NamedNodeSettings, Node, Output};
 use crate::{Graph, Id};
 
 /// A structural error in a graph.
@@ -120,6 +120,50 @@ pub enum WorkflowValidationError {
     InvalidFileNames { node: String, port: &'static str },
     #[error("{node}: input {input} must select an upstream output")]
     InvalidInputSource { node: String, input: String },
+    #[error("{node}: invalid or overlapping asset path {path:?}")]
+    InvalidAssetPath { node: String, path: String },
+    #[error("{node}: asset {path:?} must select an asset version")]
+    InvalidAssetId { node: String, path: String },
+}
+
+/// Validates asset declarations within the separate asset mount.
+pub fn validate_assets(node: &Node) -> Result<(), WorkflowValidationError> {
+    let invalid_path = |path: &str| WorkflowValidationError::InvalidAssetPath {
+        node: node.name.clone(),
+        path: path.to_owned(),
+    };
+    let mut paths = HashSet::new();
+    for AssetRef {
+        file_name,
+        asset_id,
+    } in &node.assets
+    {
+        if file_name.contains('\\')
+            || file_name.chars().any(char::is_control)
+            || file_name
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".." || part.contains(':'))
+            || !paths.insert(file_name.as_str())
+        {
+            return Err(invalid_path(file_name));
+        }
+        if asset_id.is_nil() {
+            return Err(WorkflowValidationError::InvalidAssetId {
+                node: node.name.clone(),
+                path: file_name.clone(),
+            });
+        }
+    }
+    for asset in &node.assets {
+        let path = &asset.file_name;
+        if path
+            .match_indices('/')
+            .any(|(index, _)| paths.contains(&path[..index]))
+        {
+            return Err(invalid_path(path));
+        }
+    }
+    Ok(())
 }
 
 /// Validates runnable settings and input bindings before publishing a DAG.
@@ -145,6 +189,7 @@ pub fn validate_workflow(graph: &DAG) -> Result<(), WorkflowValidationError> {
         for settings in node.settings.named_settings() {
             validate_node_settings(node, &settings)?;
         }
+        validate_assets(node)?;
         for (label, ports) in [
             (
                 "input",
@@ -298,4 +343,39 @@ pub fn unreferenced_outputs(graph: &DAG) -> Vec<UnreferencedOutput<'_>> {
         }
     }
     outputs
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+
+    #[test]
+    fn older_nodes_serialize_an_empty_asset_array_and_mount_paths_cannot_overlap() {
+        let mut node: Node = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(), "name": "task", "node_type": "docker",
+            "inputs": [], "outputs": [],
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&node).unwrap()["assets"],
+            serde_json::json!([])
+        );
+
+        let asset_id = Uuid::new_v4();
+        node.assets = ["scripts/run.lua", "scripts-data"]
+            .map(|file_name| AssetRef {
+                file_name: file_name.into(),
+                asset_id,
+            })
+            .to_vec();
+        validate_assets(&node).unwrap();
+        node.assets.push(AssetRef {
+            file_name: "scripts".into(),
+            asset_id,
+        });
+        assert!(matches!(
+            validate_assets(&node),
+            Err(WorkflowValidationError::InvalidAssetPath { .. }),
+        ));
+    }
 }

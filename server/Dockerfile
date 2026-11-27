@@ -14,6 +14,7 @@ COPY crates/ crates/
 COPY server/ server/
 COPY pilot/ pilot/
 COPY agent/ agent/
+COPY examples/runlua/ examples/runlua/
 COPY --from=ui /build/ui/dist/ ui/dist/
 RUN cargo build --locked --release -p server --features embed-ui --bin server --bin init-db
 

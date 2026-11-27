@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import type { Graph, GraphNode, Run } from '../src/types';
 
@@ -15,6 +16,7 @@ function graph(id: string, name: string, version: number, nodeNames: string[]): 
     settings: { config: { image: 'example.invalid/worker' }, resource: { cpu_cores: 1, memory_bytes: 1048576 }, timeout: '30s' },
     inputs: [],
     outputs: [],
+    assets: [],
   }));
   return { id, name, version, node_count: nodes.length, nodes, edges: nodes.slice(1).map((node, index) => [nodes[index].id, node.id]) };
 }
@@ -319,6 +321,76 @@ test('The draft editor saves output kinds and converts legacy multi-file JSON', 
     { file_name: 'bundle', kind: 'Directory' },
     { file_name: 'report.json', kind: 'File' },
   ]);
+});
+
+test('The browser uploads a shared asset to RustFS and pins it on a node', async ({ page }) => {
+  await mockGraphs(page);
+  const script = Buffer.from('print("hello")');
+  const asset = {
+    asset_id: 'aa000000-0000-4000-8000-000000000001',
+    name: 'transform', version: 1, size: script.length, format: 'text/x-lua',
+    sha256: createHash('sha256').update(script).digest('hex'), published_at: '2026-11-15T02:30:00Z',
+  };
+  const uploadId = 'aa000000-0000-4000-8000-000000000002';
+  const uploadUrl = 'https://rustfs.example.test/bucket/asset-staging/upload?signature=fixture';
+  let committed = false;
+  let uploaded = false;
+  let draft = report;
+  await page.route(`**${api}/assets?limit=50`, (route) => route.fulfill({
+    json: { items: committed ? [asset] : [], next_cursor: null },
+  }));
+  await page.route(`**${api}/assets/${asset.asset_id}`, (route) => route.fulfill({ json: asset }));
+  await page.route(`**${api}/assets/prepare`, (route) => {
+    expect(route.request().postDataJSON()).toEqual({
+      name: asset.name, version: asset.version, size: asset.size, format: asset.format, sha256: asset.sha256,
+    });
+    return route.fulfill({ json: {
+      state: 'pending', asset_id: asset.asset_id, upload_id: uploadId,
+      upload: { operation: 'upload', url: uploadUrl, headers: { 'x-upload-marker': 'staging' } },
+    } });
+  });
+  await page.route(uploadUrl, (route) => {
+    const request = route.request();
+    const headers = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'PUT', 'access-control-allow-headers': '*' };
+    if (request.method() === 'OPTIONS') return route.fulfill({ status: 204, headers });
+    expect(request.method()).toBe('PUT');
+    expect(request.headers()['x-upload-marker']).toBe('staging');
+    expect(request.headers()['x-rayflow-request']).toBeUndefined();
+    expect(request.postDataBuffer()).toEqual(script);
+    uploaded = true;
+    return route.fulfill({ status: 200, headers });
+  });
+  await page.route(`**${api}/assets/${asset.asset_id}/commit`, (route) => {
+    expect(uploaded).toBe(true);
+    expect(route.request().postDataJSON()).toEqual({ upload_id: uploadId });
+    committed = true;
+    return route.fulfill({ json: asset });
+  });
+  await page.route(`**${api}/graphs/${report.id}/draft`, (route) => {
+    if (route.request().method() === 'PUT') draft = route.request().postDataJSON().graph;
+    return route.fulfill({ json: draft });
+  });
+
+  await page.goto('/#/assets');
+  await page.getByRole('button', { name: 'Upload asset' }).click();
+  const upload = page.getByRole('dialog', { name: 'Upload asset' });
+  await upload.getByLabel('Asset name').fill(asset.name);
+  await upload.getByLabel('File').setInputFiles({ name: 'script.lua', mimeType: asset.format, buffer: script });
+  await upload.getByRole('button', { name: 'Publish asset' }).click();
+  await expect(page.getByRole('table', { name: 'Published assets' })).toContainText(asset.name);
+
+  await page.getByRole('link', { name: /^Orchestration/ }).click();
+  await draftRow(page, report.name).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByRole('button', { name: 'Add asset', exact: true }).click();
+  const picker = page.getByRole('dialog', { name: 'Add asset' });
+  await picker.getByLabel('Asset version').selectOption(asset.asset_id);
+  await picker.getByLabel('Mount path').fill('scripts/transform.lua');
+  await expect(picker.getByText('/data/assets/scripts/transform.lua', { exact: true })).toBeVisible();
+  await picker.getByRole('button', { name: 'Add asset' }).click();
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved.', { exact: true })).toBeVisible();
+  expect(draft.nodes[0].assets).toEqual([{ asset_id: asset.asset_id, file_name: 'scripts/transform.lua' }]);
+  expect(draft.edges).toEqual([]);
 });
 
 test('The draft table shows workflow metadata, row actions, and copyable IDs', async ({ page, context }) => {

@@ -130,6 +130,7 @@ fn workflow() -> DAG {
             id: Uuid::new_v4(),
             name: name.into(),
             node_type: "test".into(),
+            assets: vec![],
             settings: NodeSettings {
                 config: json!({}),
                 resource: Resource {
@@ -207,6 +208,7 @@ fn storage_config() -> Config {
             endpoint: "http://127.0.0.1:9000".into(),
             bucket: "workflow-test".into(),
             prefix: "artifacts".into(),
+            asset_import_prefix: None,
             region: "us-east-1".into(),
             access_key: "test-key".into(),
             secret_key: "test-secret".into(),

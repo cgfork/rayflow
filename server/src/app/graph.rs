@@ -132,6 +132,7 @@ impl<S> App<S> {
         let mut tx = db.transaction().await?;
         tx.publish(graph_id, actor).await?;
         let graph = tx.load(graph_id, None).await?;
+        super::asset::validate_graph_assets(&mut tx, &graph).await?;
         for node in &graph.nodes {
             for settings in node.settings.named_settings() {
                 if graph.updated_at.checked_add(settings.timeout).is_err()

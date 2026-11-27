@@ -22,7 +22,8 @@ type NodeDiff =
   | FieldDiff<'id' | 'name' | 'node_type'>
   | { field: 'settings'; change: SettingsDiff[] }
   | { field: 'inputs'; change: PortDiff[] }
-  | { field: 'outputs'; change: PortDiff[] };
+  | { field: 'outputs'; change: PortDiff[] }
+  | { field: 'assets'; change: PortDiff[] };
 type Edge = [string, string];
 
 interface StructureDiff {
@@ -47,6 +48,7 @@ interface GraphComparison {
 const nodeFields: Record<string, string> = {
   id: 'Node ID', name: 'Name', node_type: 'Node type', file_name: 'File name',
   source: 'Source', required: 'Required', format: 'Format', kind: 'Kind',
+  asset_id: 'Asset ID',
   cpu_cores: 'CPU cores', memory_bytes: 'Memory (bytes)',
 };
 
@@ -132,9 +134,9 @@ function settingsRows(changes: SettingsDiff[]): DiffRow[] {
 function nodeRows(changes: NodeDiff[]): DiffRow[] {
   return changes.flatMap<DiffRow>(({ field, change }) => {
     if (field === 'settings') return settingsRows(change);
-    if (field === 'inputs' || field === 'outputs') {
+    if (field === 'inputs' || field === 'outputs' || field === 'assets') {
       return change.flatMap<DiffRow>((port) => {
-        const label = `${field === 'inputs' ? 'Input' : 'Output'} ${port.index + 1}`;
+        const label = `${{ inputs: 'Input', outputs: 'Output', assets: 'Asset' }[field]} ${port.index + 1}`;
         if (port.kind === 'changed') {
           return port.changes.map(({ field, change }) => ({ key: `${label}:${field}`, label: `${label} · ${nodeFieldName(field)}`, values: change }));
         }

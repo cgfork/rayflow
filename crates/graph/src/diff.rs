@@ -227,6 +227,7 @@ mod tests {
             id,
             name: format!("node-{}", id.as_u128()),
             node_type: "docker".into(),
+            assets: vec![],
             settings: Default::default(),
             inputs: vec![],
             outputs: vec![],

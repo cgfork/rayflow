@@ -116,6 +116,9 @@ pub trait FileSystem: CatalogSystem {
 pub enum PresignOperation {
     Upload,
     Download,
+    Head,
+    Copy { source: String },
+    Delete,
     CreateMultipart,
     UploadPart { upload_id: String, part_number: u32 },
     CompleteMultipart { upload_id: String },
@@ -125,15 +128,22 @@ pub enum PresignOperation {
 impl PresignOperation {
     pub const fn method(&self) -> &'static str {
         match self {
-            Self::Upload | Self::UploadPart { .. } => "PUT",
+            Self::Upload | Self::Copy { .. } | Self::UploadPart { .. } => "PUT",
             Self::Download => "GET",
+            Self::Head => "HEAD",
             Self::CreateMultipart | Self::CompleteMultipart { .. } => "POST",
-            Self::AbortMultipart { .. } => "DELETE",
+            Self::Delete | Self::AbortMultipart { .. } => "DELETE",
         }
     }
 
     pub const fn is_multipart(&self) -> bool {
-        !matches!(self, Self::Upload | Self::Download)
+        matches!(
+            self,
+            Self::CreateMultipart
+                | Self::UploadPart { .. }
+                | Self::CompleteMultipart { .. }
+                | Self::AbortMultipart { .. }
+        )
     }
 
     pub fn is_valid(&self) -> bool {

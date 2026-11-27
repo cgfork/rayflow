@@ -21,6 +21,14 @@ pub struct Transfer {
     pub multipart: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct AssetTransfer {
+    pub asset_id: Uuid,
+    pub sha256: String,
+    #[serde(flatten)]
+    pub transfer: Transfer,
+}
+
 #[derive(Serialize)]
 struct MultipartPresignRequest<'a> {
     job_id: Uuid,
@@ -280,6 +288,25 @@ impl Client {
             return Ok(None);
         }
         Ok(Some(response.error_for_status()?.json().await?))
+    }
+
+    pub(crate) async fn download_asset(
+        &self,
+        job_id: Uuid,
+        agent_id: Uuid,
+        filename: &str,
+    ) -> Result<AssetTransfer, Error> {
+        let body =
+            serde_json::json!({"job_id": job_id, "agent_id": agent_id, "filename": filename});
+        Ok(self
+            .http
+            .post(format!("{}/job/asset/presign", self.base_url()))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     pub fn new(settings: Settings) -> Result<Self, Error> {

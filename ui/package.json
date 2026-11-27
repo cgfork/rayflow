@@ -17,6 +17,7 @@
     "@codemirror/language": "^6.13.1",
     "@codemirror/lint": "^6.9.8",
     "@lezer/highlight": "^1.2.5",
+    "@noble/hashes": "^2.4.0",
     "@xyflow/react": "^12.0.0",
     "codemirror": "^6.0.2",
     "lucide-react": "^0.468.0",

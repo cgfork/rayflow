@@ -13,8 +13,8 @@ use agent::{
     JobManager, JobOutcome, JobResult, JobUsage, StopReason, Usage, UsagePercentiles,
     client::Client,
     containerd::{
-        Container, ContainerEvent, ContainerState, Containerd, ExitStatus,
-        docker::{DockerContainerd, DockerFiles, DockerSpec},
+        Container, ContainerEvent, ContainerFile, ContainerState, Containerd, ExitStatus,
+        docker::{DockerContainerd, DockerSpec},
     },
     errors::Error,
     settings::Settings,
@@ -112,6 +112,7 @@ impl Workflow {
                     id: node_run.node_id,
                     name: "execute".into(),
                     node_type: "docker".into(),
+                    assets: vec![],
                     settings: NodeSettings::default(),
                     inputs: vec![],
                     outputs: output
@@ -345,19 +346,13 @@ impl Containerd for FakeProvider {
         DockerSpec::try_from(job)
     }
 
-    fn spec_with_files<'a>(
+    fn spec_with_files<'a, 'files>(
         &'a self,
         job: &'a Job,
-        metadata: &Path,
-        inputs: &Path,
-        outputs: &Path,
+        files: impl IntoIterator<Item = &'files ContainerFile>,
     ) -> Result<Self::Spec<'a>, Error> {
         let mut spec = self.spec(job)?;
-        spec.files = Some(DockerFiles {
-            metadata: metadata.into(),
-            inputs: inputs.into(),
-            outputs: outputs.into(),
-        });
+        spec.files = files.into_iter().cloned().collect();
         Ok(spec)
     }
 
@@ -469,10 +464,22 @@ async fn yield_and_resume_isolate_job_data_and_keep_unarchived_files() {
     manager.start(job.clone()).await;
     let spec = provider.0.lock().unwrap().prepared[0].clone();
     assert_eq!(spec.image, "fixture-image");
-    let mounts = spec.files.unwrap();
-    assert_eq!(mounts.inputs, data.join("inputs").canonicalize().unwrap());
-    assert_eq!(mounts.outputs, data.join("outputs").canonicalize().unwrap());
-    assert_eq!(mounts.metadata, dir.canonicalize().unwrap());
+    assert_eq!(spec.files.len(), 4);
+    for (target, source, read_only) in [
+        ("/rayflow", dir.clone(), true),
+        ("/data/inputs", data.join("inputs"), true),
+        ("/data/outputs", data.join("outputs"), false),
+        ("/data/assets", data.join("asset"), true),
+    ] {
+        let mount = spec
+            .files
+            .iter()
+            .find(|mount| mount.target == target)
+            .unwrap();
+        assert_eq!(mount.source, source.canonicalize().unwrap());
+        assert_eq!(mount.read_only, read_only);
+    }
+    assert!(data.join("asset").read_dir().unwrap().next().is_none());
     let pinned: DAG =
         serde_json::from_slice(&fs::read(dir.join("graph.json")).await.unwrap()).unwrap();
     assert_eq!(pinned.version, workflow.run.version);

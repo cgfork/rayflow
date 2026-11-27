@@ -510,6 +510,7 @@ main:has(> .runtime-canvas) > .back-link { align-self: flex-start; }
 .port-form { margin-bottom: var(--space-2); padding: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius); background: var(--canvas); }
 .port-form input, .port-form select { font-size: var(--font-small); }
 .port-form > input, .port-form > select { margin-top: var(--space-2); }
+.asset-reference { display: grid; flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .checkbox { display: flex; align-items: center; gap: var(--space-2); margin-top: var(--space-2); color: var(--muted); font-size: var(--font-small); }
 .checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(--brand); }
 .connection { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); padding-left: var(--space-2); border-radius: var(--radius); background: var(--canvas); color: var(--muted); font-size: var(--font-small); overflow-wrap: anywhere; }

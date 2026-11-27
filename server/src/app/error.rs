@@ -15,6 +15,16 @@ pub enum AppError {
     StorageUnavailable,
     #[error("artifact not found: {0}")]
     ArtifactNotFound(String),
+    #[error("asset version is not published: {0}")]
+    AssetNotFound(Uuid),
+    #[error("asset version is already reserved or the upload ID does not match")]
+    AssetConflict,
+    #[error("asset upload belongs to another user")]
+    AssetUploadForbidden,
+    #[error("asset upload is not available in storage")]
+    AssetUploadIncomplete,
+    #[error("asset size or SHA-256 digest does not match its expected value")]
+    AssetIntegrity,
     #[error(transparent)]
     Catalog(#[from] ::catalog::Error),
     #[error(transparent)]
@@ -124,6 +134,11 @@ impl AppError {
                 (Status::SERVICE_UNAVAILABLE, "RAYFLOW_STORAGE_UNAVAILABLE")
             }
             Self::ArtifactNotFound(_) => (Status::NOT_FOUND, "RAYFLOW_ARTIFACT_NOT_FOUND"),
+            Self::AssetNotFound(_) => (Status::NOT_FOUND, "RAYFLOW_ASSET_NOT_FOUND"),
+            Self::AssetConflict => (Status::CONFLICT, "RAYFLOW_ASSET_CONFLICT"),
+            Self::AssetUploadForbidden => (Status::FORBIDDEN, "RAYFLOW_ASSET_UPLOAD_FORBIDDEN"),
+            Self::AssetUploadIncomplete => (Status::CONFLICT, "RAYFLOW_ASSET_UPLOAD_INCOMPLETE"),
+            Self::AssetIntegrity => (Status::UNPROCESSABLE_ENTITY, "RAYFLOW_ASSET_INTEGRITY"),
             Self::Catalog(error) => catalog_error(error),
             Self::Storage(error) => storage_error(error.as_ref()),
             Self::StorageConfiguration(_) => {

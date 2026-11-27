@@ -135,6 +135,36 @@ impl crate::File for File {
     }
 }
 
+/// A reserved or published version of a reusable asset.
+#[derive(Clone, Debug, toasty::Model)]
+#[table = "asset"]
+#[unique(uuid)]
+#[unique(name, version)]
+pub struct Asset {
+    #[key]
+    #[auto]
+    pub id: u64,
+    pub uuid: Uuid,
+    #[column(type = varchar(255))]
+    pub name: String,
+    pub version: u64,
+    #[unique]
+    pub catalog_uuid: Option<Uuid>,
+    // Migration 27 stores exactly 32 bytes. Toasty uses its bytes mapping
+    // here because its binary length override is incompatible with this derive.
+    pub sha256: Vec<u8>,
+    pub size: u64,
+    #[column(type = varchar(255))]
+    pub format: String,
+    pub upload_id: Option<Uuid>,
+    #[column(type = varchar(750))]
+    pub source_url: String,
+    #[column(type = varchar(64))]
+    pub created_by: String,
+    pub created_at: Timestamp,
+    pub published_at: Option<Timestamp>,
+}
+
 pub fn models() -> toasty::ModelSet {
-    toasty::models!(Catalog, File)
+    toasty::models!(Catalog, File, Asset)
 }

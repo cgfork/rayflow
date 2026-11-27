@@ -3,16 +3,28 @@
 //! Providers translate pinned job configurations and optional artifact mounts
 //! into container specifications. `JobManager` owns lifecycle and persistence.
 
-use std::pin::Pin;
+use std::{path::PathBuf, pin::Pin};
 
 use futures_util::Stream;
 use jiff::Timestamp;
 use scheduler::Job;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Usage, errors::Error};
 
 pub mod docker;
+
+/// One host path exposed to a job container.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerFile {
+    pub source: PathBuf,
+    pub target: String,
+    pub read_only: bool,
+    /// Environment variables provided by this mount.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
 
 /// The identifier used by a container provider to address a container.
 ///
@@ -182,15 +194,16 @@ pub trait Containerd: Clone + Send + Sync + 'static {
     /// job filesystem; those actions belong to `prepare` and `create`.
     fn spec<'a>(&'a self, job: &'a Job) -> Result<Self::Spec<'a>, Error>;
 
-    /// Builds a specification exposing prepared inputs and writable outputs.
-    /// Providers that execute jobs with artifacts must implement this method.
-    fn spec_with_files<'a>(
+    /// Builds a specification exposing the supplied paths and their environment variables.
+    /// Providers that execute jobs with mounts must implement this method.
+    fn spec_with_files<'a, 'files>(
         &'a self,
-        _job: &'a Job,
-        _metadata: &std::path::Path,
-        _inputs: &std::path::Path,
-        _outputs: &std::path::Path,
+        job: &'a Job,
+        files: impl IntoIterator<Item = &'files ContainerFile>,
     ) -> Result<Self::Spec<'a>, Error> {
+        if files.into_iter().next().is_none() {
+            return self.spec(job);
+        }
         Err(Error::Provider(
             "container provider does not support artifact directories".into(),
         ))
