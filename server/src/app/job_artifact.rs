@@ -1,13 +1,15 @@
 //! Storage and claim checks for job metadata archives.
 
-use catalog::{CatalogOptionalData, CatalogSystem, ObjectStorage, PresignOperation, PresignedUrl};
+use catalog::{
+    CatalogOptionalData, CatalogSystem, ObjectStorage, PresignOperation, model::Catalog,
+};
 use jiff::Timestamp;
 use scheduler::{Job, JobArtifactName, actuator::Status};
 use toasty::{Executor, Transaction, schema::Model};
 use uuid::Uuid;
 
 use super::{App, AppError};
-use crate::api::run::Transfer;
+use crate::api::run::{JobArtifactDownload, Transfer};
 
 const FORMAT: &str = "application/json";
 
@@ -118,7 +120,7 @@ impl<S> App<S> {
         run_id: Uuid,
         node_run_id: Uuid,
         filename: JobArtifactName,
-    ) -> Result<Option<PresignedUrl>, AppError> {
+    ) -> Result<Option<JobArtifactDownload>, AppError> {
         let mut db = self.db.clone();
         let Some(job) = Job::filter_by_node_run_id(node_run_id)
             .filter(Job::fields().run_id().eq(run_id))
@@ -149,10 +151,10 @@ impl<S> App<S> {
             .as_ref()
             .ok_or(AppError::StorageUnavailable)?;
         let storage = config.object_storage(self.db.clone())?;
-        storage
+        let presigned = storage
             .presign_catalog(&catalog, PresignOperation::Download, config.presign_ttl)
-            .map(Some)
-            .map_err(|error| AppError::Storage(Box::new(error)))
+            .map_err(|error| AppError::Storage(Box::new(error)))?;
+        Ok(Some(JobArtifactDownload { catalog, presigned }))
     }
 
     pub async fn prepare_job_artifact(
@@ -251,7 +253,7 @@ impl<S> App<S> {
         agent_id: Uuid,
         filename: JobArtifactName,
         catalog_uuid: Uuid,
-    ) -> Result<Uuid, AppError> {
+    ) -> Result<Catalog, AppError> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let assignment = lock_assignment(&mut tx, job_id, agent_id)
@@ -279,7 +281,11 @@ impl<S> App<S> {
             )
             .await?;
         }
+        let catalog = tx
+            .get_catalog(catalog_uuid)
+            .await?
+            .ok_or_else(|| AppError::ArtifactNotFound(catalog_uuid.to_string()))?;
         tx.commit().await?;
-        Ok(catalog_uuid)
+        Ok(catalog)
     }
 }

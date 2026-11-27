@@ -46,6 +46,7 @@ const OUTPUT_MOUNT: &str = "/data/outputs";
 const ASSET_MOUNT: &str = "/data/assets";
 const MAX_ARCHIVE_UPLOADS: usize = 4;
 const CONTAINER_FILE: &str = "container.json";
+const ASSET_STAGE_FILE: &str = "asset-stage.json";
 
 /// The terminal action reported to the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,10 +273,19 @@ where
         ensure_dir(&data).await?;
         let inputs = data.join("inputs");
         let outputs = data.join("outputs");
-        let assets = data.join(ASSET_DIR);
         ensure_dir(&inputs).await?;
         ensure_dir(&outputs).await?;
-        ensure_dir(&assets).await?;
+        let assets = if node.assets.is_empty() {
+            let empty_assets = data.join(ASSET_DIR);
+            ensure_dir(&empty_assets).await?;
+            fs::canonicalize(&empty_assets).await?
+        } else {
+            let assets = self.inner.transfer.ensure_job_asset_dir(job_id).await?;
+            // Cleanup can recover the staging directory even if preparation
+            // stops before the container is created.
+            write_json(&directory.join(ASSET_STAGE_FILE), &true).await?;
+            assets
+        };
 
         let files = [
             ContainerFile {
@@ -300,7 +310,7 @@ where
                 env: vec![("RAYFLOW_OUTPUT_DIR".into(), OUTPUT_MOUNT.into())],
             },
             ContainerFile {
-                source: fs::canonicalize(&assets).await?,
+                source: assets,
                 target: ASSET_MOUNT.into(),
                 read_only: true,
                 env: vec![("RAYFLOW_ASSET_DIR".into(), ASSET_MOUNT.into())],
@@ -312,7 +322,7 @@ where
         while !lease_expired(&job) {
             let prepared = async {
                 self.inner.transfer.prepare_input(&job, &data, node).await?;
-                self.inner.transfer.prepare_assets(&job, &data, node).await
+                self.inner.transfer.prepare_assets(&job, node).await
             }
             .await;
             match prepared {

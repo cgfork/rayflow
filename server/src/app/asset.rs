@@ -11,6 +11,7 @@ use catalog::{
 use futures_util::StreamExt;
 use graph::{Graph, GraphStore, types::DAG};
 use jiff::Timestamp;
+use percent_encoding::percent_decode_str;
 use runtime::command::NodeRun;
 use scheduler::Job;
 use sha2::{Digest, Sha256};
@@ -21,7 +22,7 @@ use super::{App, AppError, Page, PageQuery};
 use crate::{
     api::asset::{
         AssetDescriptor, AssetTransfer, ImportAssetRequest, PrepareAssetRequest,
-        PrepareAssetResponse, PresignJobAssetRequest,
+        PrepareAssetResponse, PresignJobAssetRequest, PublishedAsset,
     },
     config::StorageConfig,
 };
@@ -149,6 +150,20 @@ async fn load_asset(db: &mut impl Executor, asset_id: Uuid) -> Result<Asset, App
         .ok_or(AppError::AssetNotFound(asset_id))
 }
 
+async fn lock_asset(tx: &mut Transaction<'_>, asset_id: Uuid) -> Result<(), AppError> {
+    let table = tx.schema().table_for(Asset::id()).name.replace('`', "``");
+    // Toasty cannot currently lock a selected record. Acquire the row lock
+    // before reading the asset and its catalog in this transaction.
+    toasty::sql::query(format!(
+        "SELECT id FROM `{table}` WHERE uuid = ? FOR UPDATE"
+    ))
+    .bind(asset_id)
+    .column_types([toasty::stmt::Type::U64])
+    .exec(tx)
+    .await?;
+    Ok(())
+}
+
 async fn lock_promotion(
     tx: &mut Transaction<'_>,
     uuid: Uuid,
@@ -182,6 +197,115 @@ async fn published_catalog(db: &mut impl Executor, asset: &Asset) -> Result<Cata
         .await?
         .filter(|catalog| catalog.uploaded)
         .ok_or(AppError::AssetNotFound(asset.uuid))
+}
+
+async fn published_asset(db: &mut impl Executor, asset: Asset) -> Result<PublishedAsset, AppError> {
+    let catalog = published_catalog(db, &asset).await?;
+    Ok(PublishedAsset {
+        asset: asset_descriptor(asset)?,
+        catalog,
+    })
+}
+
+fn staging_key(asset: &Asset) -> Result<String, AppError> {
+    let upload_id = asset.upload_id.ok_or(AppError::AssetConflict)?;
+    let url = url::Url::parse(&asset.source_url).map_err(|_| AppError::AssetConflict)?;
+    if url.scheme() != "s3"
+        || url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(AppError::AssetConflict);
+    }
+    let mut key = String::new();
+    // Reverse object_url's segment encoding exactly once so old reservations
+    // keep the reserved key even when the configured prefix has changed.
+    for part in url.path_segments().ok_or(AppError::AssetConflict)? {
+        let decoded = percent_decode_str(part)
+            .decode_utf8()
+            .map_err(|_| AppError::AssetConflict)?;
+        if decoded.contains('/') || validate_relative_path(&decoded).is_err() {
+            return Err(AppError::AssetConflict);
+        }
+        key.push('/');
+        key.push_str(&decoded);
+    }
+    let suffix = format!("/asset-staging/{}/{upload_id}", asset.uuid);
+    if !key
+        .strip_suffix(&suffix)
+        .is_some_and(|prefix| prefix.len() > 1)
+    {
+        return Err(AppError::AssetConflict);
+    }
+    Ok(key)
+}
+
+async fn owned_staging_catalog(
+    tx: &mut Transaction<'_>,
+    asset: &Asset,
+) -> Result<Option<Catalog>, AppError> {
+    let Some(id) = asset
+        .catalog_uuid
+        .filter(|_| asset.published_at.is_none() && asset.upload_id.is_some())
+    else {
+        return Ok(None);
+    };
+    let key = staging_key(asset)?;
+    let catalog = tx.get_catalog(id).await?.ok_or(AppError::AssetConflict)?;
+    if catalog.uploaded
+        || catalog.key != key
+        || catalog.url != asset.source_url
+        || catalog.size != asset.size
+        || catalog.format != asset.format
+    {
+        return Err(AppError::AssetConflict);
+    }
+    Ok(Some(catalog))
+}
+
+async fn reserve_staging_catalog(
+    tx: &mut Transaction<'_>,
+    asset: &Asset,
+) -> Result<Catalog, AppError> {
+    if let Some(catalog) = owned_staging_catalog(tx, asset).await? {
+        return Ok(catalog);
+    }
+    let key = staging_key(asset)?;
+    if tx.get_catalog_by_key(&key).await?.is_some() {
+        return Err(AppError::AssetConflict);
+    }
+    let catalog_id = tx
+        .upsert_catalog(CatalogOptionalData {
+            key: Some(key),
+            url: Some(asset.source_url.clone()),
+            size: Some(asset.size),
+            format: Some(asset.format.clone()),
+            uploaded: Some(false),
+        })
+        .await?;
+    Asset::filter_by_id(asset.id)
+        .update()
+        .catalog_uuid(Some(catalog_id))
+        .exec(&mut *tx)
+        .await?;
+    tx.get_catalog(catalog_id)
+        .await?
+        .ok_or(AppError::AssetConflict)
+}
+
+async fn delete_owned_staging_catalog(
+    tx: &mut Transaction<'_>,
+    asset: &Asset,
+) -> Result<Option<Catalog>, AppError> {
+    let catalog = owned_staging_catalog(tx, asset).await?;
+    if let Some(catalog) = &catalog {
+        Catalog::filter_by_uuid(catalog.uuid)
+            .filter(Catalog::fields().uploaded().eq(false))
+            .delete()
+            .exec(tx)
+            .await?;
+    }
+    Ok(catalog)
 }
 
 pub(super) async fn validate_graph_assets(
@@ -252,37 +376,41 @@ impl<S> App<S> {
         let upload_id = Uuid::new_v4();
         let staging = asset_key(config, &format!("asset-staging/{asset_id}/{upload_id}"));
         let source_url = config.object_url(&staging)?;
-        let asset = self
-            .reserve_asset(
-                &version,
-                asset_id,
-                Some(upload_id),
-                source_url,
-                request.size,
-                actor,
-            )
-            .await?;
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        let asset = Self::reserve_asset(
+            &mut tx,
+            &version,
+            asset_id,
+            Some(upload_id),
+            source_url,
+            request.size,
+            actor,
+        )
+        .await?;
         if asset.published_at.is_some() {
-            return Ok(PrepareAssetResponse::Published {
-                asset: asset_descriptor(asset)?,
-            });
+            let asset = published_asset(&mut tx, asset).await?;
+            tx.commit().await?;
+            return Ok(PrepareAssetResponse::Published { asset });
         }
         verify_upload_owner(&asset, actor)?;
         let upload_id = asset.upload_id.ok_or(AppError::AssetConflict)?;
-        let object = Catalog::new(asset.uuid, "", &asset.source_url, asset.size, &asset.format);
+        let catalog = reserve_staging_catalog(&mut tx, &asset).await?;
         let mut upload = self.sign_asset(
             config,
-            &object,
+            &catalog,
             PresignOperation::UploadSized { size: asset.size },
             config.presign_ttl,
         )?;
         upload.operation = PresignOperation::Upload;
         // Fetch derives the signed Content-Length from the selected File.
         upload.headers.remove("content-length");
+        tx.commit().await?;
         Ok(PrepareAssetResponse::Pending {
             asset_id: asset.uuid,
             upload_id,
             upload,
+            catalog,
         })
     }
 
@@ -291,16 +419,25 @@ impl<S> App<S> {
         asset_id: Uuid,
         upload_id: Uuid,
         actor: &str,
-    ) -> Result<AssetDescriptor, AppError> {
-        let asset = load_asset(&mut self.db.clone(), asset_id).await?;
+    ) -> Result<PublishedAsset, AppError> {
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        lock_asset(&mut tx, asset_id).await?;
+        let asset = load_asset(&mut tx, asset_id).await?;
         verify_upload_owner(&asset, actor)?;
         if asset.upload_id != Some(upload_id) {
             return Err(AppError::AssetConflict);
         }
         if asset.published_at.is_some() {
-            return asset_descriptor(asset);
+            let published = published_asset(&mut tx, asset).await?;
+            tx.commit().await?;
+            return Ok(published);
         }
-        self.finalize_asset(asset).await
+        let staging = owned_staging_catalog(&mut tx, &asset)
+            .await?
+            .unwrap_or_else(|| legacy_staging_object(&asset));
+        tx.commit().await?;
+        self.finalize_asset(asset, Some(staging)).await
     }
 
     pub(crate) async fn cancel_asset(
@@ -326,19 +463,22 @@ impl<S> App<S> {
             .first()
             .exec(&mut tx)
             .await?;
+        let mut staging = None;
         if let Some(asset) = &asset {
             if asset.published_at.is_some() {
                 return Err(AppError::AssetConflict);
             }
             verify_upload_owner(asset, actor)?;
             Asset::filter_by_id(asset.id).delete().exec(&mut tx).await?;
+            staging = delete_owned_staging_catalog(&mut tx, asset).await?;
         }
         tx.commit().await?;
 
         if let Some((asset, config)) = asset.zip(self.config.storage.as_ref())
             && asset.upload_id.is_some()
         {
-            self.remove_staged_upload(config, &asset).await;
+            let staging = staging.unwrap_or_else(|| legacy_staging_object(&asset));
+            self.remove_staged_upload(config, &staging).await;
         }
         Ok(())
     }
@@ -349,7 +489,7 @@ impl<S> App<S> {
         version: u64,
         request: ImportAssetRequest,
         actor: &str,
-    ) -> Result<AssetDescriptor, AppError> {
+    ) -> Result<PublishedAsset, AppError> {
         let version = AssetVersion::new(name, version, request.sha256, request.format)?;
         validate_relative_path(&request.source_key)?;
         let config = self.asset_storage()?;
@@ -381,7 +521,10 @@ impl<S> App<S> {
             source.size = size;
             self.verify_asset_object(config, &source, &version.sha256)
                 .await?;
-            self.reserve_asset(
+            let mut db = self.db.clone();
+            let mut tx = db.transaction().await?;
+            let asset = Self::reserve_asset(
+                &mut tx,
                 &version,
                 Uuid::new_v4(),
                 None,
@@ -389,16 +532,18 @@ impl<S> App<S> {
                 size,
                 actor,
             )
-            .await?
+            .await?;
+            tx.commit().await?;
+            asset
         };
         if asset.published_at.is_some() {
-            return asset_descriptor(asset);
+            return published_asset(&mut self.db.clone(), asset).await;
         }
         verify_upload_owner(&asset, actor)?;
         if asset.upload_id.is_some() || asset.source_url != source_url {
             return Err(AppError::AssetConflict);
         }
-        self.finalize_asset(asset).await
+        self.finalize_asset(asset, None).await
     }
 
     pub(crate) async fn download_asset(&self, asset_id: Uuid) -> Result<AssetTransfer, AppError> {
@@ -474,7 +619,7 @@ impl<S> App<S> {
     }
 
     async fn reserve_asset(
-        &self,
+        tx: &mut Transaction<'_>,
         version: &AssetVersion,
         asset_id: Uuid,
         upload_id: Option<Uuid>,
@@ -482,8 +627,6 @@ impl<S> App<S> {
         size: u64,
         actor: &str,
     ) -> Result<Asset, AppError> {
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
         let table = tx.schema().table_for(Asset::id()).name.replace('`', "``");
         // Toasty does not expose insert-on-conflict with a no-op. This locks the
         // canonical name/version across simultaneous reservations.
@@ -503,25 +646,26 @@ impl<S> App<S> {
         )
         .bind(source_url)
         .bind(actor)
-        .exec(&mut tx)
+        .exec(&mut *tx)
         .await?;
         let asset = Asset::filter_by_name_and_version(&version.name, version.version)
-            .get(&mut tx)
+            .get(tx)
             .await?;
         version.verify_metadata(&asset)?;
         if asset.size != size {
             return Err(AppError::AssetConflict);
         }
-        tx.commit().await?;
         Ok(asset)
     }
 
-    async fn finalize_asset(&self, asset: Asset) -> Result<AssetDescriptor, AppError> {
+    async fn finalize_asset(
+        &self,
+        asset: Asset,
+        staging: Option<Catalog>,
+    ) -> Result<PublishedAsset, AppError> {
         let config = self.asset_storage()?;
-        if asset.upload_id.is_some() {
-            let staging =
-                Catalog::new(asset.uuid, "", &asset.source_url, asset.size, &asset.format);
-            let error = match self.asset_object_length(config, &staging).await {
+        if let Some(staging) = &staging {
+            let error = match self.asset_object_length(config, staging).await {
                 Ok(size) if size == asset.size => None,
                 Ok(_) => Some(AppError::AssetIntegrity),
                 Err(error) => Some(error),
@@ -586,34 +730,26 @@ impl<S> App<S> {
         // same transaction that made the copy canonical.
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
-        let table = tx.schema().table_for(Asset::id()).name.replace('`', "``");
-        // Toasty cannot currently lock a selected record. Serialize the final
-        // catalog link before any snapshot reads in this transaction.
-        toasty::sql::query(format!(
-            "SELECT id FROM `{table}` WHERE uuid = ? FOR UPDATE"
-        ))
-        .bind(asset.uuid)
-        .column_types([toasty::stmt::Type::U64])
-        .exec(&mut tx)
-        .await?;
+        lock_asset(&mut tx, asset.uuid).await?;
         let promotion = lock_promotion(&mut tx, candidate_id).await?;
         let current = Asset::filter_by_uuid(asset.uuid)
             .first()
             .exec(&mut tx)
             .await?;
-        match current {
+        let current = match current {
             Some(current) if current.published_at.is_some() => {
+                let published = published_asset(&mut tx, current).await;
                 tx.commit().await?;
                 self.discard_promotion(config, &candidate).await;
-                return asset_descriptor(current);
+                return published;
             }
             None => {
                 tx.commit().await?;
                 self.discard_promotion(config, &candidate).await;
                 return Err(AppError::AssetNotFound(asset.uuid));
             }
-            Some(_) => {}
-        }
+            Some(current) => current,
+        };
         if promotion
             .and_then(|row| row.expires_at)
             .is_none_or(|expires_at| expires_at <= Timestamp::now())
@@ -635,26 +771,29 @@ impl<S> App<S> {
             .published_at(Some(Timestamp::now()))
             .exec(&mut tx)
             .await?;
-        let published = load_asset(&mut tx, asset.uuid).await?;
+        delete_owned_staging_catalog(&mut tx, &current).await?;
+        let asset = load_asset(&mut tx, asset.uuid).await?;
+        let published = published_asset(&mut tx, asset).await?;
         AssetPromotion::filter_by_uuid(candidate_id)
             .delete()
             .exec(&mut tx)
             .await?;
         tx.commit().await?;
-        if asset.upload_id.is_some() {
-            self.remove_staged_upload(config, &asset).await;
+        if let Some(staging) = &staging {
+            self.remove_staged_upload(config, staging).await;
         }
-        asset_descriptor(published)
+        Ok(published)
     }
 
     async fn published_or_error(
         &self,
         uuid: Uuid,
         error: AppError,
-    ) -> Result<AssetDescriptor, AppError> {
-        let current = load_asset(&mut self.db.clone(), uuid).await?;
+    ) -> Result<PublishedAsset, AppError> {
+        let mut db = self.db.clone();
+        let current = load_asset(&mut db, uuid).await?;
         if current.published_at.is_some() {
-            return asset_descriptor(current);
+            return published_asset(&mut db, current).await;
         }
         Err(error)
     }
@@ -723,9 +862,8 @@ impl<S> App<S> {
         }
     }
 
-    async fn remove_staged_upload(&self, config: &StorageConfig, asset: &Asset) {
-        let staging = Catalog::new(asset.uuid, "", &asset.source_url, asset.size, &asset.format);
-        if let Err(error) = self.delete_asset_object(config, &staging).await {
+    async fn remove_staged_upload(&self, config: &StorageConfig, staging: &Catalog) {
+        if let Err(error) = self.delete_asset_object(config, staging).await {
             tracing::warn!(%error, "could not remove staged asset upload");
         }
     }
@@ -842,6 +980,12 @@ fn verify_upload_owner(asset: &Asset, actor: &str) -> Result<(), AppError> {
         return Err(AppError::AssetUploadForbidden);
     }
     Ok(())
+}
+
+fn legacy_staging_object(asset: &Asset) -> Catalog {
+    // Older reservations have a source URL but no catalog row. Commit and
+    // cancel can still address that object without creating a transient row.
+    Catalog::new(asset.uuid, "", &asset.source_url, asset.size, &asset.format)
 }
 
 fn active_grant_ttl(now: Timestamp, expiry: Timestamp) -> Option<Duration> {

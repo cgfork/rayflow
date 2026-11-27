@@ -5,12 +5,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import { isHttpDownloadUrl, memory, send, usePaged, useRemote } from './api';
 import { Empty, ErrorBanner, Loading, Modal, PageHeader, Pagination } from './components';
 import { isAssetPath } from './graph';
-import type { AssetRef, AssetVersion } from './types';
-
-type Presigned = { url: string; operation: 'upload' | 'download'; headers: Record<string, string> };
-type PreparedAsset =
-  | { state: 'pending'; asset_id: string; upload_id: string; upload: Presigned }
-  | (AssetVersion & { state: 'published' });
+import type { AssetRef, AssetTransfer, AssetVersion, PrepareAssetResponse, PublishedAsset } from './types';
 
 export default function Assets({ notify }: { notify: (message: string) => void }) {
   const [uploading, setUploading] = useState(false);
@@ -23,7 +18,7 @@ export default function Assets({ notify }: { notify: (message: string) => void }
     setDownloading(asset.asset_id);
     setError(undefined);
     try {
-      const { presigned } = await send<{ presigned: Presigned }>(`/assets/${asset.asset_id}/download`, {});
+      const { presigned } = await send<AssetTransfer>(`/assets/${asset.asset_id}/download`, {});
       if (presigned.operation !== 'download' || !isHttpDownloadUrl(presigned.url)) throw new Error('The server returned an invalid download URL.');
       const link = document.createElement('a');
       link.href = presigned.url;
@@ -71,7 +66,7 @@ function AssetPagination({ versions }: { versions: AssetPage }) {
     previous={versions.previous} next={versions.next} />;
 }
 
-function UploadAsset({ close, notify, published }: { close: () => void; notify: (message: string) => void; published: (asset: AssetVersion) => void }) {
+function UploadAsset({ close, notify, published }: { close: () => void; notify: (message: string) => void; published: (asset: PublishedAsset) => void }) {
   const [name, setName] = useState('');
   const [version, setVersion] = useState('1');
   const [file, setFile] = useState<File>();
@@ -120,7 +115,7 @@ function UploadAsset({ close, notify, published }: { close: () => void; notify: 
         stream.releaseLock();
       }
       setAttemptedVersion({ name, version: number });
-      const result = await send<PreparedAsset>('/assets/prepare', {
+      const result = await send<PrepareAssetResponse>('/assets/prepare', {
         name, version: number, size: file.size, format: file.type || 'application/octet-stream',
         sha256: bytesToHex(hash.digest()),
       });
@@ -136,7 +131,7 @@ function UploadAsset({ close, notify, published }: { close: () => void; notify: 
       });
       if (!response.ok) throw new Error(`Object storage rejected the upload (HTTP ${response.status}).`);
       setStatus('Verifying and publishing…');
-      const asset = await send<AssetVersion>(`/assets/${result.asset_id}/commit`, { upload_id: result.upload_id });
+      const asset = await send<PublishedAsset>(`/assets/${result.asset_id}/commit`, { upload_id: result.upload_id });
       published(asset);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : 'Asset upload failed.');

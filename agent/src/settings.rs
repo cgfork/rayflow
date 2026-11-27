@@ -16,6 +16,8 @@ use crate::errors::Error;
 
 /// Files larger than this size use multipart/ranged transfers by default.
 pub const DEFAULT_MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+/// Default size of the shared asset cache in bytes.
+const DEFAULT_ASSET_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const OWNER_FILE: &str = ".agent-owner.json";
 
 #[derive(Deserialize)]
@@ -34,9 +36,18 @@ pub struct Settings {
     #[serde(default)]
     pub auth_token: Option<String>,
     pub workdir: PathBuf,
-    /// Root for job input/output bytes, separate from durable job metadata.
+    /// Root for per-job inputs and outputs.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Root for the shared asset cache and per-job asset links.
+    #[serde(default = "default_asset_dir")]
+    pub asset_dir: PathBuf,
+    /// Optional mounted object storage to read on cache misses.
+    #[serde(default)]
+    pub asset_source_dir: Option<PathBuf>,
+    /// Byte budget for cached assets. In-use assets can exceed this budget.
+    #[serde(default = "default_asset_cache_max_bytes")]
+    pub asset_cache_max_bytes: u64,
     pub resources: ResourceCapacity,
     pub batch: usize,
     #[serde(with = "jiff::fmt::serde::unsigned_duration::required")]
@@ -55,6 +66,9 @@ impl std::fmt::Debug for Settings {
             .field("server_url", &self.server_url)
             .field("workdir", &self.workdir)
             .field("data_dir", &self.data_dir)
+            .field("asset_dir", &self.asset_dir)
+            .field("asset_source_dir", &self.asset_source_dir)
+            .field("asset_cache_max_bytes", &self.asset_cache_max_bytes)
             .field("resources", &self.resources)
             .field("batch", &self.batch)
             .field("poll_interval", &self.poll_interval)
@@ -130,6 +144,9 @@ impl Settings {
             server_url: server_url.into(),
             auth_token: None,
             data_dir: workdir.join("data"),
+            asset_dir: workdir.join("assets"),
+            asset_source_dir: None,
+            asset_cache_max_bytes: DEFAULT_ASSET_CACHE_MAX_BYTES,
             workdir,
             resources,
             batch: 64,
@@ -137,6 +154,28 @@ impl Settings {
             request_timeout: Duration::from_secs(60),
             multipart_threshold: DEFAULT_MULTIPART_THRESHOLD,
         }
+    }
+
+    pub(crate) fn job_asset_dir(&self, job_id: Uuid) -> PathBuf {
+        self.asset_dir.join("jobs").join(job_id.to_string())
+    }
+
+    pub(crate) async fn canonical_job_asset_dir(&self, job_id: Uuid) -> Result<PathBuf, Error> {
+        let assets = tokio::fs::canonicalize(self.job_asset_dir(job_id)).await?;
+        let job_id = job_id.to_string();
+        for root in [&self.workdir, &self.data_dir] {
+            match tokio::fs::canonicalize(root.join(&job_id)).await {
+                Ok(path) if assets.starts_with(&path) || path.starts_with(&assets) => {
+                    return Err(Error::Settings(
+                        "asset staging overlaps with the job data or metadata directory",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(assets)
     }
 
     pub fn validate(&self) -> Result<(), Error> {
@@ -154,6 +193,19 @@ impl Settings {
         }
         if self.data_dir.as_os_str().is_empty() {
             return Err(Error::Settings("data_dir must not be empty"));
+        }
+        if self.asset_dir.as_os_str().is_empty() {
+            return Err(Error::Settings("asset_dir must not be empty"));
+        }
+        if let Some(source) = &self.asset_source_dir {
+            if source.as_os_str().is_empty() {
+                return Err(Error::Settings("asset_source_dir must not be empty"));
+            }
+            if source == &self.asset_dir {
+                return Err(Error::Settings(
+                    "asset_source_dir must differ from asset_dir",
+                ));
+            }
         }
         if self.multipart_threshold == 0 {
             return Err(Error::Settings("multipart threshold must be positive"));
@@ -182,6 +234,14 @@ impl Settings {
 
 fn default_data_dir() -> PathBuf {
     ".rayflow/data".into()
+}
+
+fn default_asset_dir() -> PathBuf {
+    ".rayflow/assets".into()
+}
+
+fn default_asset_cache_max_bytes() -> u64 {
+    DEFAULT_ASSET_CACHE_MAX_BYTES
 }
 
 fn default_multipart_threshold() -> u64 {
@@ -253,6 +313,23 @@ mod tests {
     #[test]
     fn accepts_valid_settings() {
         assert!(valid_settings().validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_asset_staging_that_resolves_to_the_job_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = valid_settings();
+        settings.asset_dir = root.path().join("assets");
+        settings.data_dir = settings.asset_dir.join("jobs/.");
+        let job_id = Uuid::new_v4();
+        fs::create_dir_all(settings.job_asset_dir(job_id)).unwrap();
+
+        assert!(matches!(
+            settings.canonical_job_asset_dir(job_id).await,
+            Err(Error::Settings(
+                "asset staging overlaps with the job data or metadata directory"
+            ))
+        ));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use event::task::Task;
 use futures_util::{FutureExt, Stream, StreamExt, stream};
 use graph::{
     GraphStore, Page, PageRequest,
-    types::{DAG, Kind, Node, NodeSettings, Output},
+    types::{AssetRef, DAG, Kind, Node, NodeSettings, Output},
 };
 use jiff::Timestamp;
 use runtime::command::{NodeRun, Run};
@@ -32,6 +32,7 @@ use scheduler::{
     actuator::{NodeConfig, Status},
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 use tokio::{fs, sync::Notify, time::timeout};
 use uuid::Uuid;
@@ -451,6 +452,59 @@ async fn recover_job<C: Containerd>(manager: &JobManager<C, Graphs>, job_id: Uui
 }
 
 #[tokio::test]
+async fn mounts_job_asset_links_read_only_from_the_configured_root() {
+    let mut workflow = Workflow::new(false);
+    workflow.settings.asset_dir = workflow._root.path().join("asset-volume");
+    let asset_id = Uuid::new_v4();
+    let file_name = "scripts/main.lua";
+    workflow.graph.0[0].nodes[0].assets.push(AssetRef {
+        asset_id,
+        file_name: file_name.into(),
+    });
+    let script = b"return 1";
+    let cache = workflow
+        .settings
+        .asset_dir
+        .join("cache")
+        .join(asset_id.to_string());
+    fs::create_dir_all(&cache).await.unwrap();
+    fs::write(
+        cache.join(format!("{:x}.blob", Sha256::digest(script))),
+        script,
+    )
+    .await
+    .unwrap();
+    let provider = FakeProvider::default();
+    let manager = workflow.open(provider.clone()).await;
+    let job = workflow.claim("fixture-image", "true");
+    manager.start(job.clone()).await;
+
+    let spec = provider.0.lock().unwrap().prepared[0].clone();
+    let mount = spec
+        .files
+        .iter()
+        .find(|file| file.target == "/data/assets")
+        .unwrap();
+    let aliases = workflow
+        .settings
+        .asset_dir
+        .join("jobs")
+        .join(job.uuid.to_string());
+    assert_eq!(mount.source, aliases.canonicalize().unwrap());
+    assert!(mount.read_only);
+    assert_eq!(fs::read(aliases.join(file_name)).await.unwrap(), script);
+    assert!(!workflow.data_dir(job.uuid).join("asset").exists());
+    assert!(
+        provider
+            .container(&spec.name)
+            .inspect()
+            .await
+            .unwrap()
+            .is_running()
+    );
+}
+
+#[tokio::test]
 async fn yield_and_resume_isolate_job_data_and_keep_unarchived_files() {
     let workflow = Workflow::new(true);
     let provider = FakeProvider::default();
@@ -480,6 +534,7 @@ async fn yield_and_resume_isolate_job_data_and_keep_unarchived_files() {
         assert_eq!(mount.read_only, read_only);
     }
     assert!(data.join("asset").read_dir().unwrap().next().is_none());
+    assert!(!workflow.settings.asset_dir.exists());
     let pinned: DAG =
         serde_json::from_slice(&fs::read(dir.join("graph.json")).await.unwrap()).unwrap();
     assert_eq!(pinned.version, workflow.run.version);

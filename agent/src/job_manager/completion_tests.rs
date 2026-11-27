@@ -85,6 +85,8 @@ struct ArtifactTraffic {
     upload_failure: Option<StatusCode>,
     commit_error: Option<StatusCode>,
     wrong_commit_catalog: Option<Uuid>,
+    unuploaded_commit_catalog: bool,
+    legacy_commit_reply: bool,
     lose_commit_reply: bool,
 }
 
@@ -136,6 +138,18 @@ impl Fixture {
         }
     }
 
+    fn archive_catalog(&self, filename: JobArtifactName, size: u64, uploaded: bool) -> Catalog {
+        let mut catalog = Catalog::new(
+            self.catalog_id(filename),
+            format!("/jobs/{}/{}", self.job.uuid, filename.as_str()),
+            format!("s3://results/{}", filename.as_str()),
+            size,
+            "application/json",
+        );
+        catalog.uploaded = uploaded;
+        catalog
+    }
+
     fn claim(&self, headers: &HeaderMap, body: &Value) {
         assert_eq!(headers["authorization"], format!("Bearer {TOKEN}"));
         assert_eq!(body["job_id"], json!(self.job.uuid));
@@ -164,16 +178,8 @@ async fn prepare(
     if *traffic.prepared_size.get_or_insert(size) != size {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let mut catalog = Catalog::new(
-        fixture.catalog_id(filename),
-        format!("/jobs/{}/{}", fixture.job.uuid, filename.as_str()),
-        format!("s3://results/{}", filename.as_str()),
-        size,
-        "application/json",
-    );
-    catalog.uploaded = traffic.uploaded;
     let transfer = Transfer {
-        catalog,
+        catalog: fixture.archive_catalog(filename, size, traffic.uploaded),
         presigned: PresignedUrl {
             url: format!("{}/object/{}", fixture.endpoint, filename.as_str()),
             operation: if traffic.uploaded {
@@ -231,14 +237,21 @@ async fn commit(
     if let Some(status) = traffic.commit_error.take() {
         return status.into_response();
     }
+    let uploaded = !std::mem::take(&mut traffic.unuploaded_commit_catalog);
+    let mut catalog = fixture.archive_catalog(filename, traffic.prepared_size.unwrap(), uploaded);
     if let Some(id) = traffic.wrong_commit_catalog.take() {
-        return Json(id).into_response();
+        catalog.uuid = id;
+    }
+    if catalog.uuid != catalog_id || !catalog.uploaded {
+        return Json(json!({"catalog_uuid": catalog_id, "catalog": catalog})).into_response();
     }
     traffic.uploaded = true;
     if std::mem::take(&mut traffic.lose_commit_reply) {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
-    } else {
+    } else if traffic.legacy_commit_reply {
         Json(catalog_id).into_response()
+    } else {
+        Json(json!({"catalog_uuid": catalog_id, "catalog": catalog})).into_response()
     }
 }
 
@@ -811,6 +824,13 @@ async fn redirected_result_upload_is_retried_with_the_same_bytes() {
 #[tokio::test]
 async fn requires_archive_commit_acknowledgment_before_cleanup() {
     let harness = Harness::new("succeed", None).await;
+    harness
+        .fixture
+        .traffic
+        .lock()
+        .unwrap()
+        .result
+        .legacy_commit_reply = true;
     let manager = harness.manager().await;
     harness.report(&manager).await.unwrap();
     let dir = harness.metadata();
@@ -836,6 +856,18 @@ async fn requires_archive_commit_acknowledgment_before_cleanup() {
     assert!(matches!(
         harness.upload_usage(&manager).await,
         Err(Error::CatalogMismatch { .. })
+    ));
+    assert!(!dir.join("usage.json.upload").exists());
+    harness
+        .fixture
+        .traffic
+        .lock()
+        .unwrap()
+        .usage
+        .unuploaded_commit_catalog = true;
+    assert!(matches!(
+        harness.upload_usage(&manager).await,
+        Err(Error::Artifact(_))
     ));
     assert!(!dir.join("usage.json.upload").exists());
     assert!(harness.upload_usage(&manager).await.unwrap());
@@ -1042,7 +1074,11 @@ async fn recovers_legacy_frozen_result_bytes_and_upload_receipt() {
 
 #[tokio::test]
 async fn resumes_cleanup_after_partial_metadata_removal() {
-    let harness = Harness::new("succeed", None).await;
+    let mut harness = Harness::new("succeed", None).await;
+    harness.settings.asset_dir = harness._root.path().join("unavailable-asset-volume");
+    fs::write(&harness.settings.asset_dir, b"unavailable")
+        .await
+        .unwrap();
     let dir = harness.metadata();
     write_json(&dir.join(CLEANUP_FILE), &true).await.unwrap();
     fs::remove_file(dir.join("job.json")).await.unwrap();
@@ -1058,6 +1094,7 @@ async fn resumes_cleanup_after_partial_metadata_removal() {
         result = tokio::time::timeout(Duration::from_secs(5), cleaned) => result.unwrap(),
     }
     assert!(!harness.data().exists());
+    assert!(harness.settings.asset_dir.is_file());
 }
 
 #[tokio::test]
@@ -1071,11 +1108,45 @@ async fn cleans_shared_metadata_and_data_directory() {
             .unwrap();
     }
     harness.settings.data_dir = harness.settings.workdir.clone();
+    harness.settings.asset_dir = harness._root.path().join("asset-volume");
+    harness.settings.asset_cache_max_bytes = 0;
+    let assets = harness.settings.job_asset_dir(harness.fixture.job.uuid);
+    fs::create_dir_all(&assets).await.unwrap();
+    write_json(&metadata.join(ASSET_STAGE_FILE), &true)
+        .await
+        .unwrap();
+    let other_job = harness.settings.job_asset_dir(Uuid::new_v4());
+    fs::create_dir_all(&other_job).await.unwrap();
+    fs::write(other_job.join("unrelated.txt"), b"unrelated")
+        .await
+        .unwrap();
+    #[cfg(unix)]
+    let cached_asset = {
+        use sha2::{Digest, Sha256};
+
+        let script = b"return 1";
+        let cache = harness
+            .settings
+            .asset_dir
+            .join("cache")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&cache).await.unwrap();
+        let cached_asset = cache.join(format!("{:x}.blob", Sha256::digest(script)));
+        fs::write(&cached_asset, script).await.unwrap();
+        fs::hard_link(&cached_asset, assets.join("script.lua"))
+            .await
+            .unwrap();
+        cached_asset
+    };
     let manager = harness.manager().await;
     assert!(harness.upload_usage(&manager).await.unwrap());
     harness.report(&manager).await.unwrap();
     assert!(harness.fixture.traffic.lock().unwrap().output_committed);
     assert!(!metadata.exists());
+    assert!(!assets.exists());
+    assert!(other_job.join("unrelated.txt").is_file());
+    #[cfg(unix)]
+    assert!(!cached_asset.exists());
 }
 
 #[cfg(unix)]

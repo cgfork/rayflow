@@ -1,5 +1,7 @@
 //! Remote job polling and durable job execution.
 
+#![cfg_attr(windows, feature(windows_by_handle))]
+
 use std::{io, path::Path};
 
 use serde::{Serialize, de::DeserializeOwned};

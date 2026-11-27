@@ -53,6 +53,13 @@ pub struct AssetDescriptor {
     pub published_at: Timestamp,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PublishedAsset {
+    #[serde(flatten)]
+    pub asset: AssetDescriptor,
+    pub catalog: Catalog,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PrepareAssetRequest {
     pub name: String,
@@ -69,10 +76,11 @@ pub enum PrepareAssetResponse {
         asset_id: Uuid,
         upload_id: Uuid,
         upload: PresignedUrl,
+        catalog: Catalog,
     },
     Published {
         #[serde(flatten)]
-        asset: AssetDescriptor,
+        asset: PublishedAsset,
     },
 }
 
@@ -137,7 +145,7 @@ async fn commit<S>(
     Path(asset_id): Path<Uuid>,
     user: Option<Extension<User>>,
     Json(request): Json<CommitAssetRequest>,
-) -> Result<Json<AssetDescriptor>, AppError> {
+) -> Result<Json<PublishedAsset>, AppError> {
     app.commit_asset(asset_id, request.upload_id, actor(&user))
         .await
         .map(Json)
@@ -164,7 +172,7 @@ async fn import<S>(
     Path((name, version)): Path<(String, u64)>,
     user: Option<Extension<User>>,
     Json(request): Json<ImportAssetRequest>,
-) -> Result<Json<AssetDescriptor>, AppError> {
+) -> Result<Json<PublishedAsset>, AppError> {
     app.import_asset(name, version, request, actor(&user))
         .await
         .map(Json)

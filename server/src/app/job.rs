@@ -6,6 +6,7 @@ use catalog::directory::DIRECTORY_MANIFEST;
 use catalog::path::validate_relative_path;
 use catalog::{
     CatalogOptionalData, CatalogSystem, FileInput, FileSystem, ObjectStorage, PresignOperation,
+    model::Catalog,
 };
 use graph::{
     Graph, GraphStore,
@@ -316,7 +317,7 @@ impl<S> App<S> {
         agent_id: Uuid,
         filename: String,
         catalog_uuid: Uuid,
-    ) -> Result<Uuid, AppError>
+    ) -> Result<(Uuid, Catalog), AppError>
     where
         S: GraphStore<Uuid, G = DAG> + Clone,
         S::load(..): Send,
@@ -343,19 +344,25 @@ impl<S> App<S> {
                 "output catalog does not match the job output".into(),
             ));
         }
-        tx.update_catalog(
-            catalog_uuid,
-            CatalogOptionalData {
-                uploaded: Some(true),
-                ..Default::default()
-            },
-        )
-        .await?;
+        if !catalog.uploaded {
+            tx.update_catalog(
+                catalog_uuid,
+                CatalogOptionalData {
+                    uploaded: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
         let file = tx
             .upsert_file(&FileInput::new(node_run.uuid, filename, catalog_uuid))
             .await?;
+        let catalog = tx
+            .get_catalog(catalog_uuid)
+            .await?
+            .ok_or_else(|| AppError::ArtifactNotFound(catalog_uuid.to_string()))?;
         tx.commit().await?;
-        Ok(file)
+        Ok((file, catalog))
     }
 
     pub async fn presign_input(

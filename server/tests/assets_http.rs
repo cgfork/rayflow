@@ -16,7 +16,10 @@ use axum::{
     http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use catalog::model::{Asset, AssetPromotion};
+use catalog::{
+    CatalogOptionalData, CatalogSystem,
+    model::{Asset, AssetPromotion, Catalog},
+};
 use graph::types::{AssetRef, DAG, Node, NodeSettings, Resource};
 use jiff::Timestamp;
 use runtime::backend::Backend;
@@ -171,6 +174,19 @@ async fn upload(client: &reqwest::Client, prepared: &Value, bytes: &'static [u8]
         .unwrap();
 }
 
+async fn persisted_catalog(db: &mut toasty::Db, response: &Value, uploaded: bool) -> Catalog {
+    let catalog: Catalog = serde_json::from_value(response["catalog"].clone()).unwrap();
+    assert!(catalog.id > 0);
+    assert!(catalog.created_at > Timestamp::UNIX_EPOCH);
+    assert!(catalog.updated_at >= catalog.created_at);
+    assert_eq!(catalog.uploaded, uploaded);
+    assert_eq!(
+        db.get_catalog(catalog.uuid).await.unwrap(),
+        Some(catalog.clone())
+    );
+    catalog
+}
+
 fn graph(asset_id: Uuid) -> DAG {
     DAG {
         id: Uuid::new_v4(),
@@ -216,8 +232,15 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
             "format":"text/x-lua",
             "sha256":sha256,
         });
-        let pending = post(&app, "/assets/prepare", prepare.clone(), StatusCode::OK).await;
+        let (pending, repeated) = tokio::join!(
+            post(&app, "/assets/prepare", prepare.clone(), StatusCode::OK),
+            post(&app, "/assets/prepare", prepare.clone(), StatusCode::OK),
+        );
         assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["asset_id"], repeated["asset_id"]);
+        assert_eq!(pending["upload_id"], repeated["upload_id"]);
+        assert_eq!(pending["catalog"], repeated["catalog"]);
+        let staging = persisted_catalog(&mut db, &pending, false).await;
         assert_eq!(pending["upload"]["operation"], "upload");
         assert!(pending["upload"]["headers"].get("content-length").is_none());
         let upload_url = url::Url::parse(pending["upload"]["url"].as_str().unwrap()).unwrap();
@@ -225,6 +248,14 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
             key == "X-Amz-SignedHeaders" && value.split(';').any(|part| part == "content-length")
         }));
         let asset_id: Uuid = serde_json::from_value(pending["asset_id"].clone()).unwrap();
+        let upload_id = pending["upload_id"].as_str().unwrap();
+        assert_eq!(
+            staging.key,
+            format!("/artifacts/asset-staging/{asset_id}/{upload_id}")
+        );
+        assert_eq!(staging.url, format!("s3://asset-tests{}", staging.key));
+        assert_eq!(staging.format, "text/x-lua");
+        assert_eq!(staging.size, SCRIPT.len() as u64);
         let commit = format!("/assets/{asset_id}/commit");
         let upload_ref = json!({"upload_id":pending["upload_id"]});
 
@@ -269,6 +300,10 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
         )
         .await;
         assert_eq!(bad["error_code"], "RAYFLOW_ASSET_INTEGRITY");
+        assert_eq!(
+            db.get_catalog(staging.uuid).await.unwrap(),
+            Some(staging.clone())
+        );
         upload(&browser, &pending, SCRIPT).await;
         let (published, replay) = tokio::join!(
             post(&app, &commit, upload_ref.clone(), StatusCode::OK),
@@ -277,6 +312,9 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
         assert_eq!(published, replay);
         assert_eq!(published["asset_id"], json!(asset_id));
         assert_eq!(published["sha256"], sha256);
+        let catalog = persisted_catalog(&mut db, &published, true).await;
+        assert_ne!(catalog.uuid, staging.uuid);
+        assert!(db.get_catalog(staging.uuid).await.unwrap().is_none());
         assert_eq!(
             objects
                 .lock()
@@ -295,6 +333,7 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
             StatusCode::OK,
         )
         .await;
+        assert_eq!(download["catalog"], published["catalog"]);
         let download_url = url::Url::parse(download["presigned"]["url"].as_str().unwrap()).unwrap();
         assert!(download_url.query_pairs().any(|(key, value)| {
             key == "response-content-disposition" && value == "attachment; filename=\"script.lua\""
@@ -324,6 +363,7 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
         let retried = post(&app, "/assets/prepare", prepare.clone(), StatusCode::OK).await;
         assert_eq!(retried["state"], "published");
         assert_eq!(retried["asset_id"], json!(asset_id));
+        assert_eq!(retried["catalog"], published["catalog"]);
         let mut conflicting = prepare;
         conflicting["sha256"] = json!(format!("{:x}", Sha256::digest(OTHER)));
         let conflict = post(&app, "/assets/prepare", conflicting, StatusCode::CONFLICT).await;
@@ -441,17 +481,76 @@ async fn assets_publish_only_verified_bytes_and_isolate_upload_replays() {
         assert_eq!(signed["asset_id"], json!(asset_id));
         assert_eq!(signed["sha256"], sha256);
         assert_eq!(signed["presigned"]["operation"], "download");
+        assert_eq!(signed["catalog"], published["catalog"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn legacy_pending_upload_reuses_its_encoded_source() {
+    support::with_test_database(|mut db| async move {
+        const BYTES: &[u8] = b"return 1";
+        let (state, _, _, _) = fixture(db.clone()).await;
+        let app = router(state);
+        let asset_id = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
+        let key = format!("/old prefix/literal%2F/asset-staging/{asset_id}/{upload_id}");
+        let mut source_url = url::Url::parse("s3://asset-tests/").unwrap();
+        source_url
+            .path_segments_mut()
+            .unwrap()
+            .pop_if_empty()
+            .extend(key[1..].split('/'));
+        let digest = Sha256::digest(BYTES);
+        Asset::create()
+            .uuid(asset_id)
+            .name("legacy.lua")
+            .version(1)
+            .sha256(digest.to_vec())
+            .size(BYTES.len() as u64)
+            .format("text/x-lua")
+            .upload_id(Some(upload_id))
+            .source_url(source_url.as_str())
+            .created_by("local")
+            .created_at(Timestamp::now())
+            .exec(&mut db)
+            .await
+            .unwrap();
+
+        let request = json!({
+            "name": "legacy.lua", "version": 1, "size": BYTES.len(),
+            "format": "text/x-lua", "sha256": format!("{digest:x}"),
+        });
+        let pending = post(&app, "/assets/prepare", request.clone(), StatusCode::OK).await;
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["asset_id"], json!(asset_id));
+        assert_eq!(pending["upload_id"], json!(upload_id));
+        let staging = persisted_catalog(&mut db, &pending, false).await;
+        assert_eq!(staging.key, key);
+        assert_eq!(staging.url, source_url.as_str());
+        let retry = post(&app, "/assets/prepare", request, StatusCode::OK).await;
+        assert_eq!(retry["catalog"], pending["catalog"]);
     })
     .await;
 }
 
 #[tokio::test]
 async fn imported_asset_is_bound_to_its_verified_copy() {
-    support::with_test_database(|db| async move {
+    support::with_test_database(|mut db| async move {
         const BYTES: &[u8] = b"shared data";
-        let (state, objects, _, _) = fixture(db).await;
+        let (state, objects, _, _) = fixture(db.clone()).await;
         let app = router(state);
         let source = "/asset-tests/shared-imports/examples/data.json";
+        let source_catalog = db
+            .upsert_catalog(CatalogOptionalData {
+                key: Some("/shared-imports/examples/data.json".into()),
+                url: Some("s3://asset-tests/shared-imports/examples/data.json".into()),
+                size: Some(BYTES.len() as u64),
+                format: Some("application/json".into()),
+                uploaded: Some(true),
+            })
+            .await
+            .unwrap();
         objects
             .lock()
             .await
@@ -468,6 +567,9 @@ async fn imported_asset_is_bound_to_its_verified_copy() {
             .await
             .insert(source.into(), Bytes::from_static(BYTES));
         let imported = post(&app, path, import.clone(), StatusCode::OK).await;
+        let catalog = persisted_catalog(&mut db, &imported, true).await;
+        assert_ne!(catalog.uuid, source_catalog);
+        assert!(db.get_catalog(source_catalog).await.unwrap().is_some());
         objects.lock().await.remove(source);
         let retry = post(&app, path, import, StatusCode::OK).await;
         assert_eq!(imported, retry);
@@ -479,6 +581,7 @@ async fn imported_asset_is_bound_to_its_verified_copy() {
             StatusCode::OK,
         )
         .await;
+        assert_eq!(download["catalog"], imported["catalog"]);
         let storage_key = url::Url::parse(download["presigned"]["url"].as_str().unwrap()).unwrap();
         assert_eq!(objects.lock().await[storage_key.path()], BYTES);
     })
@@ -501,6 +604,7 @@ async fn cancel_releases_only_the_owners_unpublished_version() {
         };
         let old = post(&app, "/assets/prepare", request(b"old"), StatusCode::OK).await;
         let old_id = old["asset_id"].as_str().unwrap().parse::<Uuid>().unwrap();
+        let staging = persisted_catalog(&mut db, &old, false).await;
         let path = "/assets/script.lua/versions/1/cancel";
         Asset::filter_by_uuid(old_id)
             .update()
@@ -509,6 +613,10 @@ async fn cancel_releases_only_the_owners_unpublished_version() {
             .await
             .unwrap();
         post(&app, path, json!({}), StatusCode::FORBIDDEN).await;
+        assert_eq!(
+            db.get_catalog(staging.uuid).await.unwrap(),
+            Some(staging.clone())
+        );
         Asset::filter_by_uuid(old_id)
             .update()
             .created_by("local")
@@ -520,6 +628,7 @@ async fn cancel_releases_only_the_owners_unpublished_version() {
         post(&app, path, json!({}), StatusCode::NO_CONTENT).await;
         post(&app, path, json!({}), StatusCode::NO_CONTENT).await;
         assert!(objects.lock().await.is_empty());
+        assert!(db.get_catalog(staging.uuid).await.unwrap().is_none());
 
         let replacement = post(
             &app,
@@ -552,6 +661,7 @@ async fn publication_failure_keeps_the_copy_durable_for_cleanup() {
             "sha256": format!("{:x}", Sha256::digest(BYTES)),
         });
         let pending = post(&app, "/assets/prepare", prepare, StatusCode::OK).await;
+        let staging = persisted_catalog(&mut db, &pending, false).await;
         let asset_id = pending["asset_id"].as_str().unwrap();
         let commit = format!("/assets/{asset_id}/commit");
         let request = json!({"upload_id": pending["upload_id"]});
@@ -572,6 +682,10 @@ async fn publication_failure_keeps_the_copy_durable_for_cleanup() {
             StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
+        assert_eq!(
+            db.get_catalog(staging.uuid).await.unwrap(),
+            Some(staging.clone())
+        );
         toasty::sql::statement("DROP TRIGGER fail_asset_publish")
             .exec(&mut db)
             .await
@@ -584,6 +698,7 @@ async fn publication_failure_keeps_the_copy_durable_for_cleanup() {
             .unwrap()
             .unwrap();
         post(&app, &commit, request, StatusCode::OK).await;
+        assert!(db.get_catalog(staging.uuid).await.unwrap().is_none());
         let download = post(
             &app,
             &format!("/assets/{asset_id}/download"),

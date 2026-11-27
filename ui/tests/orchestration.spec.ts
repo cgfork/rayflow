@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import type { Graph, GraphNode, Run } from '../src/types';
+import type { AssetTransfer, AssetVersion, Catalog, Graph, GraphNode, PrepareAssetResponse, PublishedAsset, Run } from '../src/types';
 
 const api = '/api/v1';
 const home = '/#/orchestration';
@@ -326,14 +326,21 @@ test('The draft editor saves output kinds and converts legacy multi-file JSON', 
 test('The browser uploads a shared asset to RustFS and pins it on a node', async ({ page }) => {
   await mockGraphs(page);
   const script = Buffer.from('print("hello")');
-  const asset = {
+  const asset: AssetVersion = {
     asset_id: 'aa000000-0000-4000-8000-000000000001',
     name: 'transform-v1_example.lua', version: 1, size: script.length, format: 'text/x-lua',
-    sha256: createHash('sha256').update(script).digest('hex'), published_at: '2026-11-15T02:30:00Z',
+    sha256: createHash('sha256').update(script).digest('hex'),
+    created_by: 'local', created_at: '2026-11-15T02:29:00Z', published_at: '2026-11-15T02:30:00Z',
   };
   const uploadId = 'aa000000-0000-4000-8000-000000000002';
   const uploadUrl = 'https://rustfs.example.test/bucket/asset-staging/upload?signature=fixture';
   const downloadUrl = 'https://rustfs.example.test/bucket/assets/published?signature=attachment';
+  const expiresAt = '2030-01-01T00:00:00Z';
+  const catalog: Catalog = {
+    id: 2, uuid: 'aa000000-0000-4000-8000-000000000003', key: '/assets/published',
+    url: 's3://bucket/assets/published', size: asset.size, format: asset.format, uploaded: true,
+    created_at: asset.published_at, updated_at: asset.published_at,
+  };
   let abandoned = true;
   let committed = false;
   let uploaded = false;
@@ -349,8 +356,13 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
     if (abandoned) return route.fulfill({ status: 409, json: { error: 'The asset version is already reserved.' } });
     return route.fulfill({ json: {
       state: 'pending', asset_id: asset.asset_id, upload_id: uploadId,
-      upload: { operation: 'upload', url: uploadUrl, headers: { 'x-upload-marker': 'staging' } },
-    } });
+      catalog: {
+        ...catalog, id: 1, uuid: 'aa000000-0000-4000-8000-000000000004', key: '/asset-staging/upload',
+        url: 's3://bucket/asset-staging/upload', uploaded: false,
+        created_at: asset.created_at, updated_at: asset.created_at,
+      },
+      upload: { operation: 'upload', url: uploadUrl, headers: { 'x-upload-marker': 'staging' }, expires_at: expiresAt },
+    } satisfies PrepareAssetResponse });
   });
   await page.route(`**${api}/assets/${asset.name}/versions/${asset.version}/cancel`, (route) => {
     expect(route.request().method()).toBe('POST');
@@ -374,10 +386,13 @@ test('The browser uploads a shared asset to RustFS and pins it on a node', async
     expect(uploaded).toBe(true);
     expect(route.request().postDataJSON()).toEqual({ upload_id: uploadId });
     committed = true;
-    return route.fulfill({ json: asset });
+    return route.fulfill({ json: { ...asset, catalog } satisfies PublishedAsset });
   });
   await page.route(`**${api}/assets/${asset.asset_id}/download`, (route) => route.fulfill({
-    json: { presigned: { operation: 'download', url: downloadUrl, headers: {} } },
+    json: {
+      asset_id: asset.asset_id, sha256: asset.sha256, catalog, multipart: false,
+      presigned: { operation: 'download', url: downloadUrl, headers: {}, expires_at: expiresAt },
+    } satisfies AssetTransfer,
   }));
   await page.context().route(downloadUrl, (route) => route.fulfill({
     headers: { 'content-type': 'text/html', 'content-disposition': `attachment; filename="${asset.name}"` },
